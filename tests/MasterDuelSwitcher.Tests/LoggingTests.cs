@@ -169,6 +169,33 @@ public sealed class LoggingTests : IDisposable
         Assert.DoesNotContain("first factory event", secondLog);
     }
 
+    /// <summary>验证同一数据目录的两个同时运行实例都持续记录信息和调试消息。</summary>
+    [Fact]
+    public void ConcurrentFactoriesKeepBothInstancesMessagesInSharedStreams()
+    {
+        using (var first = ApplicationLogging.CreateFactory(root))
+        {
+            first.CreateLogger("LoggingTests.FirstInstance").LogInformation("first instance started");
+            using (var second = ApplicationLogging.CreateFactory(root))
+            {
+                second.CreateLogger("LoggingTests.SecondInstance").LogInformation("second instance started");
+                second.CreateLogger("LoggingTests.SecondInstance").LogDebug("second instance debug");
+                first.CreateLogger("LoggingTests.FirstInstance").LogDebug("first instance debug");
+            }
+            first.CreateLogger("LoggingTests.FirstInstance").LogInformation("first instance continued");
+        }
+
+        foreach (string stream in new[] { "run", "debug" })
+        {
+            string log = ReadLogStream(stream);
+            Assert.Contains("first instance started", log);
+            Assert.Contains("second instance started", log);
+            Assert.Contains("first instance continued", log);
+        }
+        Assert.Contains("first instance debug", ReadLogStream("debug"));
+        Assert.Contains("second instance debug", ReadLogStream("debug"));
+    }
+
     /// <summary>验证日志工厂拒绝空的数据目录。</summary>
     [Theory]
     [InlineData(null)]
