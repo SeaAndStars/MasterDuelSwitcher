@@ -8,7 +8,7 @@ $ErrorActionPreference = 'Stop'
 $taskRepository = Split-Path -Parent $PSScriptRoot
 # 明确的输出目录，避免输出到当前用户主目录。
 $taskPublishPath = if ($OutputDirectory) { [IO.Path]::GetFullPath($OutputDirectory) } else { Join-Path $taskRepository 'artifacts\publish\win-x64' }
-dotnet publish (Join-Path $taskRepository 'src\MasterDuelSwitcher.App\MasterDuelSwitcher.App.csproj') -c Release -r win-x64 --self-contained true -p:RuntimeFrameworkVersion=10.0.10 -p:PublishSingleFile=true -p:IncludeNativeLibrariesForSelfExtract=true -p:EnableCompressionInSingleFile=true -p:DebugType=None -p:DebugSymbols=false -o $taskPublishPath
+dotnet publish (Join-Path $taskRepository 'src\MasterDuelSwitcher.App\MasterDuelSwitcher.App.csproj') -c Release -r win-x64 --self-contained true -p:MasterDuelRuntimeVersion=10.0.10 -p:PublishSingleFile=true -p:IncludeNativeLibrariesForSelfExtract=true -p:EnableCompressionInSingleFile=true -p:DebugType=None -p:DebugSymbols=false -o $taskPublishPath
 if ($LASTEXITCODE -ne 0) { throw '发布失败，请检查构建输出。' }
 Copy-Item -LiteralPath (Join-Path $taskRepository 'README.md') -Destination (Join-Path $taskPublishPath '使用说明.md')
 Copy-Item -LiteralPath (Join-Path $taskRepository 'THIRD-PARTY-NOTICES.md') -Destination $taskPublishPath
