@@ -1,3 +1,4 @@
+using System.Diagnostics;
 using System.Numerics;
 using System.Runtime.InteropServices;
 using MasterDuelSwitcher.Core.Models;
@@ -5,6 +6,7 @@ using MasterDuelSwitcher.Core.Services;
 using Microsoft.Extensions.Logging;
 using OpenCvSharp;
 using Xunit;
+using Xunit.Abstractions;
 using LogLevel = Microsoft.Extensions.Logging.LogLevel;
 
 namespace MasterDuelSwitcher.Tests;
@@ -12,11 +14,19 @@ namespace MasterDuelSwitcher.Tests;
 /// <summary>使用真实游戏截图和真实 OpenCV 图像处理验证免费卡包识别及动作边界。</summary>
 public sealed class FreePackVisionTests : IDisposable
 {
-    /// <summary>将费用文字边界隔离后的真实 OpenCV 截图识别器。</summary>
-    private readonly OpenCvPackRecognizer recognizer = new(feeVerifier: new RecordingFeeVerifier(true));
+    /// <summary>将费用及标题文字边界隔离后的真实 OpenCV 截图识别器。</summary>
+    private readonly OpenCvPackRecognizer recognizer = new(feeVerifier: new RecordingFeeVerifier(true),
+        titleReader: new RecordingTitleReader("独立卡包标题"));
+
+    /// <summary>向测试结果记录四种真实界面的逐帧识别耗时。</summary>
+    private readonly ITestOutputHelper output;
 
     /// <summary>测试帧使用的固定捕获时间，避免断言依赖系统时钟。</summary>
     private static readonly DateTimeOffset capturedAtUtc = new(2026, 10, 3, 12, 0, 0, TimeSpan.Zero);
+
+    /// <summary>接收测试输出通道，性能记录仅写入测试结果。</summary>
+    /// <param name="output">当前测试的输出记录器。</param>
+    public FreePackVisionTests(ITestOutputHelper output) => this.output = output;
 
     /// <summary>独立免费按钮片段缺少详情状态锚点，各缩放下均不得授权任何点击。</summary>
     [Theory]
@@ -144,6 +154,8 @@ public sealed class FreePackVisionTests : IDisposable
         var observation = recognizer.Recognize(ToFrame(image));
         Assert.Equal(PackScreen.Opening, observation.Screen);
         AssertTargetInside(observation.PrimaryTarget, new Rect(1109, 941, 243, 58), scale, image);
+        Assert.Equal(observation.PrimaryTarget, observation.AnimationSkipTarget);
+        Assert.Empty(observation.PackTitle);
         Assert.False(observation.FreeOffer);
         Assert.Null(observation.NextTarget);
         Assert.Empty(observation.Fingerprint);
@@ -159,6 +171,9 @@ public sealed class FreePackVisionTests : IDisposable
         var observation = recognizer.Recognize(ToFrame(image));
         Assert.Equal(PackScreen.Opening, observation.Screen);
         AssertTargetInside(observation.PrimaryTarget, new Rect(205, 846, 300, 77), 1, image);
+        AssertTargetInside(observation.AnimationSkipTarget, new Rect(1109, 941, 243, 58), 1, image);
+        Assert.NotEqual(observation.PrimaryTarget, observation.AnimationSkipTarget);
+        Assert.Empty(observation.PackTitle);
         Assert.False(observation.FreeOffer);
         Assert.Null(observation.NextTarget);
     }
@@ -203,6 +218,8 @@ public sealed class FreePackVisionTests : IDisposable
         var skipRegion = includeTitlebar ? new Rect(1776, 1062, 248, 65) : new Rect(1775, 1031, 248, 65);
         Assert.Equal(PackScreen.Opening, observation.Screen);
         AssertTargetInside(observation.PrimaryTarget, skipRegion, scale, image);
+        Assert.Equal(observation.PrimaryTarget, observation.AnimationSkipTarget);
+        Assert.Empty(observation.PackTitle);
         Assert.False(observation.FreeOffer);
         Assert.Null(observation.NextTarget);
         Assert.Empty(observation.Fingerprint);
@@ -231,6 +248,10 @@ public sealed class FreePackVisionTests : IDisposable
         var openRegion = includeTitlebar ? new Rect(962, 984, 119, 48) : new Rect(961, 953, 119, 48);
         Assert.Equal(PackScreen.Opening, observation.Screen);
         AssertTargetInside(observation.PrimaryTarget, openRegion, scale, image);
+        var skipRegion = includeTitlebar ? new Rect(1776, 1062, 248, 65) : new Rect(1775, 1031, 248, 65);
+        AssertTargetInside(observation.AnimationSkipTarget, skipRegion, scale, image);
+        Assert.NotEqual(observation.PrimaryTarget, observation.AnimationSkipTarget);
+        Assert.Empty(observation.PackTitle);
         Assert.False(observation.FreeOffer);
         Assert.Null(observation.NextTarget);
         Assert.Empty(observation.Fingerprint);
@@ -262,6 +283,10 @@ public sealed class FreePackVisionTests : IDisposable
         var openRegion = includeTitlebar ? new Rect(962, 984, 119, 48) : new Rect(961, 953, 119, 48);
         Assert.Equal(PackScreen.Opening, observation.Screen);
         AssertTargetInside(observation.PrimaryTarget, openRegion, scale, image);
+        var skipRegion = includeTitlebar ? new Rect(1776, 1062, 248, 65) : new Rect(1775, 1031, 248, 65);
+        AssertTargetInside(observation.AnimationSkipTarget, skipRegion, scale, image);
+        Assert.NotEqual(observation.PrimaryTarget, observation.AnimationSkipTarget);
+        Assert.Empty(observation.PackTitle);
         Assert.False(observation.FreeOffer);
         Assert.Null(observation.NextTarget);
         Assert.Empty(observation.Fingerprint);
@@ -919,16 +944,20 @@ public sealed class FreePackVisionTests : IDisposable
     {
         using var provider = new MemoryProvider();
         using var factory = LoggerFactory.Create(builder => builder.SetMinimumLevel(LogLevel.Debug).AddProvider(provider));
-        using var loggedRecognizer = new OpenCvPackRecognizer(factory.CreateLogger<OpenCvPackRecognizer>(), new RecordingFeeVerifier(true));
+        using var loggedRecognizer = new OpenCvPackRecognizer(factory.CreateLogger<OpenCvPackRecognizer>(),
+            new RecordingFeeVerifier(true), new RecordingTitleReader("【独立\t卡包 标题】"));
         using var image = LoadFixture("paid-details.png");
         var frame = ToFrame(image);
         var observation = loggedRecognizer.Recognize(frame);
         Assert.Equal(PackScreen.PackDetails, observation.Screen);
+        Assert.Equal("独立卡包标题", observation.PackTitle);
         var log = Assert.Single(provider.Events);
         Assert.Equal(LogLevel.Debug, log.Level);
         Assert.Equal(observation.Screen, Assert.IsType<PackScreen>(log.Properties["Screen"]));
         Assert.Equal(observation.Confidence, Assert.IsType<double>(log.Properties["Confidence"]));
+        Assert.Equal(observation.PackTitle, Assert.IsType<string>(log.Properties["PackTitle"]));
         Assert.Contains(observation.Screen.ToString(), log.Message);
+        Assert.Contains(observation.PackTitle, log.Message);
         loggedRecognizer.Dispose();
         loggedRecognizer.Dispose();
         Assert.Throws<ObjectDisposedException>(() => loggedRecognizer.Recognize(frame));
@@ -944,7 +973,8 @@ public sealed class FreePackVisionTests : IDisposable
     public void RejectedFeeEvidenceOverridesPositiveFreeTemplates(string fixture, PackScreen expectedScreen)
     {
         var verifier = new RecordingFeeVerifier(false);
-        using var subject = new OpenCvPackRecognizer(feeVerifier: verifier);
+        using var subject = new OpenCvPackRecognizer(feeVerifier: verifier,
+            titleReader: new RecordingTitleReader("独立卡包标题"));
         using var image = LoadFixture(fixture);
         var observation = subject.Recognize(ToFrame(image));
         Assert.False(observation.FreeOffer);
@@ -968,7 +998,8 @@ public sealed class FreePackVisionTests : IDisposable
     public void ModalFeeVerifierReceivesOnlyTightlyPackedFeeRow(double scale, bool includeTitlebar)
     {
         var verifier = new RecordingFeeVerifier(true);
-        using var subject = new OpenCvPackRecognizer(feeVerifier: verifier);
+        using var subject = new OpenCvPackRecognizer(feeVerifier: verifier,
+            titleReader: new RecordingTitleReader("独立卡包标题"));
         using var original = LoadFixture("free-confirm-long-title.png");
         using var input = includeTitlebar ? original.Clone() : Crop(original, new Rect(1, 31, 2048, 1152));
         using var image = Resize(input, scale);
@@ -993,7 +1024,8 @@ public sealed class FreePackVisionTests : IDisposable
     public void DetailsFeeVerifierReceivesOnlyTheVerifiedSingleButton(string fixture, double scale)
     {
         var verifier = new RecordingFeeVerifier(true);
-        using var subject = new OpenCvPackRecognizer(feeVerifier: verifier);
+        using var subject = new OpenCvPackRecognizer(feeVerifier: verifier,
+            titleReader: new RecordingTitleReader("独立卡包标题"));
         using var original = LoadFixture(fixture);
         using var image = Resize(original, scale);
         var observation = subject.Recognize(ToFrame(image));
@@ -1013,7 +1045,8 @@ public sealed class FreePackVisionTests : IDisposable
     public void GemInsideModalBlocksPurchaseDespiteApprovedText(double scale)
     {
         var verifier = new RecordingFeeVerifier(true);
-        using var subject = new OpenCvPackRecognizer(feeVerifier: verifier);
+        using var subject = new OpenCvPackRecognizer(feeVerifier: verifier,
+            titleReader: new RecordingTitleReader("独立卡包标题"));
         using var original = LoadFixture("free-confirm-long-title.png");
         using var paid = LoadFixture("paid-confirm.png");
         using var gem = new Mat(paid, new Rect(938, 571, 80, 85));
@@ -1037,7 +1070,8 @@ public sealed class FreePackVisionTests : IDisposable
     public void WalletGemOutsideModalDoesNotBlockVerifiedFreeFee(double scale)
     {
         var verifier = new RecordingFeeVerifier(true);
-        using var subject = new OpenCvPackRecognizer(feeVerifier: verifier);
+        using var subject = new OpenCvPackRecognizer(feeVerifier: verifier,
+            titleReader: new RecordingTitleReader("独立卡包标题"));
         using var original = LoadFixture("free-confirm-long-title.png");
         using var paid = LoadFixture("paid-confirm.png");
         using var gem = new Mat(paid, new Rect(938, 571, 80, 85));
@@ -1059,7 +1093,8 @@ public sealed class FreePackVisionTests : IDisposable
     public void ScreensWithoutFreeTemplateNeverRequestFeeAuthorization(string fixture)
     {
         var verifier = new RecordingFeeVerifier(true);
-        using var subject = new OpenCvPackRecognizer(feeVerifier: verifier);
+        using var subject = new OpenCvPackRecognizer(feeVerifier: verifier,
+            titleReader: new RecordingTitleReader("独立卡包标题"));
         using var image = LoadFixture(fixture);
         var observation = subject.Recognize(ToFrame(image));
         Assert.False(observation.FreeOffer);
@@ -1092,7 +1127,7 @@ public sealed class FreePackVisionTests : IDisposable
     public void DefaultWindowsOcrVerifiesRealFreeFeeAndRejectsPaidModal(string fixture, PackScreen expected,
         bool freeOffer, double scale)
     {
-        using var subject = new OpenCvPackRecognizer();
+        using var subject = new OpenCvPackRecognizer(titleReader: new RecordingTitleReader("独立卡包标题"));
         using var original = LoadFixture(fixture);
         using var image = Resize(original, scale);
         var observation = subject.Recognize(ToFrame(image));
@@ -1101,6 +1136,331 @@ public sealed class FreePackVisionTests : IDisposable
         if (freeOffer) Assert.NotNull(observation.PrimaryTarget);
         else Assert.Null(observation.PrimaryTarget);
         AssertConfidence(observation);
+    }
+
+    /// <summary>详情文字没有有效标题时，即使详情菜单和导航仍在，也不得建立卡包身份或动作。</summary>
+    /// <param name="rawTitle">标题 OCR 返回的空白或标点文字。</param>
+    [Theory]
+    [InlineData("")]
+    [InlineData(" \t\r\n　")]
+    [InlineData("【】?!・。，—")]
+    [InlineData("💎🙂＋＝")]
+    public void DetailsWithoutLetterOrDigitTitleDoNotAuthorizeActions(string rawTitle)
+    {
+        var reader = new RecordingTitleReader(rawTitle);
+        using var subject = new OpenCvPackRecognizer(feeVerifier: new RecordingFeeVerifier(true), titleReader: reader);
+        using var image = LoadFixture("paid-details-after-opening.png");
+        AssertUnknown(subject.Recognize(ToFrame(image)));
+        Assert.Single(reader.Calls);
+    }
+
+    /// <summary>标题须按兼容规范化保留全部 Unicode 字母及数字，移除空白标点并保留稀有中文代理对。</summary>
+    /// <param name="rawTitle">标题 OCR 返回的原始文字。</param>
+    /// <param name="expectedTitle">独立指定的精确规范化标题。</param>
+    [Theory]
+    [InlineData("  颠 覆\t世 界\r\n恶 魔 之 力。", "颠覆世界恶魔之力")]
+    [InlineData("ＡＢＣ１２３-卡包 #Ⅳ", "ABC123卡包IV")]
+    [InlineData("【𠮷 𠀀】魔・神＋２０２６", "𠮷𠀀魔神2026")]
+    [InlineData("Pack Ａ-2（免费?）", "PackA2免费")]
+    [InlineData("Ｃafé・卡包１２", "Café卡包12")]
+    public void DetailsNormalizeCompleteUnicodeTitleExactly(string rawTitle, string expectedTitle)
+    {
+        var reader = new RecordingTitleReader(rawTitle);
+        using var subject = new OpenCvPackRecognizer(feeVerifier: new RecordingFeeVerifier(true), titleReader: reader);
+        using var image = LoadFixture("paid-details-after-opening.png");
+        var observation = subject.Recognize(ToFrame(image));
+        Assert.Equal(PackScreen.PackDetails, observation.Screen);
+        Assert.Equal(expectedTitle, observation.PackTitle);
+        Assert.Single(reader.Calls);
+        Assert.False(observation.FreeOffer);
+        Assert.Null(observation.PrimaryTarget);
+        Assert.NotNull(observation.NextTarget);
+        Assert.Null(observation.AnimationSkipTarget);
+        AssertFingerprint(observation.Fingerprint);
+    }
+
+    /// <summary>相同真实像素产生相同图像指纹时，不同的近似文字标题仍须提供不同的精确卡包身份。</summary>
+    /// <param name="firstTitle">第一个标题 OCR 结果。</param>
+    /// <param name="secondTitle">具有相似字形但身份不同的第二个标题。</param>
+    [Theory]
+    [InlineData("颠覆世界恶魔之力", "颠覆世界恶魔之刃")]
+    [InlineData("免费魔神", "免费魔王")]
+    [InlineData("PackA2", "PackA3")]
+    [InlineData("PackA2", "Packa2")]
+    [InlineData("𠮷魔神", "𠀀魔神")]
+    public void SimilarTitlesRemainDistinctDespiteIdenticalRealImageHash(string firstTitle, string secondTitle)
+    {
+        using var firstSubject = new OpenCvPackRecognizer(feeVerifier: new RecordingFeeVerifier(true),
+            titleReader: new RecordingTitleReader(firstTitle));
+        using var secondSubject = new OpenCvPackRecognizer(feeVerifier: new RecordingFeeVerifier(true),
+            titleReader: new RecordingTitleReader(secondTitle));
+        using var image = LoadFixture("paid-details-after-opening.png");
+        var frame = ToFrame(image);
+        var first = firstSubject.Recognize(frame);
+        var second = secondSubject.Recognize(frame);
+        Assert.Equal(PackScreen.PackDetails, first.Screen);
+        Assert.Equal(PackScreen.PackDetails, second.Screen);
+        AssertFingerprint(first.Fingerprint);
+        Assert.Equal(first.Fingerprint, second.Fingerprint);
+        Assert.Equal(firstTitle, first.PackTitle);
+        Assert.Equal(secondTitle, second.PackTitle);
+        Assert.NotEqual(first.PackTitle, second.PackTitle);
+        Assert.NotNull(first.NextTarget);
+        Assert.NotNull(second.NextTarget);
+        Assert.Null(first.AnimationSkipTarget);
+        Assert.Null(second.AnimationSkipTarget);
+    }
+
+    /// <summary>标题 OCR 只接收包含完整真实标题字形的紧密 BGRA 区域，排除左侧类别文字和右侧钱包。</summary>
+    /// <param name="scale">真实图像的缩放比例。</param>
+    /// <param name="includeTitlebar">是否保留截图的窗口标题栏。</param>
+    [Theory]
+    [InlineData(0.65, true)]
+    [InlineData(0.85, true)]
+    [InlineData(1.0, true)]
+    [InlineData(1.25, true)]
+    [InlineData(0.65, false)]
+    [InlineData(0.85, false)]
+    [InlineData(1.0, false)]
+    [InlineData(1.25, false)]
+    public void DetailsTitleReaderReceivesCompleteIndependentTitlePixels(double scale, bool includeTitlebar)
+    {
+        var reader = new RecordingTitleReader("颠覆世界恶魔之力");
+        using var subject = new OpenCvPackRecognizer(feeVerifier: new RecordingFeeVerifier(true), titleReader: reader);
+        using var original = LoadFixture("paid-details-after-opening.png");
+        using var input = includeTitlebar ? original.Clone() : Crop(original, new Rect(1, 31, 2048, 1152));
+        using var image = Resize(input, scale);
+        var frame = ToFrame(image);
+        var before = frame.Pixels.ToArray();
+        var observation = subject.Recognize(frame);
+        Assert.Equal(PackScreen.PackDetails, observation.Screen);
+        Assert.Equal("颠覆世界恶魔之力", observation.PackTitle);
+        AssertCopiedTitleRegion(image, Assert.Single(reader.Calls), includeTitlebar, scale);
+        Assert.Equal(before, frame.Pixels);
+    }
+
+    /// <summary>旧图像指纹仍完整但标题上下文越出裁切帧时，应等待完整画面且不读取残缺文字。</summary>
+    [Fact]
+    public void DetailsWithCroppedTitleContextDoNotReadOrAuthorizePartialTitle()
+    {
+        var reader = new RecordingTitleReader("颠覆世界恶魔之力");
+        using var subject = new OpenCvPackRecognizer(feeVerifier: new RecordingFeeVerifier(true), titleReader: reader);
+        using var original = LoadFixture("paid-details-after-opening.png");
+        using var image = Crop(original, new Rect(0, 66, 2050, 1118));
+        AssertUnknown(subject.Recognize(ToFrame(image)));
+        Assert.Empty(reader.Calls);
+    }
+
+    /// <summary>标题读取故障应传播同一异常并停止识别，调用方像素保持原样。</summary>
+    [Fact]
+    public void TitleReaderFailurePropagatesWithoutProducingAnObservation()
+    {
+        var failure = new InvalidOperationException("测试标题 OCR 故障");
+        var reader = new RecordingTitleReader("故障没有文字结果", failure);
+        using var subject = new OpenCvPackRecognizer(feeVerifier: new RecordingFeeVerifier(true), titleReader: reader);
+        using var image = LoadFixture("paid-details-after-opening.png");
+        var frame = ToFrame(image);
+        var before = frame.Pixels.ToArray();
+        var thrown = Assert.Throws<InvalidOperationException>(() => subject.Recognize(frame));
+        Assert.Same(failure, thrown);
+        Assert.Single(reader.Calls);
+        Assert.Equal(before, frame.Pixels);
+    }
+
+    /// <summary>真实系统标题 OCR 在整窗和客户区各缩放下，应为同一包的收费及免费详情返回相同完整标题。</summary>
+    /// <param name="scale">真实图像的缩放比例。</param>
+    /// <param name="includeTitlebar">是否保留截图的窗口标题栏。</param>
+    [Theory]
+    [InlineData(0.65, true)]
+    [InlineData(0.85, true)]
+    [InlineData(1.0, true)]
+    [InlineData(1.25, true)]
+    [InlineData(0.65, false)]
+    [InlineData(0.85, false)]
+    [InlineData(1.0, false)]
+    [InlineData(1.25, false)]
+    public void DefaultTitleOcrKeepsSamePackAcrossFreeOfferAndAnimation(double scale, bool includeTitlebar)
+    {
+        using var subject = new OpenCvPackRecognizer();
+        using var paidOriginal = LoadFixture("paid-details-after-opening.png");
+        using var freeOriginal = LoadFixture("free-details-single-row.png");
+        using var paidInput = includeTitlebar ? paidOriginal.Clone() : Crop(paidOriginal, new Rect(1, 31, 2048, 1152));
+        using var freeInput = includeTitlebar ? freeOriginal.Clone() : Crop(freeOriginal, new Rect(1, 31, 2048, 1152));
+        using var paidImage = Resize(paidInput, scale);
+        using var freeImage = Resize(freeInput, scale);
+        var paid = subject.Recognize(ToFrame(paidImage));
+        var free = subject.Recognize(ToFrame(freeImage));
+        Assert.Equal(PackScreen.PackDetails, paid.Screen);
+        Assert.Equal(PackScreen.PackDetails, free.Screen);
+        Assert.Equal("颠覆世界恶魔之力", paid.PackTitle);
+        Assert.Equal(paid.PackTitle, free.PackTitle);
+        Assert.False(paid.FreeOffer);
+        Assert.True(free.FreeOffer);
+        Assert.Null(paid.PrimaryTarget);
+        Assert.NotNull(free.PrimaryTarget);
+        Assert.NotNull(paid.NextTarget);
+        Assert.NotNull(free.NextTarget);
+        Assert.Null(paid.AnimationSkipTarget);
+        Assert.Null(free.AnimationSkipTarget);
+    }
+
+    /// <summary>真实系统标题 OCR 在不同卡包之间必须建立精确区分，第三标题不能与原收费或开包后标题混同。</summary>
+    /// <param name="scale">真实图像的缩放比例。</param>
+    /// <param name="includeTitlebar">是否保留截图的窗口标题栏。</param>
+    [Theory]
+    [InlineData(0.65, true)]
+    [InlineData(0.85, true)]
+    [InlineData(1.0, true)]
+    [InlineData(1.25, true)]
+    [InlineData(0.65, false)]
+    [InlineData(0.85, false)]
+    [InlineData(1.0, false)]
+    [InlineData(1.25, false)]
+    public void DefaultTitleOcrDistinguishesAllThreeRealPacks(double scale, bool includeTitlebar)
+    {
+        using var subject = new OpenCvPackRecognizer();
+        using var firstOriginal = LoadFixture("paid-details.png");
+        using var secondOriginal = LoadFixture("paid-details-after-opening.png");
+        using var thirdOriginal = LoadFixture("free-details-second-title.png");
+        using var firstInput = includeTitlebar ? firstOriginal.Clone() : Crop(firstOriginal, new Rect(1, 31, 2048, 1152));
+        using var secondInput = includeTitlebar ? secondOriginal.Clone() : Crop(secondOriginal, new Rect(1, 31, 2048, 1152));
+        using var thirdInput = includeTitlebar ? thirdOriginal.Clone() : Crop(thirdOriginal, new Rect(1, 31, 2048, 1152));
+        using var firstImage = Resize(firstInput, scale);
+        using var secondImage = Resize(secondInput, scale);
+        using var thirdImage = Resize(thirdInput, scale);
+        var first = subject.Recognize(ToFrame(firstImage));
+        var second = subject.Recognize(ToFrame(secondImage));
+        var third = subject.Recognize(ToFrame(thirdImage));
+        Assert.Equal(PackScreen.PackDetails, first.Screen);
+        Assert.Equal(PackScreen.PackDetails, second.Screen);
+        Assert.Equal(PackScreen.PackDetails, third.Screen);
+        Assert.False(string.IsNullOrEmpty(first.PackTitle));
+        Assert.Equal("颠覆世界恶魔之力", second.PackTitle);
+        Assert.Equal("于毁灭中觉醒", third.PackTitle);
+        Assert.NotEqual(first.PackTitle, second.PackTitle);
+        Assert.NotEqual(first.PackTitle, third.PackTitle);
+        Assert.NotEqual(second.PackTitle, third.PackTitle);
+        Assert.NotNull(first.NextTarget);
+        Assert.NotNull(second.NextTarget);
+        Assert.NotNull(third.NextTarget);
+        Assert.Null(first.AnimationSkipTarget);
+        Assert.Null(second.AnimationSkipTarget);
+        Assert.Null(third.AnimationSkipTarget);
+    }
+
+    /// <summary>未知、结果及购买弹窗均不应读取卡包标题或提供动画跳过动作；开包只允许提供已验证动画动作。</summary>
+    /// <param name="fixture">独立真实截图名称。</param>
+    /// <param name="expected">截图应识别的界面状态。</param>
+    [Theory]
+    [InlineData("free-button.png", PackScreen.Unknown)]
+    [InlineData("free-confirm.png", PackScreen.FreePurchaseDialog)]
+    [InlineData("free-confirm-long-title.png", PackScreen.FreePurchaseDialog)]
+    [InlineData("paid-confirm.png", PackScreen.UnverifiedPurchaseDialog)]
+    [InlineData("opening.png", PackScreen.Opening)]
+    [InlineData("opening-full-window.png", PackScreen.Opening)]
+    [InlineData("results.png", PackScreen.Results)]
+    [InlineData("results-secret-sidebar.png", PackScreen.Results)]
+    public void NonDetailsScreensNeverReadOrPublishPackTitle(string fixture, PackScreen expected)
+    {
+        var reader = new RecordingTitleReader("错误区域不能成为标题");
+        using var subject = new OpenCvPackRecognizer(feeVerifier: new RecordingFeeVerifier(true), titleReader: reader);
+        using var image = LoadFixture(fixture);
+        var observation = subject.Recognize(ToFrame(image));
+        Assert.Equal(expected, observation.Screen);
+        Assert.Empty(reader.Calls);
+        Assert.Empty(observation.PackTitle);
+        if (expected == PackScreen.Opening)
+        {
+            Assert.NotNull(observation.AnimationSkipTarget);
+            Assert.Equal(observation.PrimaryTarget, observation.AnimationSkipTarget);
+        }
+        else Assert.Null(observation.AnimationSkipTarget);
+    }
+
+    /// <summary>打开文字仍完整但跳过按钮位于裁切帧右侧或下方时，主要动作仍为打开且动画坐标必须为空。</summary>
+    /// <param name="scale">真实图像的缩放比例。</param>
+    /// <param name="width">保留的原图宽度。</param>
+    /// <param name="height">保留的原图高度。</param>
+    [Theory]
+    [InlineData(0.65, 1100, 1184)]
+    [InlineData(0.85, 1100, 1184)]
+    [InlineData(1.0, 1100, 1184)]
+    [InlineData(1.25, 1100, 1184)]
+    [InlineData(0.65, 2050, 1060)]
+    [InlineData(0.85, 2050, 1060)]
+    [InlineData(1.0, 2050, 1060)]
+    [InlineData(1.25, 2050, 1060)]
+    public void OpeningWithSkipOutsideCroppedFrameHasNoAnimationTarget(double scale, int width, int height)
+    {
+        using var original = LoadFixture("opening-full-window.png");
+        using var input = Crop(original, new Rect(0, 0, width, height));
+        using var image = Resize(input, scale);
+        var observation = recognizer.Recognize(ToFrame(image));
+        Assert.Equal(PackScreen.Opening, observation.Screen);
+        AssertTargetInside(observation.PrimaryTarget, new Rect(962, 984, 119, 48), scale, image);
+        Assert.Null(observation.AnimationSkipTarget);
+        Assert.False(observation.FreeOffer);
+        Assert.Null(observation.NextTarget);
+        Assert.Empty(observation.PackTitle);
+    }
+
+    /// <summary>预热后记录四种真实界面各十帧的识别耗时，并核验调用方像素不变，不设置机器相关时间门槛。</summary>
+    [Fact]
+    public void FourScreenProfileRecordsTenFramesWithoutTimingThreshold()
+    {
+        string[] fixtures = ["paid-details.png", "free-confirm-long-title.png", "opening-full-window.png", "results-secret-sidebar.png"];
+        foreach (var fixture in fixtures)
+        {
+            using var image = LoadFixture(fixture);
+            var frame = ToFrame(image);
+            var before = frame.Pixels.ToArray();
+            for (var warmup = 0; warmup < 2; warmup++) recognizer.Recognize(frame);
+            var watch = Stopwatch.StartNew();
+            PackScreen lastScreen = PackScreen.Unknown;
+            for (var index = 0; index < 10; index++) lastScreen = recognizer.Recognize(frame).Screen;
+            watch.Stop();
+            Assert.Equal(before, frame.Pixels);
+            output.WriteLine("{0}: warmup=2 frames=10 totalMs={1:F2} meanMs={2:F2} lastScreen={3}", fixture,
+                watch.Elapsed.TotalMilliseconds, watch.Elapsed.TotalMilliseconds / 10, lastScreen);
+        }
+    }
+
+    /// <summary>独立定位一千像素宽的真实标题上下文矩形并逐行比较 BGRA，完整包含字形且排除类别与钱包。</summary>
+    /// <param name="image">真实缩放后的源截图。</param>
+    /// <param name="title">被测识别器实际交给文字边界的区域。</param>
+    /// <param name="includeTitlebar">源截图是否包含标题栏。</param>
+    /// <param name="scale">源截图的缩放比例。</param>
+    private static void AssertCopiedTitleRegion(Mat image, TitleCall title, bool includeTitlebar, double scale)
+    {
+        Assert.Equal(title.Width * title.Height * 4, title.Pixels.Length);
+        var tolerance = (int)Math.Ceiling(12 * scale);
+        var width1000 = (int)Math.Round(1000 * scale);
+        Assert.InRange(title.Width, width1000 - tolerance, width1000 + tolerance);
+        Assert.InRange(title.Height, (int)Math.Round(90 * scale) - tolerance, (int)Math.Round(90 * scale) + tolerance);
+        var expectedX = (int)Math.Round((includeTitlebar ? 284 : 283) * scale);
+        var expectedY = (int)Math.Round((includeTitlebar ? 55 : 24) * scale);
+        var source = ToFrame(image).Pixels;
+        var imageWidth = image.Width;
+        var imageHeight = image.Height;
+        Rect? actualRegion = null;
+        for (var y = Math.Max(0, expectedY - tolerance); y <= Math.Min(imageHeight - title.Height, expectedY + tolerance) && actualRegion is null; y++)
+        {
+            for (var x = Math.Max(0, expectedX - tolerance); x <= Math.Min(imageWidth - title.Width, expectedX + tolerance); x++)
+            {
+                var allRowsMatch = true;
+                for (var row = 0; row < title.Height && allRowsMatch; row++)
+                    allRowsMatch = source.AsSpan(((y + row) * imageWidth + x) * 4, title.Width * 4)
+                        .SequenceEqual(title.Pixels.AsSpan(row * title.Width * 4, title.Width * 4));
+                if (!allRowsMatch) continue;
+                actualRegion = new Rect(x, y, title.Width, title.Height);
+                break;
+            }
+        }
+        Assert.True(actualRegion.HasValue, "标题像素必须逐行来自真实截图的标题专属区域。");
+        var region = actualRegion.GetValueOrDefault();
+        var glyphs = includeTitlebar ? new Rect(290, 85, 254, 30) : new Rect(289, 54, 254, 30);
+        Assert.True(region.Contains(new Point((int)Math.Floor(glyphs.Left * scale), (int)Math.Floor(glyphs.Top * scale))));
+        Assert.True(region.Contains(new Point((int)Math.Ceiling(glyphs.Right * scale) - 1, (int)Math.Ceiling(glyphs.Bottom * scale) - 1)));
     }
 
     /// <summary>核验费用像素是指定原图局部逐行复制，尺寸和坐标容差只允许模板缩放插值的像素取整。</summary>
@@ -1151,6 +1511,33 @@ public sealed class FreePackVisionTests : IDisposable
         {
             Calls.Add(new(bgraPixels.ToArray(), width, height, gemDetected));
             return approved;
+        }
+    }
+
+    /// <summary>一次标题识别收到的紧密 BGRA 字节和实际区域尺寸。</summary>
+    /// <param name="Pixels">标题区域的独立像素副本。</param>
+    /// <param name="Width">区域的物理像素宽度。</param>
+    /// <param name="Height">区域的物理像素高度。</param>
+    private sealed record TitleCall(byte[] Pixels, int Width, int Height);
+
+    /// <summary>隔离系统标题 OCR，并保留真实标题区域供独立字节验证。</summary>
+    /// <param name="text">标题识别返回的原始文字。</param>
+    /// <param name="failure">识别边界应传播的可控故障，省略时返回标题文字。</param>
+    private sealed class RecordingTitleReader(string text, Exception? failure = null) : IPackTextReader
+    {
+        /// <summary>实际收到的标题区域，按识别调用顺序保留。</summary>
+        public List<TitleCall> Calls { get; } = [];
+
+        /// <summary>记录标题区域的紧密 BGRA 副本，并返回指定的原始文字。</summary>
+        /// <param name="bgraPixels">被测识别器传入的标题区域字节。</param>
+        /// <param name="width">实际区域宽度。</param>
+        /// <param name="height">实际区域高度。</param>
+        /// <returns>当前测试指定的原始标题文字。</returns>
+        public string Read(byte[] bgraPixels, int width, int height)
+        {
+            Calls.Add(new(bgraPixels.ToArray(), width, height));
+            if (failure is not null) throw failure;
+            return text;
         }
     }
 
@@ -1234,6 +1621,8 @@ public sealed class FreePackVisionTests : IDisposable
         Assert.Null(observation.PrimaryTarget);
         Assert.Null(observation.NextTarget);
         Assert.Empty(observation.Fingerprint);
+        Assert.Empty(observation.PackTitle);
+        Assert.Null(observation.AnimationSkipTarget);
         Assert.InRange(observation.Confidence, 0, 1);
     }
 

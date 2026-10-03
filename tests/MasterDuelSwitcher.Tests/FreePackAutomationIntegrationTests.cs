@@ -10,6 +10,31 @@ namespace MasterDuelSwitcher.Tests;
 /// <summary>以用户提供的真实截图和真实 OpenCV 分类器验证免费开包完整状态转换，输入始终只记录于内存。</summary>
 public sealed class FreePackAutomationIntegrationTests
 {
+    /// <summary>真实结果按钮在动画期间未生效时重新核验并多次确认，只在返回原包后计数。</summary>
+    [Theory]
+    [InlineData(1.0)]
+    [InlineData(0.9375)]
+    public async Task RecordedResultsRemainUntilConfirmationRetryThenCountOnlyAfterReturn(double scale)
+    {
+        using var recognizer = new OpenCvPackRecognizer();
+        var sequence = CreateSequence(scale, false);
+        var progress = new RecordingProgress();
+        var platform = new RecordedPlatform(sequence, progress, 16);
+        var result = await new FreePackAutomationService(recognizer, platform).RunAsync(progress);
+
+        AssertCompletedRound(result, platform);
+        var confirmations = platform.Clicks.Where(item => item.Name == "results").ToArray();
+        Assert.InRange(confirmations.Length, 2, 10);
+        Assert.All(confirmations, item =>
+        {
+            Assert.InRange(item.Point.X, (int)Math.Floor(1518 * scale), (int)Math.Ceiling(1920 * scale) - 1);
+            Assert.InRange(item.Point.Y, (int)Math.Floor(1032 * scale), (int)Math.Ceiling(1097 * scale) - 1);
+        });
+        Assert.All(platform.Captures.Where(item => item.Name == "results"), item => Assert.Equal(0, item.OpenedPacks));
+        Assert.Equal(1, platform.Clicks.Count(item => item.Name == "free-confirm"));
+        Assert.DoesNotContain(platform.Clicks, item => item.Name == "different-details" && item.Point.X < 1800 * scale);
+    }
+
     /// <summary>真实购买后详情过渡、居中开包与秘密卡包侧栏结果须完成六次动作，不在过渡帧点击。</summary>
     [Theory]
     [InlineData(1.0)]
@@ -262,13 +287,15 @@ public sealed class FreePackAutomationIntegrationTests
         /// <summary>正常录制流程不产生停止按键请求。</summary>
         public bool IsStopRequested => false;
         /// <summary>保存录制页面和进度接收器，页面内部帧不会修改。</summary>
-        public RecordedPlatform(RecordedFrame[] sequence, RecordingProgress progress)
+        public RecordedPlatform(RecordedFrame[] sequence, RecordingProgress progress, int resultsFrames = 2)
         {
-            frames = sequence.SelectMany(item => new[] { item, item }).ToArray();
+            frames = sequence.SelectMany(item => Enumerable.Repeat(item, item.Name == "results" ? resultsFrames : 2)).ToArray();
             this.progress = progress;
         }
         /// <summary>仅记录激活请求。</summary>
         public void ActivateGame() => Activations++;
+        /// <summary>录制过程不发生系统窗口失焦，恢复请求仅返回成功。</summary>
+        public bool TryRecoverGame() => true;
         /// <summary>返回下一张真实截图副本；末帧保持以便异常流程自然超时停止。</summary>
         public GameFrame Capture()
         {

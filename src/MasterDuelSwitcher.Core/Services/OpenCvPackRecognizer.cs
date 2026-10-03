@@ -1,4 +1,5 @@
 using System.Runtime.InteropServices;
+using System.Text;
 using MasterDuelSwitcher.Core.Models;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Logging.Abstractions;
@@ -30,16 +31,21 @@ public sealed class OpenCvPackRecognizer : IPackRecognizer, IDisposable
     private readonly ILogger<OpenCvPackRecognizer> logger;
     /// <summary>对局部费用文字和宝石图标建立独立免费证据。</summary>
     private readonly IPackFeeVerifier feeVerifier;
+    /// <summary>读取完整卡包标题，以精确文字建立卡包身份。</summary>
+    private readonly IPackTextReader titleReader;
     /// <summary>原生模板资源是否已经释放。</summary>
     private bool disposed;
 
     /// <summary>读取嵌入的真实游戏截图模板，建立可重复使用的原生图像缓存。</summary>
     /// <param name="logger">识别诊断日志；省略时使用空日志。</param>
     /// <param name="feeVerifier">可注入的费用文字与宝石校验器；省略时使用系统中文识别。</param>
-    public OpenCvPackRecognizer(ILogger<OpenCvPackRecognizer>? logger = null, IPackFeeVerifier? feeVerifier = null)
+    /// <param name="titleReader">可注入的标题文字识别器；省略时使用系统中文识别。</param>
+    public OpenCvPackRecognizer(ILogger<OpenCvPackRecognizer>? logger = null, IPackFeeVerifier? feeVerifier = null,
+        IPackTextReader? titleReader = null)
     {
         this.logger = logger ?? NullLogger<OpenCvPackRecognizer>.Instance;
         this.feeVerifier = feeVerifier ?? new OcrFreePackCostVerifier(new WindowsPackTextReader());
+        this.titleReader = titleReader ?? new WindowsPackTextReader();
         templates = new[]
         {
             LoadTemplate("details-label", 1336, 377), LoadTemplate("next-arrow", 1938, 551),
@@ -75,9 +81,10 @@ public sealed class OpenCvPackRecognizer : IPackRecognizer, IDisposable
         Cv2.Resize(gray, search, new Size((int)Math.Round(gray.Width * factor), (int)Math.Round(gray.Height * factor)),
             0, 0, InterpolationFlags.Area);
         var observation = RecognizeDialog(search, bgra, factor) ?? RecognizeResults(search, factor)
-            ?? RecognizeOpening(search, factor) ?? RecognizeDetails(search, gray, bgra, factor) ?? Unknown();
-        logger.LogDebug("卡包画面识别：{Screen}，免费 {FreeOffer}，分数 {Confidence:F4}，卡图 {Fingerprint}",
-            observation.Screen, observation.FreeOffer, observation.Confidence, observation.Fingerprint);
+            ?? RecognizeOpening(search, frame.Width, frame.Height, factor)
+            ?? RecognizeDetails(search, gray, bgra, factor) ?? Unknown();
+        logger.LogDebug("卡包画面识别：{Screen}，免费 {FreeOffer}，分数 {Confidence:F4}，卡图 {Fingerprint}，标题 {PackTitle}",
+            observation.Screen, observation.FreeOffer, observation.Confidence, observation.Fingerprint, observation.PackTitle);
         return observation;
     }
 
@@ -123,7 +130,7 @@ public sealed class OpenCvPackRecognizer : IPackRecognizer, IDisposable
     }
 
     /// <summary>开包界面由打开文字确认，优先跳过动画，缺少跳过时使用打开按钮。</summary>
-    private PackObservation? RecognizeOpening(Mat image, double factor)
+    private PackObservation? RecognizeOpening(Mat image, int width, int height, double factor)
     {
         var open = FindAnchor(image, factor, "opening-label", new Rect(0, image.Height * 2 / 3,
             image.Width, image.Height - image.Height * 2 / 3));
@@ -133,7 +140,25 @@ public sealed class OpenCvPackRecognizer : IPackRecognizer, IDisposable
                 image.Width - image.Width / 2, image.Height - image.Height * 2 / 3));
         var target = skip ?? open.Value;
         return new(PackScreen.Opening, target.Center, null, false, string.Empty,
-            Math.Min(open.Value.Score, target.Score));
+            Math.Min(open.Value.Score, target.Score))
+        {
+            AnimationSkipTarget = skip?.Center ?? InferAnimationSkipTarget(open.Value, width, height)
+        };
+    }
+
+    /// <summary>仅从已验证打开锚点与原始模板相对位置推导隐藏跳过中心，越界时保留空坐标。</summary>
+    /// <param name="open">已通过文字、相似度和对比度验证的打开锚点。</param>
+    /// <param name="width">当前客户区原始物理像素宽度。</param>
+    /// <param name="height">当前客户区原始物理像素高度。</param>
+    /// <returns>位于当前客户区底部右侧的跳过坐标；裁切后位置失效时为空。</returns>
+    private PixelPoint? InferAnimationSkipTarget(Match open, int width, int height)
+    {
+        var skip = templates["skip-label"];
+        var point = new PixelPoint(
+            (int)Math.Round(open.Bounds.X + (skip.X + skip.Gray.Width / 2d - open.Template.X) * open.Scale),
+            (int)Math.Round(open.Bounds.Y + (skip.Y + skip.Gray.Height / 2d - open.Template.Y) * open.Scale));
+        var actionRegion = new Rect(width / 2, height * 2 / 3, width - width / 2, height - height * 2 / 3);
+        return actionRegion.Contains(new Point(point.X, point.Y)) ? point : null;
     }
 
     /// <summary>详情必须具备菜单锚点和下一包双箭头，免费入口必须再核验两段文字。</summary>
@@ -146,14 +171,37 @@ public sealed class OpenCvPackRecognizer : IPackRecognizer, IDisposable
         if (next is null) return null;
         var fingerprint = Fingerprint(original, label.Value);
         if (fingerprint is null) return null;
+        var packTitle = ReadPackTitle(color, label.Value);
+        if (packTitle.Length == 0) return Unknown();
         var free = FindFreeEntry(image, factor, label.Value);
         var one = free is null ? null : FindRelative(image, factor, free.Value, "one-pack-text");
         var score = Math.Min(label.Value.Score, next.Value.Score);
         if (free is null || one is null || !OnSameYellowButton(color, one.Value, free.Value)
             || !VerifyFreeFee(color, FeeButtonBounds(one.Value, free.Value), false))
-            return new(PackScreen.PackDetails, null, next.Value.Center, false, fingerprint, score);
+            return new(PackScreen.PackDetails, null, next.Value.Center, false, fingerprint, score) { PackTitle = packTitle };
         return new(PackScreen.PackDetails, free.Value.Center, next.Value.Center, true, fingerprint,
-            Math.Min(score, Math.Min(free.Value.Score, one.Value.Score)));
+            Math.Min(score, Math.Min(free.Value.Score, one.Value.Score))) { PackTitle = packTitle };
+    }
+
+    /// <summary>读取具有完整上下留白的标题区域，兼容规范化后仅保留 Unicode 字母及数字作为精确身份。</summary>
+    /// <param name="color">当前原始客户区的完整 BGRA 像素。</param>
+    /// <param name="anchor">已完整匹配且通过标题图像指纹边界验证的详情菜单锚点。</param>
+    /// <returns>保留全部中文、字母大小写及数字的标题；没有有效文字时为空。</returns>
+    private string ReadPackTitle(Mat color, Match anchor)
+    {
+        var region = new Rect((int)Math.Round(anchor.Bounds.X - 1052 * anchor.Scale),
+            (int)Math.Round(anchor.Bounds.Y - 307 * anchor.Scale) - (int)Math.Round(15 * anchor.Scale),
+            (int)Math.Round(1000 * anchor.Scale), (int)Math.Round(90 * anchor.Scale));
+        if (region.Intersect(new Rect(0, 0, color.Width, color.Height)) != region) return string.Empty;
+        using var area = new Mat(color, region);
+        using var isolated = area.Clone();
+        var pixels = new byte[region.Width * region.Height * 4];
+        Marshal.Copy(isolated.Data, pixels, 0, pixels.Length);
+        var text = titleReader.Read(pixels, region.Width, region.Height).Normalize(NormalizationForm.FormKC);
+        var title = new StringBuilder(text.Length);
+        foreach (var rune in text.EnumerateRunes())
+            if (Rune.IsLetterOrDigit(rune)) title.Append(rune.ToString());
+        return title.ToString();
     }
 
     /// <summary>由同一按钮上的数量和免费文字推导费用像素矩形，仅补充字形周围的黄色背景。</summary>
