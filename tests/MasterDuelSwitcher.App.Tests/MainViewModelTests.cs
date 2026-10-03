@@ -13,6 +13,75 @@ namespace MasterDuelSwitcher.App.Tests;
 /// <summary>通过完全隔离的服务验证界面状态、账号绑定、事务命令和错误恢复。</summary>
 public sealed class MainViewModelTests
 {
+    /// <summary>页面尚未实例化时工作区仍可独立读取健康配置和共同快照。</summary>
+    [Fact]
+    public async Task WorkspaceRefreshesWithoutAnyPageSubscribers()
+    {
+        var store = new FakeStore();
+        var workspace = new WorkspaceService(store, new FakeDiscovery(), new FakeResources(), new FakeInteraction(), new FakeTheme());
+        await workspace.InitializeAsync();
+        Assert.True(workspace.StorageReady);
+        Assert.True(workspace.IsReady);
+        Assert.Equal(2, workspace.DetectedAccounts.Count);
+        Assert.Equal(3, workspace.Profiles.Count);
+        Assert.Single(workspace.Backups);
+        Assert.NotEmpty(workspace.Logs);
+        Assert.Equal("C:\\Fixture\\Steam", workspace.ActiveSteamPath);
+        Assert.Equal("C:\\Fixture\\Game", workspace.ActiveGamePath);
+    }
+
+    /// <summary>新发现数据同步失败时保留上一整组快照，页面接收的状态与业务活动路径一致。</summary>
+    [Fact]
+    public async Task FailedAccountSynchronizationKeepsPublishedWorkspaceSnapshotConsistent()
+    {
+        var fixture = new Fixture();
+        var store = fixture.Store;
+        var discovery = fixture.Discovery;
+        var resources = fixture.Resources;
+        var workspace = fixture.Workspace;
+        var published = new List<(string Steam, string Game, IReadOnlyList<SteamAccount> Accounts, IReadOnlyList<ResourceProfile> Profiles, IReadOnlyList<ShareBackup> Backups)>();
+        workspace.DataChanged += (_, _) => published.Add((workspace.ActiveSteamPath, workspace.ActiveGamePath, workspace.DetectedAccounts, workspace.Profiles, workspace.Backups));
+        await workspace.InitializeAsync();
+        var previous = Assert.Single(published);
+        var previousAccounts = fixture.AccountsPageVM.Accounts.ToArray();
+        var previousProfiles = fixture.ResourcesPageVM.Profiles.ToArray();
+        var previousBackups = fixture.BackupsPageVM.Backups.ToArray();
+        var previousDiscoveryStatus = workspace.DiscoveryStatus;
+        discovery.Result = new DiscoveryResult { SteamPath = "C:\\Changed\\Steam", GamePath = "C:\\Changed\\Game", Accounts = [new SteamAccount { SteamId = "changed" }] };
+        resources.Profiles = [Fixture.Profile("deadbeef", 5)];
+        resources.Backups = [new ShareBackup { Id = "changed-backup" }];
+        store.SyncError = new IOException("同步失败");
+
+        await workspace.RefreshCommand.ExecuteAsync();
+
+        Assert.Single(published);
+        Assert.Equal(previous.Steam, workspace.ActiveSteamPath);
+        Assert.Equal(previous.Game, workspace.ActiveGamePath);
+        Assert.Same(previous.Accounts, workspace.DetectedAccounts);
+        Assert.Same(previous.Profiles, workspace.Profiles);
+        Assert.Same(previous.Backups, workspace.Backups);
+        Assert.Equal(previousAccounts, fixture.AccountsPageVM.Accounts);
+        Assert.Equal(previousProfiles, fixture.ResourcesPageVM.Profiles);
+        Assert.Equal(previousBackups, fixture.BackupsPageVM.Backups);
+        Assert.Equal(previous.Steam, fixture.SettingsPageVM.SteamPath);
+        Assert.Equal(previous.Game, fixture.SettingsPageVM.GamePath);
+        Assert.Equal(previousDiscoveryStatus, workspace.DiscoveryStatus);
+        Assert.True(workspace.IsReady);
+        Assert.Contains("同步失败", workspace.Status);
+        store.SyncError = null;
+        await workspace.RefreshCommand.ExecuteAsync();
+        Assert.Equal(2, published.Count);
+        Assert.Equal("C:\\Changed\\Steam", workspace.ActiveSteamPath);
+        Assert.Equal("changed", Assert.Single(workspace.DetectedAccounts).SteamId);
+        Assert.Equal("deadbeef", Assert.Single(workspace.Profiles).FolderName);
+        Assert.Equal("changed-backup", Assert.Single(workspace.Backups).Id);
+        Assert.Equal("changed", Assert.Single(fixture.AccountsPageVM.Accounts).Account.SteamId);
+        Assert.Equal("deadbeef", Assert.Single(fixture.ResourcesPageVM.Profiles).FolderName);
+        Assert.Equal("changed-backup", Assert.Single(fixture.BackupsPageVM.Backups).Id);
+        Assert.Equal("C:\\Changed\\Steam", fixture.SettingsPageVM.SteamPath);
+        Assert.Equal("C:\\Changed\\Game", fixture.SettingsPageVM.GamePath);
+    }
+
     /// <summary>构造阶段只创建状态，首次初始化才读取存储并同步发现的账号。</summary>
     [Fact]
     public async Task ConstructorDefersStorageAccessAndInitializationPopulatesDerivedState()
@@ -21,32 +90,32 @@ public sealed class MainViewModelTests
         fixture.Store.Settings.DarkTheme = true;
         fixture.Store.Settings.SourceProfile = "11223344";
         Assert.Equal(0, fixture.Store.LoadCount);
-        Assert.True(fixture.ViewModel.IsReady);
-        Assert.False(fixture.ViewModel.StorageReady);
-        Assert.False(fixture.ViewModel.HasSelectedAccount);
-        Assert.True(fixture.ViewModel.NoAccounts);
-        Assert.True(fixture.ViewModel.NoProfiles);
-        Assert.True(fixture.ViewModel.NoBackups);
-        Assert.Equal("C:\\Fixture\\State", fixture.ViewModel.StateDirectory);
+        Assert.True(fixture.Workspace.IsReady);
+        Assert.False(fixture.Workspace.StorageReady);
+        Assert.False(fixture.AccountsPageVM.HasSelectedAccount);
+        Assert.True(fixture.AccountsPageVM.NoAccounts);
+        Assert.True(fixture.ResourcesPageVM.NoProfiles);
+        Assert.True(fixture.BackupsPageVM.NoBackups);
+        Assert.Equal("C:\\Fixture\\State", fixture.Workspace.StateDirectory);
 
         await fixture.ViewModel.InitializeAsync();
 
-        Assert.True(fixture.ViewModel.StorageReady);
-        Assert.Equal("C:\\Fixture\\Steam", fixture.ViewModel.SteamPath);
-        Assert.Equal("C:\\Fixture\\Game", fixture.ViewModel.GamePath);
-        Assert.True(fixture.ViewModel.DarkTheme);
+        Assert.True(fixture.Workspace.StorageReady);
+        Assert.Equal("C:\\Fixture\\Steam", fixture.SettingsPageVM.SteamPath);
+        Assert.Equal("C:\\Fixture\\Game", fixture.SettingsPageVM.GamePath);
+        Assert.True(fixture.SettingsPageVM.DarkTheme);
         Assert.True(Assert.Single(fixture.Theme.Applied));
-        Assert.Equal("2", fixture.ViewModel.Accounts[0].Account.SteamId);
-        Assert.Equal("本机账号 · 2/2", fixture.ViewModel.AccountCountText);
-        Assert.False(fixture.ViewModel.NoProfiles);
-        Assert.False(fixture.ViewModel.NoBackups);
-        Assert.Equal("11223344", Assert.Single(fixture.ViewModel.SourceProfiles).FolderName);
-        Assert.Equal("11223344", fixture.ViewModel.SelectedSource?.FolderName);
-        Assert.Contains("1.00 GB", fixture.ViewModel.ResourceSummary);
-        Assert.Equal("Steam 与游戏已检测", fixture.ViewModel.DiscoveryStatus);
+        Assert.Equal("2", fixture.AccountsPageVM.Accounts[0].Account.SteamId);
+        Assert.Equal("本机账号 · 2/2", fixture.AccountsPageVM.AccountCountText);
+        Assert.False(fixture.ResourcesPageVM.NoProfiles);
+        Assert.False(fixture.BackupsPageVM.NoBackups);
+        Assert.Equal("11223344", Assert.Single(fixture.ResourcesPageVM.SourceProfiles).FolderName);
+        Assert.Equal("11223344", fixture.ResourcesPageVM.SelectedSource?.FolderName);
+        Assert.Contains("1.00 GB", fixture.ResourcesPageVM.Summary);
+        Assert.Equal("Steam 与游戏已检测", fixture.Workspace.DiscoveryStatus);
         Assert.Equal(new[] { "1", "2" }, fixture.Store.Synchronized.Select(account => account.SteamId));
-        Assert.False(fixture.ViewModel.IsBusy);
-        Assert.NotEmpty(fixture.ViewModel.BusyMessage);
+        Assert.False(fixture.Workspace.IsBusy);
+        Assert.NotEmpty(fixture.Workspace.BusyMessage);
     }
 
     /// <summary>空安装与手工路径回退应保持空列表，并分别显示待设置的产品。</summary>
@@ -62,13 +131,13 @@ public sealed class MainViewModelTests
 
         await fixture.ViewModel.InitializeAsync();
 
-        Assert.Empty(fixture.ViewModel.Accounts);
-        Assert.True(fixture.ViewModel.NoAccounts);
-        Assert.True(fixture.ViewModel.NoProfiles);
-        Assert.True(fixture.ViewModel.NoBackups);
-        Assert.Equal("C:\\PreferredGame", fixture.ViewModel.GamePath);
-        Assert.Equal(expectedStatus, fixture.ViewModel.DiscoveryStatus);
-        Assert.Contains("尚未检测", fixture.ViewModel.ResourceSummary);
+        Assert.Empty(fixture.AccountsPageVM.Accounts);
+        Assert.True(fixture.AccountsPageVM.NoAccounts);
+        Assert.True(fixture.ResourcesPageVM.NoProfiles);
+        Assert.True(fixture.BackupsPageVM.NoBackups);
+        Assert.Equal("C:\\PreferredGame", fixture.SettingsPageVM.GamePath);
+        Assert.Equal(expectedStatus, fixture.Workspace.DiscoveryStatus);
+        Assert.Contains("尚未检测", fixture.ResourcesPageVM.Summary);
         Assert.Empty(fixture.Resources.ScannedPaths);
         Assert.Equal((null, "C:\\PreferredGame"), Assert.Single(fixture.Discovery.Requests));
     }
@@ -78,20 +147,20 @@ public sealed class MainViewModelTests
     public async Task RefreshPreservesAccountSelectionAndDoesNotGuessMissingSource()
     {
         var fixture = await Fixture.ReadyAsync();
-        fixture.ViewModel.SelectedAccount = fixture.ViewModel.Accounts[0];
+        fixture.AccountsPageVM.SelectedAccount = fixture.AccountsPageVM.Accounts[0];
         fixture.Store.Settings.SourceProfile = "deadbeef";
         fixture.Resources.Profiles = [Fixture.Profile("11223344", 524_288)];
 
         await fixture.ViewModel.RefreshCommand.ExecuteAsync();
 
-        Assert.Equal("2", fixture.ViewModel.SelectedAccount?.Account.SteamId);
-        Assert.True(fixture.ViewModel.HasSelectedAccount);
-        Assert.Null(fixture.ViewModel.SelectedSource);
-        Assert.Contains("0.5 MB", fixture.ViewModel.ResourceSummary);
+        Assert.Equal("2", fixture.AccountsPageVM.SelectedAccount?.Account.SteamId);
+        Assert.True(fixture.AccountsPageVM.HasSelectedAccount);
+        Assert.Null(fixture.ResourcesPageVM.SelectedSource);
+        Assert.Contains("0.5 MB", fixture.ResourcesPageVM.Summary);
         Assert.Equal(2, fixture.Store.LoadCount);
     }
 
-    /// <summary>各导航参数应给出相互一致的标题、说明和唯一页面可见状态。</summary>
+    /// <summary>官方导航通知 Shell 的页面标识应给出一致的标题和说明。</summary>
     [Theory]
     [InlineData("Accounts", "账号切换", 0)]
     [InlineData("Resources", "资源共享", 1)]
@@ -99,15 +168,14 @@ public sealed class MainViewModelTests
     [InlineData("Settings", "设置", 3)]
     [InlineData("Unknown", "账号切换", 0)]
     [InlineData(null, "账号切换", 0)]
-    public async Task NavigationKeepsTitlesAndPageFlagsConsistent(string? page, string title, int visiblePage)
+    public void NavigationKeepsTitlesAndPageFlagsConsistent(string? page, string title, int visiblePage)
     {
         var fixture = new Fixture();
-        await fixture.ViewModel.NavigateCommand.ExecuteAsync(page);
+        fixture.ViewModel.CurrentPage = page ?? "Accounts";
         Assert.Equal(title, fixture.ViewModel.Title);
         Assert.NotEmpty(fixture.ViewModel.Subtitle);
-        var pages = new[] { fixture.ViewModel.IsAccountsPage, fixture.ViewModel.IsResourcesPage, fixture.ViewModel.IsBackupsPage, fixture.ViewModel.IsSettingsPage };
-        Assert.True(pages[visiblePage]);
-        Assert.Single(pages, value => value);
+        Assert.InRange(visiblePage, 0, 3);
+        Assert.Equal(page ?? "Accounts", fixture.ViewModel.CurrentPage);
     }
 
     /// <summary>属性同值赋值不重复通知，改变页面时通知对应派生标题和可见状态。</summary>
@@ -117,19 +185,19 @@ public sealed class MainViewModelTests
         var fixture = new Fixture();
         var names = new List<string?>();
         fixture.ViewModel.PropertyChanged += (_, args) => names.Add(args.PropertyName);
+        fixture.AccountsPageVM.PropertyChanged += (_, args) => names.Add(args.PropertyName);
         fixture.ViewModel.CurrentPage = "Accounts";
-        fixture.ViewModel.ShowHidden = false;
-        fixture.ViewModel.SelectedAccount = null;
-        fixture.ViewModel.Note = "";
+        fixture.AccountsPageVM.ShowHidden = false;
+        fixture.AccountsPageVM.SelectedAccount = null;
+        fixture.AccountsPageVM.Note = "";
         Assert.Empty(names);
         fixture.ViewModel.CurrentPage = "Settings";
         Assert.Contains(nameof(MainViewModel.Title), names);
         Assert.Contains(nameof(MainViewModel.Subtitle), names);
-        Assert.Contains(nameof(MainViewModel.IsSettingsPage), names);
         names.Clear();
-        fixture.ViewModel.Note = "备注";
-        fixture.ViewModel.Note = "备注";
-        Assert.Equal(new[] { nameof(MainViewModel.Note) }, names);
+        fixture.AccountsPageVM.Note = "备注";
+        fixture.AccountsPageVM.Note = "备注";
+        Assert.Equal(new[] { nameof(AccountsPageViewModel.Note) }, names);
     }
 
     /// <summary>缺失资源目录的人工绑定保留在编辑器中，明确清空后才从设置删除。</summary>
@@ -140,27 +208,27 @@ public sealed class MainViewModelTests
         fixture.Store.Settings.AccountBindings["1"] = "deadbeef";
         fixture.Store.Settings.AccountNotes["1"] = "原备注";
         await fixture.ViewModel.InitializeAsync();
-        fixture.ViewModel.SelectedAccount = fixture.ViewModel.Accounts.Single(account => account.Account.SteamId == "1");
-        Assert.Equal("原备注", fixture.ViewModel.Note);
-        Assert.Equal("deadbeef", fixture.ViewModel.SelectedBinding?.FolderName);
-        Assert.Contains("未检测到", fixture.ViewModel.SelectedBinding?.DisplayName);
-        fixture.ViewModel.Note = "  新备注  ";
+        fixture.AccountsPageVM.SelectedAccount = fixture.AccountsPageVM.Accounts.Single(account => account.Account.SteamId == "1");
+        Assert.Equal("原备注", fixture.AccountsPageVM.Note);
+        Assert.Equal("deadbeef", fixture.AccountsPageVM.SelectedBinding?.FolderName);
+        Assert.Contains("未检测到", fixture.AccountsPageVM.SelectedBinding?.DisplayName);
+        fixture.AccountsPageVM.Note = "  新备注  ";
 
-        await fixture.ViewModel.SaveAccountCommand.ExecuteAsync();
+        await fixture.AccountsPageVM.SaveAccountCommand.ExecuteAsync();
 
         Assert.Equal("deadbeef", fixture.Store.Settings.AccountBindings["1"]);
         Assert.Equal("新备注", fixture.Store.Settings.AccountNotes["1"]);
-        Assert.Equal("1", fixture.ViewModel.SelectedAccount?.Account.SteamId);
-        fixture.ViewModel.SelectedBinding = fixture.ViewModel.BindingOptions[0];
-        await fixture.ViewModel.SaveAccountCommand.ExecuteAsync();
+        Assert.Equal("1", fixture.AccountsPageVM.SelectedAccount?.Account.SteamId);
+        fixture.AccountsPageVM.SelectedBinding = fixture.AccountsPageVM.BindingOptions[0];
+        await fixture.AccountsPageVM.SaveAccountCommand.ExecuteAsync();
         Assert.False(fixture.Store.Settings.AccountBindings.ContainsKey("1"));
-        fixture.ViewModel.SelectedBinding = null;
-        await fixture.ViewModel.SaveAccountCommand.ExecuteAsync();
+        fixture.AccountsPageVM.SelectedBinding = null;
+        await fixture.AccountsPageVM.SaveAccountCommand.ExecuteAsync();
         Assert.False(fixture.Store.Settings.AccountBindings.ContainsKey("1"));
-        fixture.ViewModel.SelectedAccount = null;
-        Assert.False(fixture.ViewModel.HasSelectedAccount);
-        Assert.Empty(fixture.ViewModel.Note);
-        Assert.Equal("", fixture.ViewModel.SelectedBinding?.FolderName);
+        fixture.AccountsPageVM.SelectedAccount = null;
+        Assert.False(fixture.AccountsPageVM.HasSelectedAccount);
+        Assert.Empty(fixture.AccountsPageVM.Note);
+        Assert.Equal("", fixture.AccountsPageVM.SelectedBinding?.FolderName);
     }
 
     /// <summary>有效资源绑定应持久保存，并在编辑器重建后保持相同选择。</summary>
@@ -168,11 +236,11 @@ public sealed class MainViewModelTests
     public async Task SavingExistingBindingRoundtripsThroughAccountEditor()
     {
         var fixture = await Fixture.ReadyAsync();
-        fixture.ViewModel.SelectedAccount = fixture.ViewModel.Accounts[0];
-        fixture.ViewModel.SelectedBinding = fixture.ViewModel.BindingOptions.Single(option => option.FolderName == "aabbccdd");
-        await fixture.ViewModel.SaveAccountCommand.ExecuteAsync();
+        fixture.AccountsPageVM.SelectedAccount = fixture.AccountsPageVM.Accounts[0];
+        fixture.AccountsPageVM.SelectedBinding = fixture.AccountsPageVM.BindingOptions.Single(option => option.FolderName == "aabbccdd");
+        await fixture.AccountsPageVM.SaveAccountCommand.ExecuteAsync();
         Assert.Equal("aabbccdd", fixture.Store.Settings.AccountBindings["2"]);
-        Assert.Equal("aabbccdd", fixture.ViewModel.SelectedBinding?.FolderName);
+        Assert.Equal("aabbccdd", fixture.AccountsPageVM.SelectedBinding?.FolderName);
     }
 
     /// <summary>隐藏操作只更改本地偏好，显示隐藏项后可以再次取消隐藏。</summary>
@@ -180,17 +248,17 @@ public sealed class MainViewModelTests
     public async Task HidingAndUnhidingAccountsUpdatesVisibleCountWithoutSteamMutation()
     {
         var fixture = await Fixture.ReadyAsync();
-        fixture.ViewModel.SelectedAccount = fixture.ViewModel.Accounts[0];
-        await fixture.ViewModel.HideAccountCommand.ExecuteAsync();
-        Assert.Single(fixture.ViewModel.Accounts);
-        Assert.Null(fixture.ViewModel.SelectedAccount);
-        Assert.Equal("本机账号 · 1/2", fixture.ViewModel.AccountCountText);
-        fixture.ViewModel.ShowHidden = true;
-        fixture.ViewModel.ShowHidden = true;
-        fixture.ViewModel.SelectedAccount = fixture.ViewModel.Accounts.Single(account => account.IsHidden);
-        await fixture.ViewModel.HideAccountCommand.ExecuteAsync();
+        fixture.AccountsPageVM.SelectedAccount = fixture.AccountsPageVM.Accounts[0];
+        await fixture.AccountsPageVM.HideAccountCommand.ExecuteAsync();
+        Assert.Single(fixture.AccountsPageVM.Accounts);
+        Assert.Null(fixture.AccountsPageVM.SelectedAccount);
+        Assert.Equal("本机账号 · 1/2", fixture.AccountsPageVM.AccountCountText);
+        fixture.AccountsPageVM.ShowHidden = true;
+        fixture.AccountsPageVM.ShowHidden = true;
+        fixture.AccountsPageVM.SelectedAccount = fixture.AccountsPageVM.Accounts.Single(account => account.IsHidden);
+        await fixture.AccountsPageVM.HideAccountCommand.ExecuteAsync();
         Assert.Empty(fixture.Store.Settings.HiddenAccounts);
-        Assert.Equal(2, fixture.ViewModel.Accounts.Count);
+        Assert.Equal(2, fixture.AccountsPageVM.Accounts.Count);
         Assert.Empty(fixture.Steam.LaunchedAccounts);
     }
 
@@ -201,12 +269,12 @@ public sealed class MainViewModelTests
         var fixture = new Fixture();
         fixture.Store.Settings.HiddenAccounts = ["1", "2"];
         await fixture.ViewModel.InitializeAsync();
-        Assert.True(fixture.ViewModel.NoAccounts);
-        fixture.ViewModel.ShowHidden = true;
-        fixture.ViewModel.SelectedAccount = fixture.ViewModel.Accounts[0];
-        fixture.ViewModel.ShowHidden = false;
-        Assert.Null(fixture.ViewModel.SelectedAccount);
-        Assert.True(fixture.ViewModel.NoAccounts);
+        Assert.True(fixture.AccountsPageVM.NoAccounts);
+        fixture.AccountsPageVM.ShowHidden = true;
+        fixture.AccountsPageVM.SelectedAccount = fixture.AccountsPageVM.Accounts[0];
+        fixture.AccountsPageVM.ShowHidden = false;
+        Assert.Null(fixture.AccountsPageVM.SelectedAccount);
+        Assert.True(fixture.AccountsPageVM.NoAccounts);
     }
 
     /// <summary>账号未选择时保存、隐藏和切号统一提示，且不会持久保存任何设置。</summary>
@@ -217,9 +285,9 @@ public sealed class MainViewModelTests
     public async Task AccountCommandsWithoutSelectionReportErrorAndLeaveSettingsUntouched(string action)
     {
         var fixture = await Fixture.ReadyAsync();
-        var command = action switch { "Save" => fixture.ViewModel.SaveAccountCommand, "Hide" => fixture.ViewModel.HideAccountCommand, _ => fixture.ViewModel.SwitchAndLaunchCommand };
+        var command = action switch { "Save" => fixture.AccountsPageVM.SaveAccountCommand, "Hide" => fixture.AccountsPageVM.HideAccountCommand, _ => fixture.AccountsPageVM.SwitchAndLaunchCommand };
         await command.ExecuteAsync();
-        Assert.Contains("选择", fixture.ViewModel.Status);
+        Assert.Contains("选择", fixture.Workspace.Status);
         Assert.Single(fixture.Interaction.Notices);
         Assert.Equal(0, fixture.Store.SaveCount);
         Assert.Empty(fixture.Steam.LaunchedAccounts);
@@ -233,19 +301,19 @@ public sealed class MainViewModelTests
         fixture.Store.Settings.SourceProfile = "11223344";
         fixture.Store.Settings.AccountBindings["2"] = "aabbccdd";
         await fixture.ViewModel.InitializeAsync();
-        fixture.ViewModel.SelectedAccount = fixture.ViewModel.Accounts[0];
-        fixture.ViewModel.SteamPath = "C:\\UnsavedSteam";
-        fixture.ViewModel.GamePath = "C:\\UnsavedGame";
+        fixture.AccountsPageVM.SelectedAccount = fixture.AccountsPageVM.Accounts[0];
+        fixture.SettingsPageVM.SteamPath = "C:\\UnsavedSteam";
+        fixture.SettingsPageVM.GamePath = "C:\\UnsavedGame";
 
-        await fixture.ViewModel.SwitchAndLaunchCommand.ExecuteAsync();
+        await fixture.AccountsPageVM.SwitchAndLaunchCommand.ExecuteAsync();
 
         var share = Assert.Single(fixture.Resources.Shared);
         Assert.Equal("C:\\Fixture\\Game", share.Game);
         Assert.Equal("11223344", share.Source);
         Assert.Equal(new[] { "aabbccdd" }, share.Targets);
         Assert.Equal(("C:\\Fixture\\Steam", "2"), Assert.Single(fixture.Steam.LaunchedAccounts));
-        Assert.Equal("已启动测试账号", fixture.ViewModel.Status);
-        Assert.Equal("2", fixture.ViewModel.SelectedAccount?.Account.SteamId);
+        Assert.Equal("已启动测试账号", fixture.Workspace.Status);
+        Assert.Equal("2", fixture.AccountsPageVM.SelectedAccount?.Account.SteamId);
     }
 
     /// <summary>账号绑定共享来源自身时直接启动，不向核心服务请求来源指向自身的链接。</summary>
@@ -256,8 +324,8 @@ public sealed class MainViewModelTests
         fixture.Store.Settings.SourceProfile = "11223344";
         fixture.Store.Settings.AccountBindings["2"] = "11223344";
         await fixture.ViewModel.InitializeAsync();
-        fixture.ViewModel.SelectedAccount = fixture.ViewModel.Accounts[0];
-        await fixture.ViewModel.SwitchAndLaunchCommand.ExecuteAsync();
+        fixture.AccountsPageVM.SelectedAccount = fixture.AccountsPageVM.Accounts[0];
+        await fixture.AccountsPageVM.SwitchAndLaunchCommand.ExecuteAsync();
         Assert.Empty(fixture.Resources.Shared);
         Assert.Equal(("C:\\Fixture\\Steam", "2"), Assert.Single(fixture.Steam.LaunchedAccounts));
         Assert.Empty(fixture.Interaction.Notices);
@@ -272,11 +340,11 @@ public sealed class MainViewModelTests
         var fixture = new Fixture();
         fixture.Store.Settings.SourceProfile = source;
         await fixture.ViewModel.InitializeAsync();
-        fixture.ViewModel.SelectedAccount = fixture.ViewModel.Accounts[0];
-        await fixture.ViewModel.SwitchAndLaunchCommand.ExecuteAsync();
+        fixture.AccountsPageVM.SelectedAccount = fixture.AccountsPageVM.Accounts[0];
+        await fixture.AccountsPageVM.SwitchAndLaunchCommand.ExecuteAsync();
         Assert.Single(fixture.Steam.LaunchedAccounts);
         Assert.Empty(fixture.Resources.Shared);
-        if (source.Length != 0) Assert.Contains(fixture.ViewModel.Logs, line => line.Contains("未绑定"));
+        if (source.Length != 0) Assert.Contains(fixture.Workspace.Logs, line => line.Contains("未绑定"));
     }
 
     /// <summary>失效人工绑定应保留并阻止切号，无论当前是否设置来源。</summary>
@@ -286,10 +354,10 @@ public sealed class MainViewModelTests
         var fixture = new Fixture();
         fixture.Store.Settings.AccountBindings["2"] = "deadbeef";
         await fixture.ViewModel.InitializeAsync();
-        fixture.ViewModel.SelectedAccount = fixture.ViewModel.Accounts[0];
-        await fixture.ViewModel.SwitchAndLaunchCommand.ExecuteAsync();
+        fixture.AccountsPageVM.SelectedAccount = fixture.AccountsPageVM.Accounts[0];
+        await fixture.AccountsPageVM.SwitchAndLaunchCommand.ExecuteAsync();
         Assert.Equal("deadbeef", fixture.Store.Settings.AccountBindings["2"]);
-        Assert.Contains("已不存在", fixture.ViewModel.Status);
+        Assert.Contains("已不存在", fixture.Workspace.Status);
         Assert.Empty(fixture.Steam.LaunchedAccounts);
     }
 
@@ -300,10 +368,10 @@ public sealed class MainViewModelTests
         var fixture = new Fixture();
         fixture.Discovery.Result = new DiscoveryResult { Accounts = fixture.Discovery.Result.Accounts };
         await fixture.ViewModel.InitializeAsync();
-        fixture.ViewModel.SelectedAccount = fixture.ViewModel.Accounts[0];
-        fixture.ViewModel.SteamPath = "C:\\UnsavedSteam";
-        await fixture.ViewModel.SwitchAndLaunchCommand.ExecuteAsync();
-        await fixture.ViewModel.RestoreSteamCommand.ExecuteAsync();
+        fixture.AccountsPageVM.SelectedAccount = fixture.AccountsPageVM.Accounts[0];
+        fixture.SettingsPageVM.SteamPath = "C:\\UnsavedSteam";
+        await fixture.AccountsPageVM.SwitchAndLaunchCommand.ExecuteAsync();
+        await fixture.BackupsPageVM.RestoreSteamCommand.ExecuteAsync();
         Assert.Equal(2, fixture.Interaction.Notices.Count);
         Assert.Empty(fixture.Steam.LaunchedAccounts);
         Assert.Empty(fixture.Steam.RestoredPaths);
@@ -318,14 +386,14 @@ public sealed class MainViewModelTests
     public async Task SavingSourceRejectsInvalidSelections(string kind)
     {
         var fixture = await Fixture.ReadyAsync();
-        fixture.ViewModel.SelectedSource = kind switch
+        fixture.ResourcesPageVM.SelectedSource = kind switch
         {
             "None" => null,
             "Missing" => Fixture.Profile("deadbeef", 1),
-            "Linked" => fixture.ViewModel.Profiles.Single(profile => profile.IsLinked),
-            _ => fixture.ViewModel.Profiles.Single(profile => profile.Bytes == 0 && !profile.IsLinked)
+            "Linked" => fixture.ResourcesPageVM.Profiles.Single(profile => profile.IsLinked),
+            _ => fixture.ResourcesPageVM.Profiles.Single(profile => profile.Bytes == 0 && !profile.IsLinked)
         };
-        await fixture.ViewModel.SaveSourceCommand.ExecuteAsync();
+        await fixture.ResourcesPageVM.SaveSourceCommand.ExecuteAsync();
         Assert.Equal(0, fixture.Store.SaveCount);
         Assert.Single(fixture.Interaction.Notices);
     }
@@ -338,10 +406,10 @@ public sealed class MainViewModelTests
         fixture.Store.Settings.SourceProfile = "deadbeef";
         fixture.Store.Settings.AccountBindings["2"] = "aabbccdd";
         await fixture.ViewModel.InitializeAsync();
-        fixture.ViewModel.SelectedAccount = fixture.ViewModel.Accounts[0];
-        await fixture.ViewModel.SwitchAndLaunchCommand.ExecuteAsync();
+        fixture.AccountsPageVM.SelectedAccount = fixture.AccountsPageVM.Accounts[0];
+        await fixture.AccountsPageVM.SwitchAndLaunchCommand.ExecuteAsync();
         Assert.Empty(fixture.Steam.LaunchedAccounts);
-        Assert.Contains("资源来源", fixture.ViewModel.Status);
+        Assert.Contains("资源来源", fixture.Workspace.Status);
     }
 
     /// <summary>活动游戏路径丢失时，即使界面保留来源对象也不可保存为共享来源。</summary>
@@ -352,10 +420,10 @@ public sealed class MainViewModelTests
         fixture.Discovery.Result = new DiscoveryResult();
         await fixture.ViewModel.InitializeAsync();
         var source = Fixture.Profile("11223344", 1);
-        fixture.ViewModel.Profiles.Add(source);
-        fixture.ViewModel.SelectedSource = source;
-        await fixture.ViewModel.SaveSourceCommand.ExecuteAsync();
-        Assert.Contains("检测 Master Duel", fixture.ViewModel.Status);
+        fixture.ResourcesPageVM.Profiles.Add(source);
+        fixture.ResourcesPageVM.SelectedSource = source;
+        await fixture.ResourcesPageVM.SaveSourceCommand.ExecuteAsync();
+        Assert.Contains("安装目录", fixture.Workspace.Status);
         Assert.Equal(0, fixture.Store.SaveCount);
     }
 
@@ -366,14 +434,14 @@ public sealed class MainViewModelTests
     public async Task SharingPersistsSourceAndReportsCreatedOrAlreadyCurrentState(bool createBackup)
     {
         var fixture = await Fixture.ReadyAsync();
-        fixture.ViewModel.SelectedSource = fixture.ViewModel.SourceProfiles[0];
+        fixture.ResourcesPageVM.SelectedSource = fixture.ResourcesPageVM.SourceProfiles[0];
         fixture.Resources.ShareResult = createBackup ? new ShareBackup { Entries = [new ShareEntry(), new ShareEntry()] } : null;
-        await fixture.ViewModel.SaveSourceCommand.ExecuteAsync();
+        await fixture.ResourcesPageVM.SaveSourceCommand.ExecuteAsync();
         Assert.Equal("11223344", fixture.Store.Settings.SourceProfile);
-        await fixture.ViewModel.EnableSharingCommand.ExecuteAsync();
+        await fixture.ResourcesPageVM.EnableSharingCommand.ExecuteAsync();
         var share = Assert.Single(fixture.Resources.Shared);
         Assert.Equal(new[] { "aabbccdd", "55667788" }, share.Targets);
-        Assert.Equal(createBackup ? "资源共享已启用；已保留 2 个目录的还原记录。" : "资源共享已是最新状态。", fixture.ViewModel.Status);
+        Assert.Equal(createBackup ? "资源共享已启用；已保留 2 个目录的还原记录。" : "资源共享已是最新状态。", fixture.Workspace.Status);
     }
 
     /// <summary>仅有来源目录时禁止建立空共享事务。</summary>
@@ -383,9 +451,9 @@ public sealed class MainViewModelTests
         var fixture = new Fixture();
         fixture.Resources.Profiles = [Fixture.Profile("11223344", 1)];
         await fixture.ViewModel.InitializeAsync();
-        fixture.ViewModel.SelectedSource = fixture.ViewModel.SourceProfiles[0];
-        await fixture.ViewModel.EnableSharingCommand.ExecuteAsync();
-        Assert.Contains("只有来源", fixture.ViewModel.Status);
+        fixture.ResourcesPageVM.SelectedSource = fixture.ResourcesPageVM.SourceProfiles[0];
+        await fixture.ResourcesPageVM.EnableSharingCommand.ExecuteAsync();
+        Assert.Contains("只有来源", fixture.Workspace.Status);
         Assert.Empty(fixture.Resources.Shared);
         Assert.Equal(0, fixture.Store.SaveCount);
     }
@@ -395,17 +463,17 @@ public sealed class MainViewModelTests
     public async Task ResourceRestoreRequiresSelectionAndPreservesIdempotence()
     {
         var fixture = await Fixture.ReadyAsync();
-        await fixture.ViewModel.RestoreResourcesCommand.ExecuteAsync();
-        Assert.Contains("选择", fixture.ViewModel.Status);
-        fixture.ViewModel.SelectedBackup = new ShareBackup { Id = "restored", Restored = true };
-        await fixture.ViewModel.RestoreResourcesCommand.ExecuteAsync();
-        Assert.Contains("已经完成", fixture.ViewModel.Status);
+        await fixture.BackupsPageVM.RestoreResourcesCommand.ExecuteAsync();
+        Assert.Contains("选择", fixture.Workspace.Status);
+        fixture.BackupsPageVM.SelectedBackup = new ShareBackup { Id = "restored", Restored = true };
+        await fixture.BackupsPageVM.RestoreResourcesCommand.ExecuteAsync();
+        Assert.Contains("已经完成", fixture.Workspace.Status);
         Assert.Empty(fixture.Resources.RestoredIds);
-        fixture.ViewModel.SelectedBackup = fixture.ViewModel.Backups[0];
-        await fixture.ViewModel.RestoreResourcesCommand.ExecuteAsync();
+        fixture.BackupsPageVM.SelectedBackup = fixture.BackupsPageVM.Backups[0];
+        await fixture.BackupsPageVM.RestoreResourcesCommand.ExecuteAsync();
         Assert.Equal(new[] { "backup" }, fixture.Resources.RestoredIds);
-        Assert.Null(fixture.ViewModel.SelectedBackup);
-        Assert.Contains("已还原", fixture.ViewModel.Status);
+        Assert.Null(fixture.BackupsPageVM.SelectedBackup);
+        Assert.Contains("已还原", fixture.Workspace.Status);
     }
 
     /// <summary>损坏存储阻止写入和同步，但仍允许既有资源备份还原及后续读取恢复。</summary>
@@ -413,24 +481,24 @@ public sealed class MainViewModelTests
     public async Task CorruptStorageBlocksWritesButAllowsExistingResourceRestoreWithoutAccountSync()
     {
         var fixture = await Fixture.ReadyAsync();
-        fixture.ViewModel.SelectedAccount = fixture.ViewModel.Accounts[0];
-        fixture.ViewModel.SelectedSource = fixture.ViewModel.SourceProfiles[0];
-        fixture.ViewModel.SelectedBackup = fixture.ViewModel.Backups[0];
+        fixture.AccountsPageVM.SelectedAccount = fixture.AccountsPageVM.Accounts[0];
+        fixture.ResourcesPageVM.SelectedSource = fixture.ResourcesPageVM.SourceProfiles[0];
+        fixture.BackupsPageVM.SelectedBackup = fixture.BackupsPageVM.Backups[0];
         var syncCount = fixture.Store.SyncCount;
         fixture.Store.LoadError = new InvalidDataException("数据库损坏");
         await fixture.ViewModel.RefreshCommand.ExecuteAsync();
-        Assert.False(fixture.ViewModel.StorageReady);
-        var commands = new[] { fixture.ViewModel.SaveAccountCommand, fixture.ViewModel.HideAccountCommand, fixture.ViewModel.SaveSourceCommand, fixture.ViewModel.EnableSharingCommand, fixture.ViewModel.SaveSettingsCommand, fixture.ViewModel.AutoDetectCommand, fixture.ViewModel.ToggleThemeCommand, fixture.ViewModel.SwitchAndLaunchCommand };
+        Assert.False(fixture.Workspace.StorageReady);
+        var commands = new[] { fixture.AccountsPageVM.SaveAccountCommand, fixture.AccountsPageVM.HideAccountCommand, fixture.ResourcesPageVM.SaveSourceCommand, fixture.ResourcesPageVM.EnableSharingCommand, fixture.SettingsPageVM.SaveSettingsCommand, fixture.SettingsPageVM.AutoDetectCommand, fixture.SettingsPageVM.ToggleThemeCommand, fixture.AccountsPageVM.SwitchAndLaunchCommand };
         foreach (var command in commands) await command.ExecuteAsync();
         Assert.Equal(0, fixture.Store.SaveCount);
         Assert.Equal(syncCount, fixture.Store.SyncCount);
-        await fixture.ViewModel.RestoreResourcesCommand.ExecuteAsync();
+        await fixture.BackupsPageVM.RestoreResourcesCommand.ExecuteAsync();
         Assert.Equal(new[] { "backup" }, fixture.Resources.RestoredIds);
         Assert.Equal(syncCount, fixture.Store.SyncCount);
-        Assert.False(fixture.ViewModel.StorageReady);
+        Assert.False(fixture.Workspace.StorageReady);
         fixture.Store.LoadError = null;
         await fixture.ViewModel.RefreshCommand.ExecuteAsync();
-        Assert.True(fixture.ViewModel.StorageReady);
+        Assert.True(fixture.Workspace.StorageReady);
         Assert.Equal(syncCount + 1, fixture.Store.SyncCount);
     }
 
@@ -441,8 +509,8 @@ public sealed class MainViewModelTests
         var fixture = new Fixture();
         fixture.Store.LoadError = new InvalidDataException("数据库损坏");
         await fixture.ViewModel.InitializeAsync();
-        Assert.False(fixture.ViewModel.StorageReady);
-        Assert.True(fixture.ViewModel.IsReady);
+        Assert.False(fixture.Workspace.StorageReady);
+        Assert.True(fixture.Workspace.IsReady);
         Assert.Single(fixture.Interaction.Notices);
         Assert.Empty(fixture.Discovery.Requests);
         Assert.Empty(fixture.Theme.Applied);
@@ -454,10 +522,10 @@ public sealed class MainViewModelTests
     public async Task RestoringSteamUsesDetectedPathAndRefreshesAccounts()
     {
         var fixture = await Fixture.ReadyAsync();
-        fixture.ViewModel.SteamPath = "C:\\UnsavedSteam";
-        await fixture.ViewModel.RestoreSteamCommand.ExecuteAsync();
+        fixture.SettingsPageVM.SteamPath = "C:\\UnsavedSteam";
+        await fixture.BackupsPageVM.RestoreSteamCommand.ExecuteAsync();
         Assert.Equal(new[] { "C:\\Fixture\\Steam" }, fixture.Steam.RestoredPaths);
-        Assert.Equal("已还原测试登录配置", fixture.ViewModel.Status);
+        Assert.Equal("已还原测试登录配置", fixture.Workspace.Status);
         Assert.Equal(2, fixture.Store.SyncCount);
     }
 
@@ -471,11 +539,11 @@ public sealed class MainViewModelTests
     {
         var fixture = await Fixture.ReadyAsync();
         fixture.Interaction.PickedFolder = chosen;
-        await fixture.ViewModel.BrowseFolderCommand.ExecuteAsync(target);
+        await fixture.SettingsPageVM.BrowseFolderCommand.ExecuteAsync(target);
         var steam = target == "Steam";
         Assert.Equal(steam ? "C:\\Fixture\\Steam" : "C:\\Fixture\\Game", Assert.Single(fixture.Interaction.FolderRequests).Initial);
-        Assert.Equal(steam && chosen is not null ? chosen : "C:\\Fixture\\Steam", fixture.ViewModel.SteamPath);
-        Assert.Equal(!steam && chosen is not null ? chosen : "C:\\Fixture\\Game", fixture.ViewModel.GamePath);
+        Assert.Equal(steam && chosen is not null ? chosen : "C:\\Fixture\\Steam", fixture.SettingsPageVM.SteamPath);
+        Assert.Equal(!steam && chosen is not null ? chosen : "C:\\Fixture\\Game", fixture.SettingsPageVM.GamePath);
         Assert.Equal(0, fixture.Store.SaveCount);
     }
 
@@ -484,18 +552,18 @@ public sealed class MainViewModelTests
     public async Task SavingSettingsValidatesTrimmedPathsBeforePersistingAndAutoDetectClearsOverrides()
     {
         var fixture = await Fixture.ReadyAsync();
-        fixture.ViewModel.SteamPath = "  C:\\ManualSteam  ";
-        fixture.ViewModel.GamePath = "  C:\\ManualGame  ";
-        await fixture.ViewModel.SaveSettingsCommand.ExecuteAsync();
+        fixture.SettingsPageVM.SteamPath = "  C:\\ManualSteam  ";
+        fixture.SettingsPageVM.GamePath = "  C:\\ManualGame  ";
+        await fixture.SettingsPageVM.SaveSettingsCommand.ExecuteAsync();
         Assert.Equal("C:\\ManualSteam", fixture.Store.Settings.SteamPath);
         Assert.Equal("C:\\ManualGame", fixture.Store.Settings.GamePath);
         Assert.Equal(("C:\\ManualSteam", "C:\\ManualGame"), fixture.Discovery.Requests[1]);
         Assert.Equal(2, fixture.Store.SyncCount);
-        await fixture.ViewModel.AutoDetectCommand.ExecuteAsync();
+        await fixture.SettingsPageVM.AutoDetectCommand.ExecuteAsync();
         Assert.Empty(fixture.Store.Settings.SteamPath);
         Assert.Empty(fixture.Store.Settings.GamePath);
         Assert.Equal((null, null), fixture.Discovery.Requests[^1]);
-        Assert.Equal("已重新自动检测安装路径。", fixture.ViewModel.Status);
+        Assert.Equal("已重新自动检测安装路径。", fixture.Workspace.Status);
     }
 
     /// <summary>空白安装路径以自动发现提交；无效路径则不保存、不更新活动数据。</summary>
@@ -503,17 +571,17 @@ public sealed class MainViewModelTests
     public async Task SavingBlankSettingsUsesAutoDiscoveryAndInvalidPathDoesNotPersist()
     {
         var fixture = await Fixture.ReadyAsync();
-        fixture.ViewModel.SteamPath = " ";
-        fixture.ViewModel.GamePath = " ";
-        await fixture.ViewModel.SaveSettingsCommand.ExecuteAsync();
+        fixture.SettingsPageVM.SteamPath = " ";
+        fixture.SettingsPageVM.GamePath = " ";
+        await fixture.SettingsPageVM.SaveSettingsCommand.ExecuteAsync();
         Assert.Equal((null, null), fixture.Discovery.Requests[1]);
         Assert.Empty(fixture.Store.Settings.SteamPath);
         fixture.Discovery.Error = new ArgumentException("安装目录错误");
-        fixture.ViewModel.SteamPath = "invalid";
-        await fixture.ViewModel.SaveSettingsCommand.ExecuteAsync();
+        fixture.SettingsPageVM.SteamPath = "invalid";
+        await fixture.SettingsPageVM.SaveSettingsCommand.ExecuteAsync();
         Assert.Equal(1, fixture.Store.SaveCount);
         Assert.Empty(fixture.Store.Settings.SteamPath);
-        Assert.Contains("安装目录错误", fixture.ViewModel.Status);
+        Assert.Contains("安装目录错误", fixture.Workspace.Status);
     }
 
     /// <summary>主题命令在保存成功后应用新主题，并支持明暗两种偏好。</summary>
@@ -523,11 +591,11 @@ public sealed class MainViewModelTests
     public async Task ThemeCommandPersistsAndAppliesRequestedTheme(bool dark)
     {
         var fixture = await Fixture.ReadyAsync();
-        fixture.ViewModel.DarkTheme = dark;
-        await fixture.ViewModel.ToggleThemeCommand.ExecuteAsync();
+        fixture.SettingsPageVM.DarkTheme = dark;
+        await fixture.SettingsPageVM.ToggleThemeCommand.ExecuteAsync();
         Assert.Equal(dark, fixture.Store.Settings.DarkTheme);
         Assert.Equal(dark, fixture.Theme.Applied[^1]);
-        Assert.Equal("主题偏好已保存。", fixture.ViewModel.Status);
+        Assert.Equal("主题偏好已保存。", fixture.Workspace.Status);
     }
 
     /// <summary>添加账号说明由交互边界显示，不启动或更改 Steam。</summary>
@@ -535,7 +603,7 @@ public sealed class MainViewModelTests
     public async Task AddingAccountDisplaysSteamInstructionsOnly()
     {
         var fixture = new Fixture();
-        await fixture.ViewModel.AddAccountCommand.ExecuteAsync();
+        await fixture.AccountsPageVM.AddAccountCommand.ExecuteAsync();
         Assert.Contains("Steam", Assert.Single(fixture.Interaction.Notices).Content);
         Assert.Equal(0, fixture.Store.SaveCount);
         Assert.Empty(fixture.Steam.LaunchedAccounts);
@@ -545,12 +613,12 @@ public sealed class MainViewModelTests
     [Fact]
     public async Task ExplicitLoggerInjectionKeepsInitializationAndCommandBehavior()
     {
-        var fixture = new Fixture(NullLogger<MainViewModel>.Instance);
+        var fixture = new Fixture(NullLogger<WorkspaceService>.Instance);
         await fixture.ViewModel.InitializeAsync();
-        await fixture.ViewModel.NavigateCommand.ExecuteAsync("Settings");
-        Assert.True(fixture.ViewModel.StorageReady);
+        fixture.ViewModel.CurrentPage = "Settings";
+        Assert.True(fixture.Workspace.StorageReady);
         Assert.Equal("Settings", fixture.ViewModel.CurrentPage);
-        Assert.True(fixture.ViewModel.IsReady);
+        Assert.True(fixture.Workspace.IsReady);
     }
 
     /// <summary>事务失败时重启交互，并按已知异常类型展示具体提示或通用错误。</summary>
@@ -571,9 +639,9 @@ public sealed class MainViewModelTests
             "Argument" => new ArgumentException("错误详情"),
             _ => new Exception("内部隐私详情")
         };
-        await fixture.ViewModel.ToggleThemeCommand.ExecuteAsync();
-        Assert.True(fixture.ViewModel.IsReady);
-        Assert.False(fixture.ViewModel.IsBusy);
+        await fixture.SettingsPageVM.ToggleThemeCommand.ExecuteAsync();
+        Assert.True(fixture.Workspace.IsReady);
+        Assert.False(fixture.Workspace.IsBusy);
         var notice = Assert.Single(fixture.Interaction.Notices);
         Assert.Equal(exposesMessage, notice.Content.Contains("错误详情"));
         Assert.DoesNotContain("内部隐私详情", notice.Content);
@@ -592,11 +660,11 @@ public sealed class MainViewModelTests
         await fixture.Discovery.Entered.Task.WaitAsync(TimeSpan.FromSeconds(5));
         try
         {
-            Assert.True(fixture.ViewModel.IsBusy);
-            Assert.False(fixture.ViewModel.IsReady);
+            Assert.True(fixture.Workspace.IsBusy);
+            Assert.False(fixture.Workspace.IsReady);
             Assert.False(fixture.ViewModel.RefreshCommand.CanExecute(null));
-            Assert.False(fixture.ViewModel.NavigateCommand.CanExecute(null));
-            await fixture.ViewModel.NavigateCommand.ExecuteAsync("Settings");
+            Assert.False(fixture.SettingsPageVM.ToggleThemeCommand.CanExecute(null));
+            await fixture.SettingsPageVM.ToggleThemeCommand.ExecuteAsync();
             await fixture.ViewModel.RefreshCommand.ExecuteAsync();
             Assert.Equal("Accounts", fixture.ViewModel.CurrentPage);
             Assert.Equal(2, fixture.Discovery.Requests.Count);
@@ -617,8 +685,8 @@ public sealed class MainViewModelTests
         var fixture = await Fixture.ReadyAsync();
         fixture.Store.SaveError = new IOException("写入失败");
         fixture.Interaction.NoticeError = new InvalidOperationException("通知失败");
-        await Assert.ThrowsAsync<InvalidOperationException>(() => fixture.ViewModel.ToggleThemeCommand.ExecuteAsync());
-        Assert.True(fixture.ViewModel.IsReady);
+        await Assert.ThrowsAsync<InvalidOperationException>(() => fixture.SettingsPageVM.ToggleThemeCommand.ExecuteAsync());
+        Assert.True(fixture.Workspace.IsReady);
     }
 
     /// <summary>日志移除换行、截断超长结果并限制最近六十条。</summary>
@@ -626,16 +694,16 @@ public sealed class MainViewModelTests
     public async Task LogHistorySanitizesLongMessagesAndKeepsOnlySixtyRecentEntries()
     {
         var fixture = await Fixture.ReadyAsync();
-        fixture.ViewModel.SelectedAccount = fixture.ViewModel.Accounts[0];
+        fixture.AccountsPageVM.SelectedAccount = fixture.AccountsPageVM.Accounts[0];
         fixture.Steam.LaunchResult = "第一行\r\n" + new string('甲', 650);
-        await fixture.ViewModel.SwitchAndLaunchCommand.ExecuteAsync();
-        Assert.Equal(601, fixture.ViewModel.Status.Length);
-        Assert.EndsWith("…", fixture.ViewModel.Status);
-        Assert.DoesNotContain('\n', fixture.ViewModel.Status);
-        Assert.DoesNotContain('\r', fixture.ViewModel.Status);
-        for (var index = 0; index < 65; index++) await fixture.ViewModel.ToggleThemeCommand.ExecuteAsync();
-        Assert.Equal(60, fixture.ViewModel.Logs.Count);
-        Assert.Contains("主题偏好", fixture.ViewModel.Logs[0]);
+        await fixture.AccountsPageVM.SwitchAndLaunchCommand.ExecuteAsync();
+        Assert.Equal(601, fixture.Workspace.Status.Length);
+        Assert.EndsWith("…", fixture.Workspace.Status);
+        Assert.DoesNotContain('\n', fixture.Workspace.Status);
+        Assert.DoesNotContain('\r', fixture.Workspace.Status);
+        for (var index = 0; index < 65; index++) await fixture.SettingsPageVM.ToggleThemeCommand.ExecuteAsync();
+        Assert.Equal(60, fixture.Workspace.Logs.Count);
+        Assert.Contains("主题偏好", fixture.Workspace.Logs[0]);
     }
 
     /// <summary>异步命令支持 ICommand 入口、参数透传和可执行条件，禁用时没有副作用。</summary>
@@ -726,10 +794,30 @@ public sealed class MainViewModelTests
         public FakeTheme Theme { get; } = new();
         /// <summary>被测试的真实状态与命令对象。</summary>
         public MainViewModel ViewModel { get; }
+        /// <summary>跨页刷新、互斥与健康数据库状态。</summary>
+        public WorkspaceService Workspace { get; }
+        /// <summary>独立账号页的状态和操作。</summary>
+        public AccountsPageViewModel AccountsPageVM { get; }
+        /// <summary>独立资源页的状态和操作。</summary>
+        public ResourcesPageViewModel ResourcesPageVM { get; }
+        /// <summary>独立备份页的状态和操作。</summary>
+        public BackupsPageViewModel BackupsPageVM { get; }
+        /// <summary>独立设置页的状态和操作。</summary>
+        public SettingsPageViewModel SettingsPageVM { get; }
         /// <summary>创建一组互不共享状态的完整服务夹具。</summary>
-        public Fixture(bool elevated = true) => ViewModel = new MainViewModel(Store, Discovery, Steam, Resources, Interaction, Theme, new FakeEnvironment(elevated));
+        public Fixture(bool elevated = true) : this(elevated, null) { }
         /// <summary>在保持全部业务边界隔离的同时显式注入日志服务。</summary>
-        public Fixture(ILogger<MainViewModel> logger) => ViewModel = new MainViewModel(Store, Discovery, Steam, Resources, Interaction, Theme, new FakeEnvironment(true), logger);
+        public Fixture(ILogger<WorkspaceService> logger) : this(true, logger) { }
+        /// <summary>组合独立页面与共同工作区，不让 Shell 承担页面业务。</summary>
+        private Fixture(bool elevated, ILogger<WorkspaceService>? logger)
+        {
+            Workspace = new WorkspaceService(Store, Discovery, Resources, Interaction, Theme, logger);
+            ViewModel = new MainViewModel(Workspace, new FakeEnvironment(elevated));
+            AccountsPageVM = new AccountsPageViewModel(Workspace, Store, Steam, Resources, Interaction);
+            ResourcesPageVM = new ResourcesPageViewModel(Workspace, Store, Resources, Interaction);
+            BackupsPageVM = new BackupsPageViewModel(Workspace, Steam, Resources);
+            SettingsPageVM = new SettingsPageViewModel(Workspace, Store, Discovery, Interaction, Theme);
+        }
         /// <summary>创建并成功完成初始化的测试夹具。</summary>
         public static async Task<Fixture> ReadyAsync()
         {
@@ -752,6 +840,8 @@ public sealed class MainViewModelTests
         public Exception? LoadError { get; set; }
         /// <summary>可注入的保存异常。</summary>
         public Exception? SaveError { get; set; }
+        /// <summary>模拟本次发现账号提交数据库失败。</summary>
+        public Exception? SyncError { get; set; }
         /// <summary>已执行读取次数。</summary>
         public int LoadCount { get; private set; }
         /// <summary>已成功保存次数。</summary>
@@ -775,7 +865,7 @@ public sealed class MainViewModelTests
             SaveCount++;
         }
         /// <summary>记录健康存储收到的真实账号同步结果。</summary>
-        public void SynchronizeAccounts(IReadOnlyList<SteamAccount> accounts) { Synchronized = accounts.ToArray(); SyncCount++; }
+        public void SynchronizeAccounts(IReadOnlyList<SteamAccount> accounts) { if (SyncError is not null) throw SyncError; Synchronized = accounts.ToArray(); SyncCount++; }
         /// <summary>返回最近一次账号同步的完整元数据。</summary>
         public IReadOnlyList<SteamAccount> GetAccounts() => Synchronized;
         /// <summary>复制集合，避免未保存编辑泄漏到持久设置的预期结果。</summary>
@@ -827,6 +917,8 @@ public sealed class MainViewModelTests
     /// <summary>用完整资源对象模拟资源扫描与事务响应，不创建目录或链接。</summary>
     private sealed class FakeResources : IResourceSharingService
     {
+        /// <summary>旧跨页夹具不执行失效共享修复事务。</summary>
+        public ShareBackup? RepairInvalidSharing(string backupId) => null;
         /// <summary>同时覆盖已下载来源、已共享目标和空目录。</summary>
         public IReadOnlyList<ResourceProfile> Profiles { get; set; } = [Fixture.Profile("11223344", 1_073_741_824), Fixture.Profile("aabbccdd", 0, true), Fixture.Profile("55667788", 0)];
         /// <summary>可选资源事务清单。</summary>
@@ -858,6 +950,8 @@ public sealed class MainViewModelTests
     /// <summary>记录所有用户交互，并允许模拟取消与通知错误。</summary>
     private sealed class FakeInteraction : IUserInteraction
     {
+        /// <summary>跨页集成夹具默认取消未请求的事务确认。</summary>
+        public Task<bool> ConfirmAsync(string title, string content) => Task.FromResult(false);
         /// <summary>已展示的通知标题和内容。</summary>
         public List<(string Title, string Content)> Notices { get; } = [];
         /// <summary>文件夹选择器收到的标题和当前编辑路径。</summary>

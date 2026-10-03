@@ -1,0 +1,171 @@
+<Page x:Class="MasterDuelSwitcher.App.Views.Pages.AccountsPage"
+      xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+      xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+      xmlns:ui="http://schemas.lepo.co/wpfui/2022/xaml"
+      xmlns:local="clr-namespace:MasterDuelSwitcher.App.Views.Pages"
+      Title="账号切换" FontFamily="Segoe UI Variable, Microsoft YaHei UI, Segoe UI" FontSize="14"
+      Foreground="{DynamicResource TextFillColorPrimaryBrush}"
+      Background="{DynamicResource ApplicationBackgroundBrush}"
+      ScrollViewer.CanContentScroll="False"
+      IsEnabled="{Binding Workspace.IsReady}"
+      AutomationProperties.AutomationId="AccountsPage">
+    <Page.Resources>
+        <local:DeferredAvatarImageConverter x:Key="AvatarImageSource" />
+    </Page.Resources>
+    <Grid>
+        <!-- 左侧真实账号列表，右侧编辑所选账号的备注与资源绑定。 -->
+        <Grid x:Name="AccountsContent">
+            <Grid.ColumnDefinitions>
+                <ColumnDefinition Width="0.9*" MinWidth="260" />
+                <ColumnDefinition Width="20" />
+                <ColumnDefinition Width="1.1*" />
+            </Grid.ColumnDefinitions>
+            <Grid>
+                <Grid.RowDefinitions>
+                    <RowDefinition Height="Auto" />
+                    <RowDefinition Height="Auto" />
+                    <RowDefinition Height="*" />
+                    <RowDefinition Height="Auto" />
+                </Grid.RowDefinitions>
+                <ui:TextBox x:Name="AccountSearch" Text="{Binding SearchText, UpdateSourceTrigger=PropertyChanged}"
+                            PlaceholderText="搜索昵称、登录名、SteamID 或备注" Margin="0,0,0,14"
+                            AutomationProperties.AutomationId="AccountSearch">
+                    <ui:TextBox.Icon><ui:SymbolIcon Symbol="Search24" /></ui:TextBox.Icon>
+                </ui:TextBox>
+                <DockPanel Grid.Row="1" Margin="0,0,0,12">
+                    <TextBlock x:Name="AccountCount" Text="{Binding AccountCountText}" FontWeight="SemiBold" VerticalAlignment="Center" />
+                    <CheckBox x:Name="ShowHiddenToggle" Content="显示隐藏" DockPanel.Dock="Right" HorizontalAlignment="Right" FontSize="11"
+                              IsChecked="{Binding ShowHidden, Mode=TwoWay}" AutomationProperties.AutomationId="ShowHidden" />
+                </DockPanel>
+                <ListBox x:Name="AccountList" Grid.Row="2" Background="Transparent" BorderThickness="0" Padding="0"
+                         ItemContainerStyle="{StaticResource AccountItemStyle}" ItemsSource="{Binding Accounts}"
+                         SelectedItem="{Binding SelectedAccount, Mode=TwoWay}" ScrollViewer.HorizontalScrollBarVisibility="Disabled"
+                         ScrollViewer.VerticalScrollBarVisibility="Auto" ScrollViewer.CanContentScroll="True"
+                         VirtualizingPanel.IsVirtualizing="True" VirtualizingPanel.VirtualizationMode="Recycling"
+                         AutomationProperties.AutomationId="AccountList">
+                    <ListBox.ItemTemplate>
+                        <DataTemplate>
+                            <Grid>
+                                <Grid.ColumnDefinitions>
+                                    <ColumnDefinition Width="42" />
+                                    <ColumnDefinition Width="*" />
+                                    <ColumnDefinition Width="Auto" />
+                                </Grid.ColumnDefinitions>
+                                <Border Background="{DynamicResource ControlFillColorSecondaryBrush}" Width="36" Height="36" CornerRadius="10" VerticalAlignment="Top">
+                                    <Grid>
+                                        <Grid.Clip><RectangleGeometry Rect="0,0,36,36" RadiusX="10" RadiusY="10" /></Grid.Clip>
+                                        <TextBlock x:Name="AvatarInitial" Text="{Binding Initial}" Foreground="{DynamicResource AccentTextFillColorPrimaryBrush}"
+                                                   FontWeight="SemiBold" FontSize="17" HorizontalAlignment="Center" VerticalAlignment="Center"
+                                                   AutomationProperties.AutomationId="AvatarInitial">
+                                            <TextBlock.Style>
+                                                <Style TargetType="TextBlock">
+                                                    <Style.Triggers>
+                                                        <DataTrigger Binding="{Binding HasAvatar}" Value="True"><Setter Property="Visibility" Value="Collapsed" /></DataTrigger>
+                                                    </Style.Triggers>
+                                                </Style>
+                                            </TextBlock.Style>
+                                        </TextBlock>
+                                        <Image x:Name="AccountAvatarImage" Source="{Binding AvatarPath, Converter={StaticResource AvatarImageSource}}" Stretch="UniformToFill"
+                                               Visibility="{Binding HasAvatar, Converter={StaticResource BoolVisibility}}" ImageFailed="OnAvatarFailed"
+                                               AutomationProperties.AutomationId="AccountAvatarImage" />
+                                    </Grid>
+                                </Border>
+                                <StackPanel Grid.Column="1">
+                                    <TextBlock Text="{Binding Title}" FontWeight="SemiBold" FontSize="14" TextTrimming="CharacterEllipsis" />
+                                    <TextBlock Text="{Binding Subtitle}" Foreground="{DynamicResource TextFillColorSecondaryBrush}" FontSize="11"
+                                               Margin="0,4,0,8" TextTrimming="CharacterEllipsis" />
+                                    <TextBlock Text="{Binding Status}" Foreground="{DynamicResource AccentTextFillColorPrimaryBrush}" FontSize="10" />
+                                </StackPanel>
+                                <ui:Button Grid.Column="2" Appearance="Transparent" Padding="6" VerticalAlignment="Top"
+                                           ToolTip="{Binding StarLabel}" AutomationProperties.Name="{Binding StarLabel}"
+                                           Command="{Binding DataContext.ToggleStarCommand, RelativeSource={RelativeSource AncestorType=Page}}"
+                                           CommandParameter="{Binding}" AutomationProperties.AutomationId="StarAccount">
+                                    <ui:Button.Icon><ui:SymbolIcon Symbol="Star24" Filled="{Binding IsStarred}" /></ui:Button.Icon>
+                                </ui:Button>
+                            </Grid>
+                        </DataTemplate>
+                    </ListBox.ItemTemplate>
+                </ListBox>
+                <Border x:Name="AccountsEmpty" Grid.Row="2" Style="{StaticResource CardStyle}" VerticalAlignment="Top"
+                        Visibility="{Binding NoAccounts, Converter={StaticResource BoolVisibility}}">
+                    <StackPanel>
+                        <ui:SymbolIcon Symbol="PersonAdd24" Foreground="{DynamicResource TextFillColorSecondaryBrush}" HorizontalAlignment="Left"
+                                       FontSize="26" Margin="0,0,0,16" />
+                        <TextBlock Text="{Binding EmptyTitle}" Style="{StaticResource SectionStyle}" TextWrapping="Wrap" />
+                        <TextBlock Text="{Binding EmptyDescription}"
+                                   Style="{StaticResource MutedStyle}" Margin="0,10,0,0" />
+                    </StackPanel>
+                </Border>
+                <ui:Button Grid.Row="3" Content="添加账号的方式" Command="{Binding AddAccountCommand}" Margin="0,10,0,0"
+                           HorizontalAlignment="Stretch" HorizontalContentAlignment="Center" AutomationProperties.AutomationId="AddAccount">
+                    <ui:Button.Icon><ui:SymbolIcon Symbol="Add24" /></ui:Button.Icon>
+                </ui:Button>
+            </Grid>
+            <Border Grid.Column="2" Style="{StaticResource CardStyle}">
+                <ScrollViewer x:Name="AccountDetailsScroll" VerticalScrollBarVisibility="Auto" HorizontalScrollBarVisibility="Disabled">
+                    <StackPanel>
+                        <TextBlock Text="账号信息" Style="{StaticResource SectionStyle}" />
+                        <StackPanel x:Name="SelectedAccountPanel" Visibility="{Binding HasSelectedAccount, Converter={StaticResource BoolVisibility}}">
+                            <TextBlock x:Name="SelectedAccountTitle" Text="{Binding SelectedAccount.Account.DisplayName}" FontSize="21" FontWeight="SemiBold"
+                                       Margin="0,20,0,6" TextWrapping="Wrap" />
+                            <TextBlock x:Name="SelectedAccountId" Text="{Binding SelectedAccount.SteamIdLabel}" Style="{StaticResource PathStyle}" FontFamily="Segoe UI Variable, Microsoft YaHei UI, Segoe UI" />
+                            <TextBlock x:Name="SelectedAccountState" Text="{Binding SelectedAccount.LoginState}" Style="{StaticResource MutedStyle}" Margin="0,10,0,24" />
+                            <ui:Button x:Name="SelectedStarButton" Content="{Binding SelectedAccount.StarLabel}" Appearance="Transparent"
+                                       Command="{Binding ToggleStarCommand}" HorizontalAlignment="Left" Margin="0,0,0,18"
+                                       AutomationProperties.AutomationId="SelectedStarButton">
+                                <ui:Button.Icon><ui:SymbolIcon Symbol="Star24" Filled="{Binding SelectedAccount.IsStarred}" /></ui:Button.Icon>
+                            </ui:Button>
+                            <TextBlock Text="本地备注" FontWeight="SemiBold" Margin="0,0,0,8" />
+                            <ui:TextBox x:Name="AccountNote" Text="{Binding Note, UpdateSourceTrigger=PropertyChanged}" MaxLength="80"
+                                        AutomationProperties.AutomationId="AccountNote" />
+                            <TextBlock Text="绑定本账号的资源目录" FontWeight="SemiBold" Margin="0,19,0,8" />
+                            <ComboBox x:Name="AccountBinding" DisplayMemberPath="DisplayName" ItemsSource="{Binding BindingOptions}"
+                                      SelectedItem="{Binding SelectedBinding, Mode=TwoWay}" AutomationProperties.AutomationId="AccountBinding"
+                                      HorizontalAlignment="Stretch" />
+                            <TextBlock Text="先在游戏中确认账号对应的 LocalData 目录，再手工绑定。" Style="{StaticResource MutedStyle}"
+                                       FontSize="11" Margin="0,7,0,18" />
+                            <Grid>
+                                <Grid.ColumnDefinitions>
+                                    <ColumnDefinition Width="*" />
+                                    <ColumnDefinition Width="Auto" />
+                                </Grid.ColumnDefinitions>
+                                <ui:Button Content="保存账号信息" Command="{Binding SaveAccountCommand}" HorizontalAlignment="Left"
+                                           AutomationProperties.AutomationId="SaveAccount">
+                                    <ui:Button.Icon><ui:SymbolIcon Symbol="Save24" /></ui:Button.Icon>
+                                </ui:Button>
+                                <ui:Button x:Name="HideAccountButton" Grid.Column="1" Content="{Binding SelectedAccount.HideLabel}" Appearance="Transparent"
+                                           Command="{Binding HideAccountCommand}" AutomationProperties.AutomationId="HideAccount" />
+                            </Grid>
+                            <Border Background="{DynamicResource ControlFillColorSecondaryBrush}" CornerRadius="8" Padding="12" Margin="0,22,0,16">
+                                <TextBlock Text="已配置共享来源时，切换会先关联本账号的资源目录。Steam 会自行提示首次登录或会话验证。"
+                                           TextWrapping="Wrap" Foreground="{DynamicResource AccentTextFillColorPrimaryBrush}" FontSize="11" LineHeight="20" />
+                            </Border>
+                            <ui:Button Content="切换并启动" Appearance="Primary" Command="{Binding SwitchAndLaunchCommand}"
+                                       HorizontalAlignment="Stretch" HorizontalContentAlignment="Center" Padding="16,12" AutomationProperties.AutomationId="SwitchAndLaunch">
+                                <ui:Button.Icon><ui:SymbolIcon Symbol="Play24" /></ui:Button.Icon>
+                            </ui:Button>
+                        </StackPanel>
+                        <StackPanel x:Name="SelectAccountHint" Margin="0,44,0,0">
+                            <StackPanel.Style>
+                                <Style TargetType="StackPanel">
+                                    <Style.Triggers>
+                                        <DataTrigger Binding="{Binding HasSelectedAccount}" Value="True">
+                                            <Setter Property="Visibility" Value="Collapsed" />
+                                        </DataTrigger>
+                                    </Style.Triggers>
+                                </Style>
+                            </StackPanel.Style>
+                            <ui:SymbolIcon Symbol="Cursor24" Foreground="{DynamicResource AccentTextFillColorPrimaryBrush}" HorizontalAlignment="Left"
+                                           FontSize="30" Margin="0,0,0,18" />
+                            <TextBlock Text="从左侧选择一个账号" FontSize="19" FontWeight="SemiBold" TextWrapping="Wrap" />
+                            <TextBlock Text="备注和资源绑定保存在本机。切换前请先退出 Master Duel。" Style="{StaticResource MutedStyle}" Margin="0,12,0,0" />
+                            <TextBlock Text="首次使用" FontWeight="SemiBold" Margin="0,30,0,8" />
+                            <TextBlock Text="1  检查 Steam 与游戏路径&#10;2  在资源共享页选择已更新的来源&#10;3  为账号绑定资源目录后启动"
+                                       Style="{StaticResource MutedStyle}" />
+                        </StackPanel>
+                    </StackPanel>
+                </ScrollViewer>
+            </Border>
+        </Grid>
+    </Grid>
+</Page>

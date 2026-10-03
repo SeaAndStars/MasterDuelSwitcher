@@ -8,7 +8,7 @@
                 <Setter Property="Padding" Value="22" />
             </Style>
             <Style x:Key="HeadingStyle" TargetType="TextBlock">
-                <Setter Property="FontFamily" Value="Segoe UI Semibold, Microsoft YaHei UI" />
+                <Setter Property="FontFamily" Value="Segoe UI Variable, Microsoft YaHei UI, Segoe UI" />
                 <Setter Property="FontWeight" Value="SemiBold" />
                 <Setter Property="FontSize" Value="28" />
                 <Setter Property="Foreground" Value="{DynamicResource TextFillColorPrimaryBrush}" />
@@ -27,22 +27,6 @@
                 <Setter Property="FontFamily" Value="Cascadia Mono, Consolas" />
                 <Setter Property="FontSize" Value="11" />
             </Style>
-            <Style x:Key="NavStyle" TargetType="ui:Button" BasedOn="{StaticResource {x:Type ui:Button}}">
-                <Setter Property="HorizontalContentAlignment" Value="Left" />
-                <Setter Property="HorizontalAlignment" Value="Stretch" />
-                <Setter Property="Margin" Value="0,3" />
-                <Setter Property="Padding" Value="16,12" />
-                <Setter Property="FontSize" Value="14" />
-                <Setter Property="Appearance" Value="Transparent" />
-                <Setter Property="Foreground" Value="{DynamicResource TextFillColorSecondaryBrush}" />
-                <Style.Triggers>
-                    <DataTrigger Binding="{Binding RelativeSource={RelativeSource Self}, Path=Tag}" Value="True">
-                        <Setter Property="Appearance" Value="Secondary" />
-                        <Setter Property="Foreground" Value="{DynamicResource SystemAccentColorPrimaryBrush}" />
-                        <Setter Property="FontWeight" Value="SemiBold" />
-                    </DataTrigger>
-                </Style.Triggers>
-            </Style>
             <Style x:Key="AccountItemStyle" TargetType="ListBoxItem">
                 <Setter Property="HorizontalContentAlignment" Value="Stretch" />
                 <Setter Property="Padding" Value="0" />
@@ -60,11 +44,11 @@
                                     <Setter TargetName="AccountFrame" Property="Background" Value="{DynamicResource ControlFillColorSecondaryBrush}" />
                                 </Trigger>
                                 <Trigger Property="IsSelected" Value="True">
-                                    <Setter TargetName="AccountFrame" Property="BorderBrush" Value="{DynamicResource SystemAccentColorPrimaryBrush}" />
+                                    <Setter TargetName="AccountFrame" Property="BorderBrush" Value="{DynamicResource AccentButtonBackground}" />
                                     <Setter TargetName="AccountFrame" Property="Background" Value="{DynamicResource ControlFillColorSecondaryBrush}" />
                                 </Trigger>
                                 <Trigger Property="IsKeyboardFocused" Value="True">
-                                    <Setter TargetName="AccountFrame" Property="BorderBrush" Value="{DynamicResource SystemAccentColorPrimaryBrush}" />
+                                    <Setter TargetName="AccountFrame" Property="BorderBrush" Value="{DynamicResource AccentButtonBackground}" />
                                 </Trigger>
                             </ControlTemplate.Triggers>
                         </ControlTemplate>

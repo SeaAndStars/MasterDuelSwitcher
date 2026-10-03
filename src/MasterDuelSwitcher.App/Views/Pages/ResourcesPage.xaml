@@ -1,0 +1,72 @@
+<Page x:Class="MasterDuelSwitcher.App.Views.Pages.ResourcesPage"
+      xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+      xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+      xmlns:ui="http://schemas.lepo.co/wpfui/2022/xaml"
+      Title="资源共享" FontFamily="Segoe UI Variable, Microsoft YaHei UI, Segoe UI" FontSize="14"
+      ScrollViewer.CanContentScroll="False"
+      Background="Transparent" IsEnabled="{Binding Workspace.IsReady}" AutomationProperties.AutomationId="ResourcesPage">
+    <ScrollViewer VerticalScrollBarVisibility="Auto" HorizontalScrollBarVisibility="Disabled">
+        <StackPanel Margin="0,0,0,24">
+            <!-- 来源必须显式选择；按钮调用本页面独立的保存和共享命令。 -->
+            <ui:Card Padding="24" Margin="0,0,0,16">
+                <StackPanel>
+                    <ui:TextBlock Text="资源来源" FontSize="18" FontWeight="SemiBold" />
+                    <ui:TextBlock Text="先使用来源账号完成游戏内更新，再退出游戏并启用共享。目标原目录会保留为备份。"
+                                  TextWrapping="Wrap" Foreground="{DynamicResource TextFillColorSecondaryBrush}" Margin="0,8,0,16" />
+                    <Grid>
+                        <Grid.ColumnDefinitions><ColumnDefinition Width="*" /><ColumnDefinition Width="Auto" /></Grid.ColumnDefinitions>
+                        <ComboBox x:Name="SourceProfile" ItemsSource="{Binding SourceProfiles}" DisplayMemberPath="DisplayName"
+                                  SelectedItem="{Binding SelectedSource, Mode=TwoWay}" AutomationProperties.AutomationId="SourceProfile" />
+                        <ui:Button x:Name="SaveSourceButton" Grid.Column="1" Content="保存来源" Command="{Binding SaveSourceCommand}" Margin="12,0,0,0"
+                                   AutomationProperties.AutomationId="SaveSource">
+                            <ui:Button.Icon><ui:SymbolIcon Symbol="Save24" /></ui:Button.Icon>
+                        </ui:Button>
+                    </Grid>
+                    <ui:Button x:Name="EnableSharingButton" Content="为其他目录启用共享" Appearance="Primary" Command="{Binding EnableSharingCommand}"
+                               HorizontalAlignment="Left" Margin="0,16,0,0" AutomationProperties.AutomationId="EnableSharing">
+                        <ui:Button.Icon><ui:SymbolIcon Symbol="Link24" /></ui:Button.Icon>
+                    </ui:Button>
+                </StackPanel>
+            </ui:Card>
+            <!-- 列表显示实际扫描结果，不按账号昵称猜测目录映射。 -->
+            <ui:Card Padding="24" Margin="0,0,0,16">
+                <StackPanel>
+                    <ui:TextBlock Text="本机资源目录" FontSize="18" FontWeight="SemiBold" />
+                    <ui:TextBlock Text="{Binding Summary}" Foreground="{DynamicResource TextFillColorSecondaryBrush}" Margin="0,8,0,16" />
+                    <ui:ListView x:Name="ProfileList" ItemsSource="{Binding Profiles}" MinHeight="100" MaxHeight="350"
+                                 AutomationProperties.AutomationId="ProfileList">
+                        <ui:ListView.ItemTemplate>
+                            <DataTemplate>
+                                <StackPanel Orientation="Horizontal" Margin="0,8">
+                                    <ui:SymbolIcon Symbol="Folder24" Margin="0,0,12,0" />
+                                    <StackPanel>
+                                        <ui:TextBlock Text="{Binding DisplayName}" FontWeight="SemiBold" />
+                                        <ui:TextBlock Text="{Binding ResourcePath}" TextWrapping="Wrap" Foreground="{DynamicResource TextFillColorSecondaryBrush}" Margin="0,4,0,0" />
+                                    </StackPanel>
+                                </StackPanel>
+                            </DataTemplate>
+                        </ui:ListView.ItemTemplate>
+                    </ui:ListView>
+                    <ui:InfoBar x:Name="ResourcesEmpty" IsOpen="{Binding NoProfiles}" IsClosable="False" Severity="Informational"
+                                Title="尚未发现资源目录" Message="请先启动游戏生成账号目录，完成更新后退出游戏并刷新。" Margin="0,16,0,0" />
+                </StackPanel>
+            </ui:Card>
+            <!-- 失效事务由用户显式选择并在官方对话框确认，不自动覆盖现有目录。 -->
+            <ui:Card Padding="24">
+                <StackPanel>
+                    <ui:TextBlock Text="修复失效共享" FontSize="18" FontWeight="SemiBold" />
+                    <ui:TextBlock Text="手动删除过共享链接和旧备份时，选择原记录进行检查。修复会保留当前目录为新备份，并原样归档旧记录。"
+                                  TextWrapping="Wrap" Foreground="{DynamicResource TextFillColorSecondaryBrush}" Margin="0,8,0,16" />
+                    <ComboBox x:Name="RepairBackup" ItemsSource="{Binding RepairBackups}" DisplayMemberPath="DisplayName"
+                              SelectedItem="{Binding SelectedRepairBackup, Mode=TwoWay}" AutomationProperties.AutomationId="RepairBackup" />
+                    <ui:Button x:Name="RepairSharingButton" Content="检查并修复失效共享" Command="{Binding RepairSharingCommand}" HorizontalAlignment="Left"
+                               Margin="0,16,0,0" AutomationProperties.AutomationId="RepairSharing">
+                        <ui:Button.Icon><ui:SymbolIcon Symbol="ArrowSync24" /></ui:Button.Icon>
+                    </ui:Button>
+                    <ui:InfoBar IsOpen="{Binding NoRepairBackups}" IsClosable="False" Severity="Informational"
+                                Title="暂无待检查记录" Message="已有备份的共享记录请在“备份还原”中执行正常还原。" Margin="0,16,0,0" />
+                </StackPanel>
+            </ui:Card>
+        </StackPanel>
+    </ScrollViewer>
+</Page>

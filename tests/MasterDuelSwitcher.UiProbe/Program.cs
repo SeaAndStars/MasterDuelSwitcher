@@ -6,7 +6,9 @@ using System.Windows.Media;
 using System.Windows.Media.Imaging;
 using System.Windows.Threading;
 using MasterDuelSwitcher.App;
+using MasterDuelSwitcher.App.Services;
 using MasterDuelSwitcher.App.Views;
+using MasterDuelSwitcher.App.Views.Pages;
 using MasterDuelSwitcher.Core.Services;
 using MasterDuelSwitcher.App.ViewModels;
 using Microsoft.Extensions.DependencyInjection;
@@ -18,6 +20,12 @@ public static class Program
 {
     /// <summary>已完成检查的名称列表。</summary>
     private static readonly List<string> Checks = [];
+
+    /// <summary>实际记住账号中已成功取得并解码的头像数量，不输出账号标识。</summary>
+    private static int AvatarCount;
+
+    /// <summary>实际只读发现的账号总数，用于报告头像可用范围。</summary>
+    private static int AccountTotal;
 
     /// <summary>STA 入口，在独立配置目录运行窗口并写出截图及验证记录。</summary>
     [STAThread]
@@ -46,20 +54,23 @@ public static class Program
                 await viewModel.InitializeAsync();
                 await WaitForReady(window);
                 Assert(window.ActualWidth >= 900 && window.ActualHeight >= 620, "实际窗口尺寸");
+                await VerifyAccountFeaturesAsync(window, provider.GetRequiredService<AccountsPage>(), isolatedState);
                 Screenshot(window, Path.Combine(output, "accounts-light.png"));
-                Navigate(window, "ResourcesNav", "ResourcesPage");
+                await NavigateAsync(window, provider.GetRequiredService<ResourcesPage>());
                 Screenshot(window, Path.Combine(output, "resources-light.png"));
-                Navigate(window, "BackupsNav", "BackupsPage");
-                Navigate(window, "SettingsNav", "SettingsPage");
+                await NavigateAsync(window, provider.GetRequiredService<BackupsPage>());
+                var settingsPage = provider.GetRequiredService<SettingsPage>();
+                await NavigateAsync(window, settingsPage);
                 Screenshot(window, Path.Combine(output, "settings-light.png"));
-                var theme = Find<System.Windows.Controls.Primitives.ToggleButton>(window, "DarkThemeToggle");
+                var theme = Find<System.Windows.Controls.Primitives.ToggleButton>(settingsPage, "DarkThemeToggle");
                 theme.IsChecked = true;
-                await viewModel.ToggleThemeCommand.ExecuteAsync();
+                await settingsPage.ViewModel.ToggleThemeCommand.ExecuteAsync();
                 await Task.Delay(200);
                 Pump();
                 Assert(new SettingsStore(isolatedState).Load().DarkTheme, "深色主题配置已保存");
                 Screenshot(window, Path.Combine(output, "settings-dark.png"));
-                Navigate(window, "AccountsNav", "AccountsPage");
+                await CaptureOfficialDialogAsync(window, provider.GetRequiredService<IUserInteraction>(), Path.Combine(output, "content-dialog-dark.png"));
+                await NavigateAsync(window, provider.GetRequiredService<AccountsPage>());
                 window.Width = 900;
                 window.Height = 620;
                 Pump();
@@ -71,6 +82,8 @@ public static class Program
                     Checks,
                     WpfUiVersion = "4.3.0",
                     ActualWindowType = window.GetType().BaseType?.FullName,
+                    AvatarCount,
+                    AccountTotal,
                     VerifiedAtUtc = DateTimeOffset.UtcNow
                 }, new JsonSerializerOptions { WriteIndented = true }));
                 result = 0;
@@ -103,19 +116,137 @@ public static class Program
         Pump();
     }
 
-    /// <summary>执行窗口实际按钮绑定的导航命令并核对页面可见性。</summary>
-    private static void Navigate(MainWindow window, string buttonName, string pageName)
+    /// <summary>通过实际官方导航控件切换 DI 页面并核对显示实例与独立视图模型。</summary>
+    private static async Task NavigateAsync(MainWindow window, Page page)
     {
-        var button = Find<Button>(window, buttonName);
-        if (button.Command?.CanExecute(button.CommandParameter) == true) button.Command.Execute(button.CommandParameter);
-        else throw new InvalidOperationException($"导航命令未就绪：{buttonName}");
+        var navigation = Find<Wpf.Ui.Controls.NavigationView>(window, "MainNavigation");
+        Assert(navigation.Navigate(page.GetType()), $"官方导航接受 {page.GetType().Name}");
+        await Task.Delay(navigation.TransitionDuration);
         Pump();
-        Assert(Find<FrameworkElement>(window, pageName).Visibility == Visibility.Visible, $"导航 {pageName}");
+        Assert(page.IsVisible && navigation.SelectedItem?.TargetPageType == page.GetType(), $"导航显示 {page.GetType().Name}");
+        Assert(page.DataContext?.GetType().Name == page.GetType().Name + "ViewModel", $"独立模型 {page.GetType().Name}");
     }
 
     /// <summary>查找 XAML 命名控件，缺失时报告具体控件名。</summary>
-    private static T Find<T>(MainWindow window, string name) where T : class => window.FindName(name) as T
+    private static T Find<T>(FrameworkElement element, string name) where T : class => element.FindName(name) as T
         ?? throw new InvalidOperationException($"控件缺失或类型错误：{name}");
+
+    /// <summary>显示真实交互服务的官方内容对话框，记录渲染并正常关闭。</summary>
+    private static async Task CaptureOfficialDialogAsync(MainWindow window, IUserInteraction interaction, string output)
+    {
+        var pending = interaction.ShowNoticeAsync("共享状态检查", "已保留现有资源目录。操作记录保存在系统数据目录，可在备份还原页检查。");
+        await Task.Delay(350);
+        Pump();
+        var host = Find<Wpf.Ui.Controls.ContentDialogHost>(window, "DialogHost");
+        var dialog = host.Content as Wpf.Ui.Controls.ContentDialog
+            ?? throw new InvalidOperationException("实际通知没有使用官方 ContentDialog。");
+        Assert(dialog.IsVisible, "官方 ContentDialog 已显示");
+        Screenshot(window, output);
+        dialog.TemplateButtonCommand.Execute(Wpf.Ui.Controls.ContentDialogButton.Close);
+        await pending;
+        await Task.Delay(250);
+        Assert(!dialog.IsVisible, "官方 ContentDialog 正常关闭");
+    }
+
+    /// <summary>在隔离数据库验证实际搜索绑定、星标保存和账号列表的独立滚动。</summary>
+    private static async Task VerifyAccountFeaturesAsync(MainWindow window, AccountsPage page, string isolatedState)
+    {
+        var model = page.ViewModel;
+        Assert(model.Accounts.Count > 1, "本机账号已只读发现供实际交互验证");
+        AccountTotal = model.Accounts.Count;
+        await model.AvatarLoadingTask.WaitAsync(TimeSpan.FromSeconds(30));
+        Pump();
+        Assert(!model.Workspace.IsBusy, "后台头像加载不占用工作区忙碌状态");
+        AvatarCount = model.Accounts.Count(account => account.HasAvatar);
+        foreach (var account in model.Accounts.Where(account => account.HasAvatar))
+        {
+            using var avatarFile = File.OpenRead(account.AvatarPath!);
+            var decoder = BitmapDecoder.Create(avatarFile, BitmapCreateOptions.PreservePixelFormat, BitmapCacheOption.OnLoad);
+            if (decoder.Frames.Count == 0 || decoder.Frames[0].PixelWidth == 0 || decoder.Frames[0].PixelHeight == 0)
+                throw new InvalidOperationException("实际缓存头像没有可解码的像素。");
+        }
+        Checks.Add("全部已取得的真实头像缓存可完整解码");
+        var avatarAccount = model.Accounts.FirstOrDefault(account => account.HasAvatar);
+        if (avatarAccount is not null)
+        {
+            var avatarList = Find<ListBox>(page, "AccountList");
+            avatarList.ScrollIntoView(avatarAccount);
+            await Task.Delay(200);
+            Pump();
+            var image = Descendants<Image>(avatarList).FirstOrDefault(control => ReferenceEquals(control.DataContext, avatarAccount));
+            Assert(image?.Source is BitmapSource source && source.PixelWidth > 0 && source.PixelHeight > 0, "真实Steam账号头像已解码显示");
+        }
+        var selected = model.Accounts.Last();
+        var id = selected.Account.SteamId;
+        model.SelectedAccount = selected;
+        Pump();
+        Assert(Find<TextBlock>(page, "SelectedAccountTitle").Text == selected.Account.DisplayName
+            && Find<TextBlock>(page, "SelectedAccountId").Text == selected.SteamIdLabel,
+            "选中账号的名称和标识实际显示在右侧详情");
+        Assert(Equals(Find<Wpf.Ui.Controls.Button>(page, "SelectedStarButton").Content, selected.StarLabel)
+            && Equals(Find<Wpf.Ui.Controls.Button>(page, "HideAccountButton").Content, selected.HideLabel),
+            "选中账号的星标和隐藏操作具有正确文字");
+        var list = Find<ListBox>(page, "AccountList");
+        var search = Find<Wpf.Ui.Controls.TextBox>(page, "AccountSearch");
+        var listScroll = Descendants<ScrollViewer>(list).First();
+        var detailScroll = Ancestor<ScrollViewer>(Find<Wpf.Ui.Controls.TextBox>(page, "AccountNote"));
+        var searchPosition = search.TranslatePoint(new Point(), window);
+        double detailOffset = detailScroll.VerticalOffset;
+        Assert(listScroll.ScrollableHeight > 0, "左侧账号列表具有内部滚动范围");
+        listScroll.ScrollToBottom();
+        await Task.Delay(200);
+        Pump();
+        Assert(listScroll.VerticalOffset > 0, "左侧账号列表独立滚动");
+        Assert(detailScroll.VerticalOffset == detailOffset && search.TranslatePoint(new Point(), window) == searchPosition, "搜索栏和右侧详情保持固定");
+        model.Note = "界面验证中的未保存编辑";
+        var pendingBinding = model.BindingOptions.Last();
+        model.SelectedBinding = pendingBinding;
+        search.Text = id;
+        Pump();
+        Assert(model.SearchText == id && model.Accounts.Count == 1 && model.Accounts[0].Account.SteamId == id, "实际搜索控件双向绑定并精确筛选账号");
+        Assert(model.SelectedAccount?.Account.SteamId == id && model.Note == "界面验证中的未保存编辑" && model.SelectedBinding?.FolderName == pendingBinding.FolderName, "搜索保留选中账号及未保存编辑");
+        var star = Find<Wpf.Ui.Controls.Button>(page, "SelectedStarButton");
+        var starCommand = star.Command as AsyncCommand ?? throw new InvalidOperationException("星标按钮缺少实际异步命令。");
+        Checks.Add("星标按钮绑定实际异步命令");
+        await starCommand.ExecuteAsync(star.CommandParameter);
+        Assert(new SettingsStore(isolatedState).Load().StarredAccounts.Contains(id), "星标已保存到实际SQLite");
+        search.Text = "";
+        Pump();
+        Assert(model.SelectedAccount?.Account.SteamId == id
+            && Find<TextBlock>(page, "SelectedAccountTitle").Text == selected.Account.DisplayName,
+            "筛选恢复后账号详情仍显示原账号");
+        Assert(model.Accounts[0].Account.SteamId == id, "星标账号置顶");
+        await starCommand.ExecuteAsync(star.CommandParameter);
+        Assert(!new SettingsStore(isolatedState).Load().StarredAccounts.Contains(id), "取消星标已保存到SQLite");
+        search.Text = "__mdswitch-no-match__";
+        Pump();
+        Assert(model.NoAccounts && model.EmptyTitle.Contains("匹配", StringComparison.Ordinal), "无搜索结果显示正确空状态");
+        search.Text = "";
+        Pump();
+    }
+
+    /// <summary>从实际显示中的可视树枚举指定控件，用于检查模板内滚动容器。</summary>
+    private static IEnumerable<T> Descendants<T>(DependencyObject parent) where T : DependencyObject
+    {
+        for (int index = 0; index < VisualTreeHelper.GetChildrenCount(parent); index++)
+        {
+            var child = VisualTreeHelper.GetChild(parent, index);
+            if (child is T match) yield return match;
+            foreach (var descendant in Descendants<T>(child)) yield return descendant;
+        }
+    }
+
+    /// <summary>定位账号编辑器所属滚动容器，避免与列表模板滚动混淆。</summary>
+    private static T Ancestor<T>(DependencyObject element) where T : DependencyObject
+    {
+        var current = VisualTreeHelper.GetParent(element);
+        while (current is not null)
+        {
+            if (current is T match) return match;
+            current = VisualTreeHelper.GetParent(current);
+        }
+        throw new InvalidOperationException($"没有找到父级控件 {typeof(T).Name}。");
+    }
 
     /// <summary>处理待渲染消息，使截图反映交互后的实际布局。</summary>
     private static void Pump() => Dispatcher.CurrentDispatcher.Invoke(() => { }, DispatcherPriority.ApplicationIdle);

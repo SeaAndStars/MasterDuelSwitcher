@@ -3,6 +3,8 @@ namespace MasterDuelSwitcher.App.Services;
 /// <summary>将用户通知和文件夹选择隔离为可替换的界面交互接口。</summary>
 public interface IUserInteraction
 {
+    /// <summary>在官方 Fluent 内容对话框中明确确认事务操作，取消或关闭时返回否。</summary>
+    Task<bool> ConfirmAsync(string title, string content);
     /// <summary>显示可恢复的操作提示。</summary>
     Task ShowNoticeAsync(string title, string content);
     /// <summary>选择安装目录；用户取消时返回空引用。</summary>

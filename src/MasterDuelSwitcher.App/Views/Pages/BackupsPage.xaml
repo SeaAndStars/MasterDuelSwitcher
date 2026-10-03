@@ -1,0 +1,44 @@
+<Page x:Class="MasterDuelSwitcher.App.Views.Pages.BackupsPage"
+      xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+      xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+      xmlns:ui="http://schemas.lepo.co/wpfui/2022/xaml"
+      Title="备份还原" FontFamily="Segoe UI Variable, Microsoft YaHei UI, Segoe UI" FontSize="14"
+      Background="Transparent" IsEnabled="{Binding Workspace.IsReady}" ScrollViewer.CanContentScroll="False">
+    <ScrollViewer VerticalScrollBarVisibility="Auto" HorizontalScrollBarVisibility="Disabled">
+        <StackPanel Margin="0,0,0,24">
+            <!-- 资源事务列表保持用户显式选择，并单独显示真实空状态。 -->
+            <ui:Card Padding="24" Margin="0,0,0,16">
+                <StackPanel>
+                    <ui:TextBlock Text="资源共享备份" FontSize="18" FontWeight="SemiBold" />
+                    <ui:TextBlock Text="选择一次共享记录，恢复当时保留的资源目录。还原前请先退出游戏。"
+                                  TextWrapping="Wrap" Foreground="{DynamicResource TextFillColorSecondaryBrush}" Margin="0,8,0,16" />
+                    <ui:ListView x:Name="BackupList" ItemsSource="{Binding Backups}"
+                                 SelectedItem="{Binding SelectedBackup, Mode=TwoWay}" DisplayMemberPath="DisplayName"
+                                 SelectionMode="Single" MinHeight="140" MaxHeight="320"
+                                 AutomationProperties.AutomationId="BackupList" />
+                    <ui:InfoBar x:Name="BackupsEmpty" IsOpen="{Binding NoBackups}" IsClosable="False"
+                                Severity="Informational" Title="暂无共享备份"
+                                Message="启用资源共享后，还原记录会显示在这里。" Margin="0,16,0,0" />
+                    <ui:Button x:Name="RestoreResourcesButton" Content="还原选中备份" Appearance="Primary"
+                               Command="{Binding RestoreResourcesCommand}" HorizontalAlignment="Left" Margin="0,16,0,0"
+                               AutomationProperties.AutomationId="RestoreResources">
+                        <ui:Button.Icon><ui:SymbolIcon Symbol="ArrowUndo24" /></ui:Button.Icon>
+                    </ui:Button>
+                </StackPanel>
+            </ui:Card>
+            <!-- Steam 登录配置使用独立动作，避免与资源目录还原混淆。 -->
+            <ui:Card Padding="24">
+                <StackPanel>
+                    <ui:TextBlock Text="Steam 登录配置" FontSize="18" FontWeight="SemiBold" />
+                    <ui:TextBlock Text="恢复工具上次切号前保存的最近账号设置。Steam 会先正常退出。"
+                                  TextWrapping="Wrap" Foreground="{DynamicResource TextFillColorSecondaryBrush}" Margin="0,8,0,16" />
+                    <ui:Button x:Name="RestoreSteamButton" Content="还原上次 Steam 登录配置"
+                               Command="{Binding RestoreSteamCommand}" HorizontalAlignment="Left"
+                               AutomationProperties.AutomationId="RestoreSteam">
+                        <ui:Button.Icon><ui:SymbolIcon Symbol="ArrowUndo24" /></ui:Button.Icon>
+                    </ui:Button>
+                </StackPanel>
+            </ui:Card>
+        </StackPanel>
+    </ScrollViewer>
+</Page>

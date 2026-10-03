@@ -1,0 +1,51 @@
+<Page x:Class="MasterDuelSwitcher.App.Views.Pages.SettingsPage"
+      xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+      xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+      xmlns:ui="http://schemas.lepo.co/wpfui/2022/xaml"
+      Title="设置" Background="Transparent" ScrollViewer.CanContentScroll="False"
+      FontFamily="Segoe UI Variable, Microsoft YaHei UI, Segoe UI" FontSize="14">
+    <!-- 设置页只绑定自己的模型，共同状态由 Workspace 提供。 -->
+    <ScrollViewer VerticalScrollBarVisibility="Auto" HorizontalScrollBarVisibility="Disabled" IsEnabled="{Binding Workspace.IsReady}">
+        <StackPanel Margin="0,0,0,16">
+            <Border Style="{StaticResource CardStyle}" Margin="0,0,0,16">
+                <StackPanel>
+                    <TextBlock Text="安装路径" FontSize="28" FontWeight="SemiBold" Foreground="{DynamicResource TextFillColorPrimaryBrush}" />
+                    <TextBlock Text="选择包含 Steam.exe 的 Steam 目录和包含 masterduel.exe 的游戏目录。" Style="{StaticResource MutedStyle}" FontSize="14" Margin="0,8,0,18" />
+                    <TextBlock Text="Steam 目录" FontWeight="SemiBold" Margin="0,0,0,8" />
+                    <Grid>
+                        <Grid.ColumnDefinitions><ColumnDefinition Width="*" /><ColumnDefinition Width="Auto" /></Grid.ColumnDefinitions>
+                        <ui:TextBox x:Name="SteamPathBox" Text="{Binding SteamPath, UpdateSourceTrigger=PropertyChanged}" FontSize="14" AutomationProperties.AutomationId="SteamPath" />
+                        <ui:Button Grid.Column="1" Content="浏览" Icon="{ui:SymbolIcon FolderOpen24}" Command="{Binding BrowseFolderCommand}" CommandParameter="Steam" Margin="10,0,0,0" AutomationProperties.AutomationId="BrowseSteam" />
+                    </Grid>
+                    <TextBlock Text="Master Duel 目录" FontWeight="SemiBold" Margin="0,20,0,8" />
+                    <Grid>
+                        <Grid.ColumnDefinitions><ColumnDefinition Width="*" /><ColumnDefinition Width="Auto" /></Grid.ColumnDefinitions>
+                        <ui:TextBox x:Name="GamePathBox" Text="{Binding GamePath, UpdateSourceTrigger=PropertyChanged}" FontSize="14" AutomationProperties.AutomationId="GamePath" />
+                        <ui:Button Grid.Column="1" Content="浏览" Icon="{ui:SymbolIcon FolderOpen24}" Command="{Binding BrowseFolderCommand}" CommandParameter="Game" Margin="10,0,0,0" AutomationProperties.AutomationId="BrowseGame" />
+                    </Grid>
+                    <StackPanel Orientation="Horizontal" Margin="0,22,0,0">
+                        <ui:Button Content="保存并检测" Appearance="Primary" Icon="{ui:SymbolIcon Save24}" Command="{Binding SaveSettingsCommand}" AutomationProperties.AutomationId="SaveSettings" />
+                        <ui:Button Content="重新自动检测" Icon="{ui:SymbolIcon ArrowClockwise24}" Command="{Binding AutoDetectCommand}" Margin="10,0,0,0" AutomationProperties.AutomationId="AutoDetect" />
+                    </StackPanel>
+                </StackPanel>
+            </Border>
+            <Border Style="{StaticResource CardStyle}" Margin="0,0,0,16">
+                <Grid>
+                    <Grid.ColumnDefinitions><ColumnDefinition Width="*" /><ColumnDefinition Width="Auto" /></Grid.ColumnDefinitions>
+                    <StackPanel>
+                        <TextBlock Text="外观" FontSize="28" FontWeight="SemiBold" Foreground="{DynamicResource TextFillColorPrimaryBrush}" />
+                        <TextBlock Text="主题偏好自动保存在本机。" Style="{StaticResource MutedStyle}" FontSize="14" Margin="0,6,0,0" />
+                    </StackPanel>
+                    <ui:ToggleSwitch x:Name="DarkThemeToggle" Grid.Column="1" Content="深色主题" VerticalAlignment="Center" IsChecked="{Binding DarkTheme, Mode=TwoWay}" Command="{Binding ToggleThemeCommand}" AutomationProperties.AutomationId="DarkTheme" />
+                </Grid>
+            </Border>
+            <Border Style="{StaticResource CardStyle}">
+                <StackPanel>
+                    <TextBlock Text="本地工具数据" FontSize="28" FontWeight="SemiBold" Foreground="{DynamicResource TextFillColorPrimaryBrush}" />
+                    <TextBlock x:Name="StateDirectoryText" Text="{Binding Workspace.StateDirectory}" Style="{StaticResource MutedStyle}" FontSize="14" Margin="0,10,0,0" />
+                    <TextBlock Text="账号信息保存在系统数据目录。移动或删除 EXE 后，备注、绑定和隐藏状态仍保留。" Style="{StaticResource MutedStyle}" FontSize="14" Margin="0,10,0,0" />
+                </StackPanel>
+            </Border>
+        </StackPanel>
+    </ScrollViewer>
+</Page>

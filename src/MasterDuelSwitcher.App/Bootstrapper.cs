@@ -2,9 +2,13 @@ using System.IO;
 using MasterDuelSwitcher.App.Services;
 using MasterDuelSwitcher.App.ViewModels;
 using MasterDuelSwitcher.App.Views;
+using MasterDuelSwitcher.App.Views.Pages;
 using MasterDuelSwitcher.Core.Services;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Logging;
+using Wpf.Ui;
+using Wpf.Ui.Abstractions;
+using IThemeService = MasterDuelSwitcher.App.Services.IThemeService;
 
 namespace MasterDuelSwitcher.App;
 
@@ -24,9 +28,21 @@ public static class Bootstrapper
         services.AddSingleton<ISteamDiscoveryService, SteamDiscoveryService>();
         services.AddSingleton<ISteamAccountService>(provider => new SteamAccountService(stateDirectory, logger: provider.GetRequiredService<ILogger<SteamAccountService>>()));
         services.AddSingleton<IResourceSharingService>(provider => new ResourceSharingService(stateDirectory, logger: provider.GetRequiredService<ILogger<ResourceSharingService>>()));
+        services.AddSingleton<IAccountAvatarService>(provider => new AccountAvatarService(provider.GetRequiredService<ISettingsStore>().StateDirectory, logger: provider.GetRequiredService<ILogger<AccountAvatarService>>()));
         services.AddSingleton<IUserInteraction, WpfUserInteraction>();
         services.AddSingleton<IThemeService, FluentThemeService>();
+        services.AddSingleton<WorkspaceService>();
         services.AddSingleton<MainViewModel>();
+        services.AddSingleton<AccountsPageViewModel>();
+        services.AddSingleton<ResourcesPageViewModel>();
+        services.AddSingleton<BackupsPageViewModel>();
+        services.AddSingleton<SettingsPageViewModel>();
+        services.AddSingleton<AccountsPage>();
+        services.AddSingleton<ResourcesPage>();
+        services.AddSingleton<BackupsPage>();
+        services.AddSingleton<SettingsPage>();
+        services.AddSingleton<INavigationViewPageProvider, PageService>();
+        services.AddSingleton<INavigationService, NavigationService>();
         services.AddSingleton<MainWindow>();
         return services.BuildServiceProvider();
     }

@@ -46,11 +46,13 @@ public sealed class BootstrapperTests
         Assert.IsType<SteamDiscoveryService>(services.GetRequiredService<ISteamDiscoveryService>());
         Assert.IsType<SteamAccountService>(services.GetRequiredService<ISteamAccountService>());
         Assert.IsType<ResourceSharingService>(services.GetRequiredService<IResourceSharingService>());
+        Assert.IsType<AccountAvatarService>(services.GetRequiredService<IAccountAvatarService>());
+        Assert.Same(services.GetRequiredService<IAccountAvatarService>(), services.GetRequiredService<IAccountAvatarService>());
         Assert.IsType<WpfUserInteraction>(services.GetRequiredService<IUserInteraction>());
         Assert.IsType<FluentThemeService>(services.GetRequiredService<IThemeService>());
         var viewModel = services.GetRequiredService<MainViewModel>();
-        Assert.Equal(stateDirectory, viewModel.StateDirectory);
-        Assert.False(viewModel.StorageReady);
+        Assert.Equal(stateDirectory, viewModel.Workspace.StateDirectory);
+        Assert.False(viewModel.Workspace.StorageReady);
         Assert.Same(viewModel, services.GetRequiredService<MainViewModel>());
         Assert.False(File.Exists(Path.Combine(stateDirectory, "accounts.db")));
     }

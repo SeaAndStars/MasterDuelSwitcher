@@ -1,10 +1,21 @@
 using MasterDuelSwitcher.Core.Models;
+using MasterDuelSwitcher.App.ViewModels;
 
 namespace MasterDuelSwitcher.App;
 
-/// <summary>账号列表的显示数据，仅包含账号标识、备注和资源绑定。</summary>
-public sealed class AccountItem
+/// <summary>账号列表的显示数据，包含人工信息与异步头像状态。</summary>
+public sealed class AccountItem : ObservableViewModel
 {
+    /// <summary>异步发现的有效本地头像路径，空值显示首字头像。</summary>
+    private string? _avatarPath;
+    /// <summary>绑定图像控件的头像路径，发现过程独立于账号列表排序。</summary>
+    public string? AvatarPath
+    {
+        get => _avatarPath;
+        set { if (Set(ref _avatarPath, value)) Notify(nameof(HasAvatar)); }
+    }
+    /// <summary>当前是否具备可显示的头像。</summary>
+    public bool HasAvatar => !string.IsNullOrEmpty(AvatarPath);
     /// <summary>Steam 发现服务返回的真实账号。</summary>
     public required SteamAccount Account { get; init; }
     /// <summary>用户保存的本地备注。</summary>
@@ -13,11 +24,15 @@ public sealed class AccountItem
     public string ResourceFolder { get; init; } = "";
     /// <summary>账号是否仅在工具列表中隐藏。</summary>
     public bool IsHidden { get; init; }
+    /// <summary>账号是否已被用户标记为优先显示的星标账号。</summary>
+    public bool IsStarred { get; init; }
+    /// <summary>账号星标按钮的操作说明。</summary>
+    public string StarLabel => IsStarred ? "取消星标" : "添加星标";
     /// <summary>列表优先显示用户备注，其次显示 Steam 昵称。</summary>
     public string Title => string.IsNullOrWhiteSpace(Note) ? Account.DisplayName : Note;
     /// <summary>显示 Steam 用户名；隐藏状态只影响工具列表。</summary>
     public string Subtitle => IsHidden ? $"{Account.AccountName} · 已隐藏" : Account.AccountName;
-    /// <summary>使用名称首字作为本地头像，不访问网络头像服务。</summary>
+    /// <summary>使用名称首字作为头像未取得或解码失败时的回退显示。</summary>
     public string Initial => string.IsNullOrWhiteSpace(Title) ? "S" : Title[..1].ToUpperInvariant();
     /// <summary>显示 Steam 最近使用状态或手动绑定状态。</summary>
     public string Status => Account.MostRecent ? "最近使用" : string.IsNullOrEmpty(ResourceFolder) ? "待绑定资源" : $"资源 {ResourceFolder}";
