@@ -28,7 +28,7 @@ SOFTWARE.
 
 WPF UI 许可证与完整组件版权清单原件随发布包的 licenses 目录保留，分别为 WPF-UI-LICENSE.md 和 WPF-UI-ThirdPartyNotices.txt。
 
-发布包同时包含 Microsoft .NET 自包含运行时。其实际第三方版权清单与许可证随运行时文件保留。
+发布包包含Microsoft .NET 10.0.10及Windows Desktop自包含运行时；实际版权清单与许可原件分别见licenses/DOTNET-Runtime-ThirdPartyNotices.txt、licenses/DOTNET-LICENSE.TXT与licenses/WindowsDesktop-Runtime-LICENSE。
 
 ## Microsoft .NET、依赖注入与 SQLite 驱动
 
@@ -39,3 +39,7 @@ Microsoft.Extensions.DependencyInjection 10.0.10、Microsoft.Data.Sqlite 10.0.10
 SQLitePCLRaw 2.1.13使用Apache-2.0许可，Copyright 2014-2024 SourceGear, LLC。完整许可见licenses/SQLitePCLRaw-LICENSE.TXT；项目：https://github.com/ericsink/SQLitePCL.raw。
 
 原生SQLite属于公共领域，版权说明：https://www.sqlite.org/copyright.html。
+
+## Serilog
+
+Serilog 4.4.0、Serilog.Extensions.Logging 10.0.0、Serilog.Sinks.File 7.0.0使用Apache-2.0许可，Copyright Serilog Contributors。各包对应的完整许可原件位于licenses/Serilog-LICENSE、licenses/Serilog.Extensions.Logging-LICENSE和licenses/Serilog.Sinks.File-LICENSE。

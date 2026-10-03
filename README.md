@@ -6,10 +6,15 @@ C# WPF + [WPF UI](https://github.com/lepoco/wpfui) 的 Windows Steam 版 Master 
 
 - 自动发现 Steam、游戏库与本机记住的 Steam 账号；支持手动选择路径。
 - 账号备注、在工具中隐藏账号、绑定游戏资源目录。
+- 按昵称、账号名、SteamID和备注即时模糊搜索；星标持久保存，列表优先显示星标及最近登录账号。
+- 左侧账号列表独立滚动；头像优先取Steam本地缓存，缺少时后台从公开社区资料或页面获取头像并缓存，暂未取得时显示名称首字。
 - 使用同一份 `LocalData/<账号目录>/0000` 下载资源，一键切换账号并由 Steam 启动游戏。
 - 原始资源目录保留为备份；工具记录事务并支持恢复。
+- 手动删除链接和旧备份后，可显式修复失效共享记录；修复保留现有目标目录并归档旧事务。
 - Steam 登录配置备份与还原；浅色、深色主题；标准 UAC 管理员启动。
 - MVVM 与 DI 架构，SQLite 保存账号记录与偏好，全部自写生产代码按行和分支覆盖率验证。
+- 四个独立Page与对应ViewModel，通过WPF UI官方NavigationView和DI页面服务导航。
+- 官方Fluent中性明暗主题和系统强调色；Windows11使用系统Segoe UI Variable，中文及旧系统采用字体回退；FluentSystemIcons图标字体随WPF UI内嵌。
 
 ## 首次使用
 
@@ -27,6 +32,15 @@ C# WPF + [WPF UI](https://github.com/lepoco/wpfui) 的 Windows Steam 版 Master 
 - 来源资源更新后，已绑定共享目录的账号复用更新后的同一份资源。Konami 发布的新资源仍需下载一次；语言差异或游戏资源格式变化可能触发额外下载。
 - 工具只修改 Steam 登录选择配置和 `0000` 的目录链接；账号目录与 `LocalSave` 分别保留。
 
+## 搜索与星标
+
+- 在账号列表上方输入昵称、账号名、SteamID或备注片段。支持忽略大小写、有序字符模糊匹配和空格分隔的多个关键词；清空搜索恢复全部可见账号。
+- 点击账号旁的星形按钮添加或取消星标，结果保存在系统数据目录SQLite，重启仍保留。
+- 列表排序依次为星标、Steam最近使用标记、Steam记录的登录时间降序；同级账号按名称和SteamID稳定排序。搜索仍保留这个置顶顺序。
+- 隐藏账号仍受“显示隐藏”开关控制；搜索和星标不会自动取消隐藏。
+- 账号列表内部滚动，搜索栏和右侧详情保持固定。头像后台加载，不阻塞账号选择和其他操作；缓存位于系统数据目录的 `avatars`。
+- 公开XML未返回头像时，工具尝试读取公开页面头像。仅下载官方头像CDN的静态PNG/JPEG，最多四项并发、每项开始处理后八秒预算；没有可用头像或图片损坏时保留首字。
+
 ## 备份与还原
 
 - “备份还原”中选择资源事务并点击还原。只移除本事务创建且仍指向预期来源的链接，并把旧目录放回原位置。
@@ -35,6 +49,18 @@ C# WPF + [WPF UI](https://github.com/lepoco/wpfui) 的 Windows Steam 版 Master 
 - “还原上次 Steam 登录配置”恢复该次切号前的配置；执行时会正常退出 Steam。之后手动打开 Steam 即可。
 - 工具账号与偏好保存在 `%LOCALAPPDATA%\MasterDuelSwitcher\accounts.db`，删除或移动 EXE 不会删除此数据库；资源事务在该目录的 `resource-backups`，Steam 登录备份在 `steam-login-backups`。
 - 不要只删除事务清单而保留尚未还原的链接，也不要在共享状态下移动或删除来源账号资源目录。
+
+## 手动删除目录后的修复
+
+1. 正常关闭 Master Duel，在“资源共享”刷新。
+2. 在“修复失效共享”选择报错的旧事务，点击修复并阅读 WPF UI 确认弹窗。
+3. 仅当旧事务只有一个目标、原备份和暂存目录已丢失、当前目标是重新创建的普通目录时执行修复。仍有完整备份或有效共享依赖的事务请使用正常还原。
+4. 修复把旧清单原样移到系统数据目录的 `resource-backups/invalid-history`，把当前目标保留为新的 `0000.mdbackup-<新事务标识>`，随后重新建立共享链接。
+5. 旧记录不会标成“已还原”；手动删除的旧备份文件不再存在，新备份保存的是修复前当前目录。修复过程中发生文件系统错误时，检查“备份还原”中的新事务后继续处理。
+
+## 日志
+
+持久日志保存在`%LOCALAPPDATA%\MasterDuelSwitcher\logs`。`run-日期.log`记录启动、操作结果和异常；`debug-日期.log`同时记录命令与事务步骤的Debug信息。发布版同样启用Debug日志，异常保留调用栈。按日及达到5MiB时滚动，每个日志流最多保留14份。日志不写入Steam密码、令牌、VDF正文或账号备注；界面的“操作记录”显示最近60条简短结果。
 
 ## 常见情况
 
@@ -48,6 +74,8 @@ C# WPF + [WPF UI](https://github.com/lepoco/wpfui) 的 Windows Steam 版 Master 
 
 需要 .NET 10 SDK 和 Windows。打开 `MasterDuelSwitcher.sln`，或在项目根目录运行：
 
+运行全量测试前正常退出 Master Duel。进程保护测试会在临时目录启动并关闭自有进程夹具，保留已运行的真实游戏。
+
 ```powershell
 dotnet restore MasterDuelSwitcher.sln
 pwsh -File scripts/Test-Coverage.ps1
@@ -55,7 +83,7 @@ dotnet build MasterDuelSwitcher.sln -c Release
 pwsh -File scripts/Publish.ps1
 ```
 
-Core 负责目录事务、SQLite 与 Steam 集成；App 的 ViewModel 通过 DI 的接口调用服务，Views保存窗口与资源组件，App.xaml仅引用Views。Tests 使用临时数据库、临时目录及隔离系统边界验证，UIProbe 打开真实 WPF 窗口。源码中的类型、方法、字段和属性具有中文注释。测试不登录或切换真实 Steam 账号。
+Core 负责目录事务、SQLite 与 Steam 集成；Views/Pages与对应页面ViewModel分离，Shell仅负责外框，通过DI及官方导航服务连接。Workspace协调跨页安装发现、忙碌状态和操作日志。App.xaml仅引用Views资源组件。Tests 使用临时数据库、临时目录及隔离系统边界验证，UIProbe 打开真实 WPF 窗口。源码中的类型、方法、字段和属性具有中文注释。测试不登录或切换真实 Steam 账号。
 
 ## 依赖与范围
 
