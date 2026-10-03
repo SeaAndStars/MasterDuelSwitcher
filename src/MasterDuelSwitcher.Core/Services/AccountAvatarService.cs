@@ -2,6 +2,9 @@ using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Logging.Abstractions;
 using System.Xml;
 using System.Xml.Linq;
+using System.Net;
+using System.Text;
+using System.Text.RegularExpressions;
 
 namespace MasterDuelSwitcher.Core.Services;
 
@@ -27,6 +30,15 @@ public sealed class AccountAvatarService : IAccountAvatarService
     private static readonly string[] AvatarHosts = ["avatars.steamstatic.com", "avatars.fastly.steamstatic.com", "avatars.akamai.steamstatic.com"];
     /// <summary>官方文档中的历史 CDN，只允许其公开头像目录。</summary>
     private static readonly string[] LegacyHosts = ["steamcdn-a.akamaihd.net", "cdn.akamai.steamstatic.com", "media.steampowered.com"];
+    /// <summary>HTML 仅选择官方 CDN 的静态 PNG、JPEG 头像，跳过动画资源。</summary>
+    private static readonly string[] StaticImageExtensions = [".png", ".jpg", ".jpeg"];
+    /// <summary>只定位精确头像容器类名，线性匹配并设置一百毫秒解析上限。</summary>
+    private static readonly Regex AvatarContainer = new(
+        """<div\b(?:[^"'<>]|"[^"]*"|'[^']*')*?\sclass\s*=\s*(?:"(?:[^"]*\s)?(?-i:playerAvatarAutoSizeInner)(?:\s[^"]*)?"|'(?:[^']*\s)?(?-i:playerAvatarAutoSizeInner)(?:\s[^']*)?')(?:[^"'<>]|"[^"]*"|'[^']*')*>(?<content>.*?)</div\s*>""",
+        RegexOptions.IgnoreCase | RegexOptions.Singleline | RegexOptions.CultureInvariant | RegexOptions.NonBacktracking, TimeSpan.FromMilliseconds(100));
+    /// <summary>只读取头像容器内部真正的 src、srcset 属性，不接受 data-src。</summary>
+    private static readonly Regex AvatarSource = new("""(?:"[^"]*"|'[^']*')|\s(?:src|srcset)\s*=\s*["'](?<value>[^"']*)["']""",
+        RegexOptions.IgnoreCase | RegexOptions.CultureInvariant | RegexOptions.NonBacktracking, TimeSpan.FromMilliseconds(100));
     /// <summary>PNG 文件签名及首个 IHDR 块头。</summary>
     private static readonly byte[] PngHeader = [137, 80, 78, 71, 13, 10, 26, 10, 0, 0, 0, 13, 73, 72, 68, 82];
     /// <summary>PNG 文件完整的 IEND 结束块。</summary>
@@ -52,16 +64,19 @@ public sealed class AccountAvatarService : IAccountAvatarService
         _logger = logger ?? NullLogger<AccountAvatarService>.Instance;
     }
 
-    /// <summary>以八秒总预算取得头像；读取、传输、取消或缓存失败均返回空结果。</summary>
+    /// <summary>取得并发槽后开始八秒活动预算；排队可由调用方取消，头像失败返回空结果。</summary>
     public async Task<string?> GetAvatarPathAsync(string steamPath, string steamId, CancellationToken cancellationToken = default)
     {
         if (string.IsNullOrEmpty(steamId) || steamId.Length != 17 || !steamId.All(char.IsAsciiDigit) || cancellationToken.IsCancellationRequested) return null;
         try
         {
-            using var budget = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
-            budget.CancelAfter(TimeSpan.FromSeconds(8));
-            await _gate.WaitAsync(budget.Token).ConfigureAwait(false);
-            try { return await GetCoreAsync(steamPath, steamId, budget.Token).ConfigureAwait(false); }
+            await _gate.WaitAsync(cancellationToken).ConfigureAwait(false);
+            try
+            {
+                using var budget = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+                budget.CancelAfter(TimeSpan.FromSeconds(8));
+                return await GetCoreAsync(steamPath, steamId, budget.Token).ConfigureAwait(false);
+            }
             finally { _gate.Release(); }
         }
         catch (Exception)
@@ -95,11 +110,38 @@ public sealed class AccountAvatarService : IAccountAvatarService
         using var reader = XmlReader.Create(xmlStream, new XmlReaderSettings { DtdProcessing = DtdProcessing.Prohibit, XmlResolver = null, MaxCharactersInDocument = MaximumProfileBytes });
         var document = XDocument.Load(reader);
         if (document.Root!.Name != "profile") return null;
-        if (!Uri.TryCreate(document.Root.Element("avatarFull")?.Value, UriKind.Absolute, out var avatar) || !AllowedAvatar(avatar)) return null;
+        var avatarValue = document.Root.Element("avatarFull")?.Value;
+        Uri? avatar;
+        if (string.IsNullOrWhiteSpace(avatarValue))
+        {
+            avatar = await FindHtmlAvatarAsync(steamId, cancellationToken).ConfigureAwait(false);
+            if (avatar is null) return null;
+        }
+        else if (!Uri.TryCreate(avatarValue, UriKind.Absolute, out avatar) || !AllowedAvatar(avatar)) return null;
         var downloaded = await DownloadAsync(avatar, MaximumImageBytes, cancellationToken).ConfigureAwait(false);
         if (downloaded is null) return null;
         var imageExtension = ImageExtension(downloaded);
         return imageExtension is null ? null : await SaveAsync(steamId, downloaded, imageExtension, cancellationToken).ConfigureAwait(false);
+    }
+
+    /// <summary>隐私 XML 缺少头像时读取有限公开 HTML，仅从头像容器提取静态白名单地址。</summary>
+    private async Task<Uri?> FindHtmlAvatarAsync(string steamId, CancellationToken cancellationToken)
+    {
+        var html = await DownloadAsync(new Uri("https://steamcommunity.com/profiles/" + steamId + "/"), MaximumProfileBytes, cancellationToken).ConfigureAwait(false);
+        if (html is null) return null;
+        foreach (Match container in AvatarContainer.Matches(Encoding.UTF8.GetString(html)))
+        {
+            foreach (Match source in AvatarSource.Matches(container.Groups["content"].Value))
+            {
+                foreach (var candidate in source.Groups["value"].Value.Split(','))
+                {
+                    var url = WebUtility.HtmlDecode(candidate.Split((char[]?)null, StringSplitOptions.RemoveEmptyEntries).FirstOrDefault());
+                    if (Uri.TryCreate(url, UriKind.Absolute, out var avatar) && AllowedAvatar(avatar)
+                        && StaticImageExtensions.Contains(Path.GetExtension(avatar.AbsolutePath), StringComparer.OrdinalIgnoreCase)) return avatar;
+                }
+            }
+        }
+        return null;
     }
 
     /// <summary>拒绝系统缓存目录及已有祖先上的重解析点，避免写入目录外部。</summary>

@@ -1,6 +1,7 @@
 using System.Net;
 using System.Collections.Concurrent;
 using System.Text;
+using System.Diagnostics;
 using Microsoft.Extensions.Logging;
 using MasterDuelSwitcher.Core.Services;
 using Xunit;
@@ -108,18 +109,18 @@ public sealed class AccountAvatarTests
 
     /// <summary>缺失头像、无效根、破损 XML 与 DTD 均保持首字头像，不请求外部实体。</summary>
     [Theory]
-    [InlineData("<profile />")]
-    [InlineData("<other><avatarFull>https://avatars.steamstatic.com/x.jpg</avatarFull></other>")]
-    [InlineData("<profile>")]
-    [InlineData("<!DOCTYPE profile [<!ENTITY avatar SYSTEM 'https://outside.example/private'>]><profile><avatarFull>&avatar;</avatarFull></profile>")]
-    [InlineData("<profile><avatarFull>invalid-uri</avatarFull></profile>")]
-    public async Task InvalidProfileDoesNotIssueAvatarRequests(string xml)
+    [InlineData("<profile />", 2)]
+    [InlineData("<other><avatarFull>https://avatars.steamstatic.com/x.jpg</avatarFull></other>", 1)]
+    [InlineData("<profile>", 1)]
+    [InlineData("<!DOCTYPE profile [<!ENTITY avatar SYSTEM 'https://outside.example/private'>]><profile><avatarFull>&avatar;</avatarFull></profile>", 1)]
+    [InlineData("<profile><avatarFull>invalid-uri</avatarFull></profile>", 1)]
+    public async Task InvalidProfileDoesNotIssueAvatarRequests(string xml, int expectedProfileRequests)
     {
         using var fixture = new Fixture();
         fixture.Handler.Reply = (_, _) => Task.FromResult(Fixture.Response(Encoding.UTF8.GetBytes(xml)));
         var service = new AccountAvatarService(fixture.State, fixture.Client);
         Assert.Null(await service.GetAvatarPathAsync(fixture.Steam, Fixture.SteamId));
-        Assert.Single(fixture.Handler.Requests);
+        Assert.Equal(expectedProfileRequests, fixture.Handler.Requests.Count);
         Assert.False(Directory.Exists(fixture.State));
     }
 
@@ -272,6 +273,43 @@ public sealed class AccountAvatarTests
         Assert.All(downloads, task => Assert.Null(task.Result));
     }
 
+    /// <summary>四个未返回传输占满槽超过八秒后，排队项仍获得完整活动预算并取得头像。</summary>
+    [Fact]
+    public async Task QueueWaitLongerThanEightSecondsDoesNotConsumeActiveRequestBudget()
+    {
+        using var fixture = new Fixture();
+        var fourEntered = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+        var release = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+        var occupiedCount = 0;
+        fixture.Handler.Reply = async (request, _) =>
+        {
+            if (request.RequestUri!.Host != "steamcommunity.com") return Fixture.Response(Fixture.Png);
+            if (request.RequestUri.AbsolutePath.Contains(Fixture.SteamId, StringComparison.Ordinal)) return Fixture.Response(Fixture.Profile(Fixture.AvatarUrl));
+            if (Interlocked.Increment(ref occupiedCount) == 4) fourEntered.TrySetResult(true);
+            await release.Task;
+            return new HttpResponseMessage(HttpStatusCode.NotFound);
+        };
+        var service = new AccountAvatarService(fixture.State, fixture.Client);
+        var occupying = Enumerable.Range(2, 4).Select(index => service.GetAvatarPathAsync(fixture.Steam, "7656119800000000" + index)).ToArray();
+        Task<string?>? queued = null;
+        var elapsed = Stopwatch.StartNew();
+        try
+        {
+            await fourEntered.Task.WaitAsync(TimeSpan.FromSeconds(3));
+            queued = service.GetAvatarPathAsync(fixture.Steam, Fixture.SteamId);
+            elapsed.Restart();
+            await Task.Delay(TimeSpan.FromMilliseconds(8200));
+            Assert.Equal(4, fixture.Handler.Requests.Count);
+        }
+        finally { release.TrySetResult(true); await Task.WhenAll(occupying); }
+        Assert.NotNull(queued);
+        var path = await queued.WaitAsync(TimeSpan.FromSeconds(3));
+        Assert.NotNull(path);
+        Assert.True(elapsed.Elapsed >= TimeSpan.FromSeconds(8));
+        Assert.Equal(Fixture.Png, await File.ReadAllBytesAsync(path));
+        Assert.Equal(6, fixture.Handler.Requests.Count);
+    }
+
     /// <summary>日志只给出固定短状态，不包含异常正文、账号标识或请求地址。</summary>
     [Fact]
     public async Task FailureLoggingDoesNotContainProfileOrExceptionData()
@@ -377,6 +415,103 @@ public sealed class AccountAvatarTests
         Assert.Empty(fixture.Handler.Requests);
     }
 
+    /// <summary>隐私 XML 未提供头像时只读取公开 HTML 的头像容器，跳过动画并选静态头像。</summary>
+    [Fact]
+    public async Task PrivacyXmlFallsBackToStaticAvatarInsidePublicHtmlContainer()
+    {
+        using var fixture = new Fixture();
+        var html = "<html><div class='profile_page'><img src='https://outside.example/trap.jpg'>"
+            + "<div class='playerAvatarAutoSizeInner'><picture><img srcset='https://avatars.steamstatic.com/animation.gif'>"
+            + "<source media='(prefers-reduced-motion: reduce)' srcset='" + Fixture.AvatarUrl + " 1x, https://avatars.steamstatic.com/larger.jpg 2x'>"
+            + "<img srcset='" + Fixture.AvatarUrl + "'></picture></div></div></html>";
+        fixture.Handler.SetHtmlFallback(html);
+        var service = new AccountAvatarService(fixture.State, fixture.Client);
+        var path = await service.GetAvatarPathAsync(fixture.Steam, Fixture.SteamId);
+        Assert.NotNull(path);
+        Assert.Equal(Fixture.Png, await File.ReadAllBytesAsync(path));
+        Assert.Equal(new[] { "https://steamcommunity.com/profiles/" + Fixture.SteamId + "/?xml=1", "https://steamcommunity.com/profiles/" + Fixture.SteamId + "/", Fixture.AvatarUrl }, fixture.Handler.Requests.Select(uri => uri.AbsoluteUri));
+    }
+
+    /// <summary>HTML 头像只接受精确容器类名及 src、srcset，支持引号、附加类和实体。</summary>
+    [Theory]
+    [InlineData("<div class=\"playerAvatarAutoSizeInner\"><img src=\"https://avatars.steamstatic.com/a.png\"></div>", "https://avatars.steamstatic.com/a.png")]
+    [InlineData("<DIV class='before playerAvatarAutoSizeInner after'><img srcset='https://avatars.fastly.steamstatic.com/a.jpeg 1x'></DIV>", "https://avatars.fastly.steamstatic.com/a.jpeg")]
+    [InlineData("<div id='avatar' class='playerAvatarAutoSizeInner'><img src='https://avatars.akamai.steamstatic.com/a.jpg?v=1&amp;x=2'></div>", "https://avatars.akamai.steamstatic.com/a.jpg?v=1&x=2")]
+    [InlineData("<div class='playerAvatarAutoSizeInner'><img src='invalid-uri'><img src='https://outside.example/trap.jpg'><img src='https://avatars.steamstatic.com/a.jpg'></div>", "https://avatars.steamstatic.com/a.jpg")]
+    [InlineData("<div class='playerAvatarAutoSizeInner'><img srcset=' , https://avatars.steamstatic.com/a.jpg 1x'></div>", "https://avatars.steamstatic.com/a.jpg")]
+    public async Task HtmlFallbackParsesOnlyContainerImageAttributes(string html, string avatarUrl)
+    {
+        using var fixture = new Fixture();
+        fixture.Handler.SetHtmlFallback(html);
+        var service = new AccountAvatarService(fixture.State, fixture.Client);
+        Assert.NotNull(await service.GetAvatarPathAsync(fixture.Steam, Fixture.SteamId));
+        Assert.Equal(avatarUrl, fixture.Handler.Requests.Last().AbsoluteUri);
+        Assert.Equal(3, fixture.Handler.Requests.Count);
+    }
+
+    /// <summary>其他容器、伪造类名、数据属性及无静态官方头像的 HTML 均返回空结果。</summary>
+    [Theory]
+    [InlineData("<div class='elsewhere'><img src='https://avatars.steamstatic.com/a.jpg'></div>")]
+    [InlineData("<div class='not-playerAvatarAutoSizeInner'><img src='https://avatars.steamstatic.com/a.jpg'></div>")]
+    [InlineData("<div data-class='playerAvatarAutoSizeInner'><img src='https://avatars.steamstatic.com/a.jpg'></div>")]
+    [InlineData("<div class='playerAvatarAutoSizeInner'><img data-src='https://avatars.steamstatic.com/a.jpg'></div>")]
+    [InlineData("<div class='playerAvatarAutoSizeInner'></div>")]
+    [InlineData("<div class='playerAvatarAutoSizeInner'><img srcset='https://avatars.steamstatic.com/a.gif 1x'></div>")]
+    [InlineData("<div class='playerAvatarAutoSizeInner'><img src='http://avatars.steamstatic.com/a.jpg'></div>")]
+    [InlineData("<div class='playerAvatarAutoSizeInner'><img src='https://outside.example/a.jpg'></div>")]
+    [InlineData("<div class='playerAvatarAutoSizeInner'><img srcset=''></div>")]
+    [InlineData("<div class=\"other\" data-note=\" class='playerAvatarAutoSizeInner'\"><img src='https://avatars.steamstatic.com/a.jpg'></div>")]
+    [InlineData("<div class='playerAvatarAutoSizeInner'><img data-note=\" src='https://avatars.steamstatic.com/a.jpg'\"></div>")]
+    public async Task HtmlFallbackRejectsNonAvatarOrNonStaticSources(string html)
+    {
+        using var fixture = new Fixture();
+        fixture.Handler.SetHtmlFallback(html);
+        var service = new AccountAvatarService(fixture.State, fixture.Client);
+        Assert.Null(await service.GetAvatarPathAsync(fixture.Steam, Fixture.SteamId));
+        Assert.Equal(2, fixture.Handler.Requests.Count);
+        Assert.False(Directory.Exists(fixture.State));
+    }
+
+    /// <summary>HTML 失败和超限响应沿用资料双长度限制，不下载头像。</summary>
+    [Theory]
+    [InlineData(0)]
+    [InlineData(1)]
+    [InlineData(2)]
+    public async Task HtmlFallbackFailuresAreBoundedAndDoNotCreateCache(int failure)
+    {
+        using var fixture = new Fixture();
+        fixture.Handler.Reply = (request, _) => Task.FromResult(!string.IsNullOrEmpty(request.RequestUri!.Query)
+            ? Fixture.Response(Encoding.UTF8.GetBytes("<profile><privacyMessage>private</privacyMessage></profile>"))
+            : failure == 0 ? new HttpResponseMessage(HttpStatusCode.NotFound) : Fixture.Response(new byte[256 * 1024 + 1], failure == 2));
+        var service = new AccountAvatarService(fixture.State, fixture.Client);
+        Assert.Null(await service.GetAvatarPathAsync(fixture.Steam, Fixture.SteamId));
+        Assert.Equal(2, fixture.Handler.Requests.Count);
+        Assert.False(Directory.Exists(fixture.State));
+    }
+
+    /// <summary>HTML 回退沿用原调用取消令牌，取消后释放槽并允许下一次重试。</summary>
+    [Fact]
+    public async Task HtmlFallbackCancellationUsesExistingBudgetAndCanRetry()
+    {
+        using var fixture = new Fixture();
+        using var cancellation = new CancellationTokenSource();
+        var entered = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+        fixture.Handler.Reply = async (request, token) =>
+        {
+            if (!string.IsNullOrEmpty(request.RequestUri!.Query)) return Fixture.Response(Encoding.UTF8.GetBytes("<profile/>"));
+            entered.TrySetResult(true);
+            await Task.Delay(Timeout.Infinite, token);
+            return new HttpResponseMessage(HttpStatusCode.NotFound);
+        };
+        var service = new AccountAvatarService(fixture.State, fixture.Client);
+        var running = service.GetAvatarPathAsync(fixture.Steam, Fixture.SteamId, cancellation.Token);
+        try { await entered.Task.WaitAsync(TimeSpan.FromSeconds(3)); }
+        finally { cancellation.Cancel(); }
+        Assert.Null(await running);
+        fixture.Handler.SetHtmlFallback("<div class='playerAvatarAutoSizeInner'><img src='" + Fixture.AvatarUrl + "'></div>");
+        Assert.NotNull(await service.GetAvatarPathAsync(fixture.Steam, Fixture.SteamId));
+    }
+
     /// <summary>每个测试只拥有自己的临时目录和 HTTP 客户端。</summary>
     private sealed class Fixture : IDisposable
     {
@@ -437,6 +572,9 @@ public sealed class AccountAvatarTests
         internal Func<HttpRequestMessage, CancellationToken, Task<HttpResponseMessage>> Reply { get; set; } = (_, _) => Task.FromResult(new HttpResponseMessage(HttpStatusCode.NotFound));
         /// <summary>设置公开资料和有效 PNG 响应。</summary>
         internal void SetValidDownload() => Reply = (request, _) => Task.FromResult(Fixture.Response(request.RequestUri!.Host == "steamcommunity.com" ? Fixture.Profile(Fixture.AvatarUrl) : Fixture.Png));
+        /// <summary>设置缺少头像的隐私 XML、公开 HTML 和静态图片三阶段响应。</summary>
+        internal void SetHtmlFallback(string html) => Reply = (request, _) => Task.FromResult(Fixture.Response(request.RequestUri!.Host != "steamcommunity.com" ? Fixture.Png
+            : string.IsNullOrEmpty(request.RequestUri.Query) ? Encoding.UTF8.GetBytes(html) : Encoding.UTF8.GetBytes("<profile><privacyMessage>private</privacyMessage></profile>")));
         /// <summary>记录请求并返回合成的未找到响应。</summary>
         protected override Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken cancellationToken)
         {
