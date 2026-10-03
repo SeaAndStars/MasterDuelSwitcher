@@ -67,6 +67,29 @@ public sealed class WindowsGameAutomationPlatform : IGameAutomationPlatform
         logger.LogInformation("FreePackWindowActivated Width={Width} Height={Height}", activatedFrame.Width, activatedFrame.Height);
     }
 
+    /// <summary>尝试恢复本轮原游戏窗口，并保留窗口身份、几何与紧急停止监听。</summary>
+    public bool TryRecoverGame()
+    {
+        if (native.IsF8Pressed) throw new OperationCanceledException("F8 已请求停止免费开包。");
+        if (activeWindow == 0 || activatedFrame is null)
+            throw new InvalidOperationException("尚未锁定本轮游戏窗口及客户区，恢复请求已停止。");
+        if (!native.IsGameWindow(activeWindow) || native.GetWindowProcessId(activeWindow) != activeProcessId)
+            throw new InvalidOperationException("原游戏窗口已退出或所属进程已经变化，恢复请求已停止。");
+        bool requested = native.ActivateWindow(activeWindow);
+        logger.LogDebug("FreePackWindowRecoveryRequested ExpectedHWND={ExpectedHWND} ExpectedPID={ExpectedPID} RequestAccepted={RequestAccepted}",
+            activeWindow, activeProcessId, requested);
+        if (native.IsF8Pressed) throw new OperationCanceledException("F8 已请求停止免费开包。");
+        GameFrame? recovered = null;
+        try { recovered = ReadClientFrame(); }
+        catch (GameWindowTemporarilyUnavailableException) { }
+        if (native.IsF8Pressed) throw new OperationCanceledException("F8 已请求停止免费开包。");
+        if (recovered is null) return false;
+        EnsureSameGeometry(activatedFrame, recovered);
+        logger.LogInformation("FreePackWindowRecovered ExpectedHWND={ExpectedHWND} ExpectedPID={ExpectedPID} Width={Width} Height={Height}",
+            activeWindow, activeProcessId, recovered.Width, recovered.Height);
+        return true;
+    }
+
     /// <summary>读取前台游戏客户区。</summary>
     public GameFrame Capture()
     {
@@ -184,7 +207,9 @@ public sealed class WindowsGameAutomationPlatform : IGameAutomationPlatform
         {
             logger.LogWarning("FreePackWindowRejected Stage={Stage} ExpectedHWND={ExpectedHWND} ExpectedPID={ExpectedPID} ActualPID={ActualPID} ActualForeground={ActualForeground} Visible={Visible} Iconic={Iconic} GameWindow={GameWindow}",
                 "ClientValidation", activeWindow, activeProcessId, processId, foreground, visible, iconic, gameWindow);
-            throw new InvalidOperationException("游戏窗口失焦、隐藏、最小化或所属进程已经变化。");
+            if (activeWindow == 0 || !gameWindow || processId != activeProcessId)
+                throw new InvalidOperationException("原游戏窗口已退出或所属进程已经变化。");
+            throw new GameWindowTemporarilyUnavailableException("游戏窗口暂时失焦、隐藏或最小化。");
         }
         if (!native.GetClientRectangle(activeWindow, out AutomationNativeRectangle rectangle))
             throw new InvalidOperationException("读取游戏客户区失败。");

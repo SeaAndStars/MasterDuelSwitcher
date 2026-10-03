@@ -447,6 +447,19 @@ public sealed class WindowsGameAutomationNativeTests
         }
     }
 
+    /// <summary>选择自有客户区与虚拟桌面边界交集的中心像素，避免窗口出屏部分产生黑色像素。</summary>
+    private static int GetVisibleOwnWindowPixel(GameFrame frame, AutomationNativeRectangle desktop)
+    {
+        long left = Math.Max((long)frame.ScreenX, desktop.Left);
+        long top = Math.Max((long)frame.ScreenY, desktop.Top);
+        long right = Math.Min((long)frame.ScreenX + frame.Width, desktop.Right);
+        long bottom = Math.Min((long)frame.ScreenY + frame.Height, desktop.Bottom);
+        Assert.True(left < right && top < bottom, "自有测试窗口客户区没有落在虚拟桌面边界内。");
+        int x = (int)(left + (right - left) / 2 - frame.ScreenX);
+        int y = (int)(top + (bottom - top) / 2 - frame.ScreenY);
+        return (frame.Width * y + x) * 4;
+    }
+
     /// <summary>在单独线程创建、操作并销毁本测试专属窗口。</summary>
     private static void VerifyOwnWindow(TaskCompletionSource completion)
     {
@@ -503,7 +516,8 @@ public sealed class WindowsGameAutomationNativeTests
                 Assert.True(Native.PostThreadMessage(listener.ThreadId, 0x0312, F8EmergencyStopListener.HotKeyId, 0));
                 Assert.True(SpinWait.SpinUntil(() => listener.IsStopRequested, TimeSpan.FromSeconds(1)));
             }
-            var platform = new WindowsGameAutomationPlatform(directory, api);
+            var ownedApi = new FixedWindowNativeApi(api, window, CancellationToken.None);
+            var platform = new WindowsGameAutomationPlatform(directory, ownedApi);
             platform.ActivateGame();
             nint dc = Native.GetDC(window);
             nint brush = Native.CreateSolidBrush(0x00332211);
@@ -519,7 +533,12 @@ public sealed class WindowsGameAutomationNativeTests
             Assert.Equal(origin.X, frame.ScreenX);
             Assert.Equal(origin.Y, frame.ScreenY);
             Assert.Equal(frame.Width * frame.Height * 4, frame.Pixels.Length);
-            int center = (frame.Width * (frame.Height / 2) + frame.Width / 2) * 4;
+            int center = GetVisibleOwnWindowPixel(frame, desktop);
+            var centerScreen = new AutomationNativePoint(frame.ScreenX + center / 4 % frame.Width, frame.ScreenY + center / 4 / frame.Width);
+            Console.WriteLine($"OwnedFirstPixel OriginalCursor=({originalCursor.X},{originalCursor.Y}) "
+                + $"Frame=({frame.ScreenX},{frame.ScreenY},{frame.Width},{frame.Height}) CenterScreen=({centerScreen.X},{centerScreen.Y}) "
+                + $"CenterRoot={Native.GetAncestor(Native.WindowFromPoint(centerScreen), 2)} Own={window} Foreground={api.GetForegroundWindow()} "
+                + $"VirtualDesktop=({desktop.Left},{desktop.Top},{desktop.Right},{desktop.Bottom}).");
             Assert.Equal([0x33, 0x22, 0x11], frame.Pixels.Skip(center).Take(3).Select(value => (int)value).ToArray());
             nint refreshedDc = Native.GetDC(window);
             nint refreshedBrush = Native.CreateSolidBrush(0x00665544);
@@ -532,14 +551,49 @@ public sealed class WindowsGameAutomationNativeTests
             GameFrame refreshed = platform.Capture();
             Assert.Equal([0x66, 0x55, 0x44], refreshed.Pixels.Skip(center).Take(3).Select(value => (int)value).ToArray());
             Assert.False(frame.Pixels.AsSpan().SequenceEqual(refreshed.Pixels), "自有窗口重绘后截图仍为旧帧。");
-            var target = new PixelPoint(originalCursor.X - frame.ScreenX, originalCursor.Y - frame.ScreenY);
-            Assert.InRange(target.X, 0, frame.Width - 1);
-            Assert.InRange(target.Y, 0, frame.Height - 1);
-            Assert.Equal(window, Native.GetAncestor(Native.WindowFromPoint(originalCursor), 2));
-            Assert.True(Native.GetCursorPos(out AutomationNativePoint cursorBeforeInput));
-            Assert.Equal(originalCursor, cursorBeforeInput);
+            GameFrame inputFrame = refreshed;
+            AutomationNativePoint cursorBeforeInput = default;
+            PixelPoint target = default;
+            nint rootBeforeInput = 0;
+            bool inputReady = false;
+            for (int attempt = 0; attempt < 3; attempt++)
+            {
+                Assert.True(Native.GetCursorPos(out cursorBeforeInput));
+                target = new PixelPoint(cursorBeforeInput.X - inputFrame.ScreenX, cursorBeforeInput.Y - inputFrame.ScreenY);
+                rootBeforeInput = Native.GetAncestor(Native.WindowFromPoint(cursorBeforeInput), 2);
+                Console.WriteLine($"OwnedClickPoint Attempt={attempt} Original=({originalCursor.X},{originalCursor.Y}) "
+                    + $"Current=({cursorBeforeInput.X},{cursorBeforeInput.Y}) Client=({target.X},{target.Y}) Root={rootBeforeInput} Own={window}.");
+                inputReady = target.X >= 0 && target.X < inputFrame.Width && target.Y >= 0 && target.Y < inputFrame.Height
+                    && rootBeforeInput == window;
+                if (inputReady || attempt == 2) break;
+                platform.EndAutomation();
+                Assert.True(Native.SetWindowPos(window, 0, cursorBeforeInput.X - 100, cursorBeforeInput.Y - 100, 0, 0, 0x0015));
+                PumpOwnWindowMessages();
+                platform.ActivateGame();
+                Assert.True(api.GetClientRectangle(window, out client));
+                nint movedDc = Native.GetDC(window);
+                nint movedBrush = Native.CreateSolidBrush(0x00665544);
+                Assert.NotEqual((nint)0, movedDc);
+                Assert.NotEqual((nint)0, movedBrush);
+                try { Assert.NotEqual(0, Native.FillRect(movedDc, ref client, movedBrush)); }
+                finally
+                {
+                    Assert.True(Native.DeleteObject(movedBrush));
+                    Assert.Equal(1, Native.ReleaseDC(window, movedDc));
+                }
+                Assert.Equal(0, Native.DwmFlush());
+                inputFrame = platform.Capture();
+                int movedCenter = GetVisibleOwnWindowPixel(inputFrame, desktop);
+                Assert.Equal([0x66, 0x55, 0x44], inputFrame.Pixels.Skip(movedCenter).Take(3).Select(value => (int)value).ToArray());
+            }
+            Assert.True(inputReady, $"两次重新定位后鼠标仍未命中自有客户区。窗口={window}，"
+                + $"初始鼠标=({originalCursor.X},{originalCursor.Y})，当前鼠标=({cursorBeforeInput.X},{cursorBeforeInput.Y})，命中根窗口={rootBeforeInput}。");
+            Assert.InRange(target.X, 0, inputFrame.Width - 1);
+            Assert.InRange(target.Y, 0, inputFrame.Height - 1);
+            Assert.Equal(window, rootBeforeInput);
+            clicked = false;
             nint foregroundBeforeInput = api.GetForegroundWindow();
-            platform.Click(frame, target);
+            platform.Click(inputFrame, target);
             Stopwatch wait = Stopwatch.StartNew();
             while (!clicked && wait.Elapsed < TimeSpan.FromSeconds(2))
             {
@@ -554,7 +608,22 @@ public sealed class WindowsGameAutomationNativeTests
             nint foregroundAfterInput = api.GetForegroundWindow();
             nint pointRoot = Native.GetAncestor(Native.WindowFromPoint(cursor), 2);
             Assert.True(clicked, $"自有测试窗口未收到鼠标松开。窗口={window}，输入前前台={foregroundBeforeInput}，输入后前台={foregroundAfterInput}，"
-                + $"预期屏幕点=({frame.ScreenX + target.X},{frame.ScreenY + target.Y})，当前鼠标=({cursor.X},{cursor.Y})，鼠标命中根窗口={pointRoot}。");
+                + $"预期屏幕点=({inputFrame.ScreenX + target.X},{inputFrame.ScreenY + target.Y})，当前鼠标=({cursor.X},{cursor.Y})，鼠标命中根窗口={pointRoot}。");
+            uint originalPid = api.GetWindowProcessId(window);
+            int beginsBeforeRecovery = ownedApi.BeginCount;
+            int endsBeforeRecovery = ownedApi.EndCount;
+            Assert.True(beginsBeforeRecovery > 0);
+            Native.ShowWindow(window, 6);
+            Assert.True(api.IsWindowMinimized(window));
+            Assert.Throws<GameWindowTemporarilyUnavailableException>(() => platform.Capture());
+            Assert.True(SpinWait.SpinUntil(platform.TryRecoverGame, TimeSpan.FromSeconds(2)), "自有最小化窗口没有恢复前台。");
+            GameFrame recovered = platform.Capture();
+            Assert.Equal(originalPid, api.GetWindowProcessId(window));
+            Assert.Equal(inputFrame.WindowHandle, recovered.WindowHandle);
+            Assert.Equal((inputFrame.Width, inputFrame.Height, inputFrame.ScreenX, inputFrame.ScreenY),
+                (recovered.Width, recovered.Height, recovered.ScreenX, recovered.ScreenY));
+            Assert.Equal(beginsBeforeRecovery, ownedApi.BeginCount);
+            Assert.Equal(endsBeforeRecovery, ownedApi.EndCount);
             Assert.False(new SystemWindowsGameAutomationNativeApi(() => [], _ => throw new ArgumentException(), "fixture").IsGameWindow(window));
             Assert.False(new SystemWindowsGameAutomationNativeApi(() => [], _ => throw new InvalidOperationException(), "fixture").IsGameWindow(window));
             Assert.False(new SystemWindowsGameAutomationNativeApi(() => [], _ => throw new Win32Exception(), "fixture").IsGameWindow(window));
@@ -579,6 +648,10 @@ public sealed class WindowsGameAutomationNativeTests
     /// <summary>固定寻找本测试拥有的目标窗口，其余操作交给真实原生边界。</summary>
     private sealed class FixedWindowNativeApi(IWindowsGameAutomationNativeApi inner, nint window, CancellationToken shutdown) : IWindowsGameAutomationNativeApi
     {
+        /// <summary>本测试实际注册紧急停止监听的次数。</summary>
+        public int BeginCount { get; private set; }
+        /// <summary>本测试实际释放紧急停止监听的次数。</summary>
+        public int EndCount { get; private set; }
         /// <summary>返回本测试指定的窗口。</summary>
         public nint FindGameWindow() => window;
         /// <summary>复验目标窗口进程。</summary>
@@ -617,14 +690,14 @@ public sealed class WindowsGameAutomationNativeTests
         public void ReleaseClientDc(nint handle, nint dc) => inner.ReleaseClientDc(handle, dc);
         /// <summary>读取真实虚拟桌面。</summary>
         public AutomationNativeRectangle GetVirtualDesktop() => inner.GetVirtualDesktop();
-        /// <summary>转发真实鼠标输入边界，本跨队列测试没有点击步骤。</summary>
+        /// <summary>将自有窗口的普通鼠标输入交给真实原生边界。</summary>
         public uint SendMouseClick(int normalizedX, int normalizedY) => inner.SendMouseClick(normalizedX, normalizedY);
         /// <summary>读取真实紧急停止状态。</summary>
         public bool IsF8Pressed => shutdown.IsCancellationRequested || inner.IsF8Pressed;
         /// <summary>注册本测试运行期间的 F8 停止热键。</summary>
-        public void BeginEmergencyStop() => inner.BeginEmergencyStop();
+        public void BeginEmergencyStop() { BeginCount++; inner.BeginEmergencyStop(); }
         /// <summary>释放本测试运行期间的 F8 停止热键。</summary>
-        public void EndEmergencyStop() => inner.EndEmergencyStop();
+        public void EndEmergencyStop() { EndCount++; inner.EndEmergencyStop(); }
         /// <summary>读取真实 UTC 时间。</summary>
         public DateTimeOffset UtcNow => inner.UtcNow;
     }

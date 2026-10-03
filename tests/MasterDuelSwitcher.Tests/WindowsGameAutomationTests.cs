@@ -16,6 +16,172 @@ public sealed class WindowsGameAutomationTests : IDisposable
     /// <summary>本次测试的独立状态目录。</summary>
     private readonly string directory = Path.Combine(Path.GetTempPath(), "FreePackPlatform-" + Guid.NewGuid().ToString("N"));
 
+    /// <summary>验证仅失焦、隐藏或最小化引起的截图和输入拒绝使用可恢复暂停异常。</summary>
+    [Theory]
+    [InlineData("capture", "foreground")]
+    [InlineData("capture", "hidden")]
+    [InlineData("capture", "minimized")]
+    [InlineData("click", "foreground")]
+    [InlineData("click", "hidden")]
+    [InlineData("click", "minimized")]
+    public void TemporaryWindowAvailabilityReportsRecoverablePause(string operation, string fault)
+    {
+        var native = new FixtureNativeApi();
+        var platform = new WindowsGameAutomationPlatform(directory, native);
+        platform.ActivateGame();
+        GameFrame frame = platform.Capture();
+        if (fault == "foreground") native.Foreground = 99;
+        if (fault == "hidden") native.Visible = false;
+        if (fault == "minimized") native.Minimized = true;
+        if (operation == "capture") Assert.Throws<GameWindowTemporarilyUnavailableException>(() => platform.Capture());
+        else Assert.Throws<GameWindowTemporarilyUnavailableException>(() => platform.Click(frame, new(10, 10)));
+        Assert.Equal(0u, native.InputCount);
+    }
+
+    /// <summary>验证原窗口恢复后继续使用原句柄与几何，且紧急停止监听只注册一次。</summary>
+    [Theory]
+    [InlineData("foreground")]
+    [InlineData("hidden")]
+    [InlineData("minimized")]
+    public void RecoveryRestoresOriginalWindowWithoutRebindingOrRestartingF8(string fault)
+    {
+        var native = new FixtureNativeApi();
+        var platform = new WindowsGameAutomationPlatform(directory, native);
+        platform.ActivateGame();
+        if (fault == "foreground") native.Foreground = 99;
+        if (fault == "hidden") native.Visible = false;
+        if (fault == "minimized") native.Minimized = true;
+        native.Window = 123;
+        native.RestoreOnActivation = true;
+        Assert.True(platform.TryRecoverGame());
+        GameFrame frame = platform.Capture();
+        Assert.Equal((nint)42, frame.WindowHandle);
+        Assert.Equal((nint)42, native.ActivatedWindows[^1]);
+        Assert.Equal(1, native.FindCount);
+        Assert.Equal(1, native.BeginCount);
+        Assert.Equal(0, native.EndCount);
+        Assert.Equal(0u, native.InputCount);
+    }
+
+    /// <summary>验证临时激活失败可返回等待，之后成功恢复时不更换原窗口或监听。</summary>
+    [Fact]
+    public void RecoveryCanRemainUnavailableAndLaterSucceed()
+    {
+        var native = new FixtureNativeApi();
+        var platform = new WindowsGameAutomationPlatform(directory, native);
+        platform.ActivateGame();
+        native.Foreground = 99;
+        native.ActivationSuccess = false;
+        native.RestoreOnActivation = true;
+        Assert.False(platform.TryRecoverGame());
+        native.ActivationSuccess = true;
+        Assert.True(platform.TryRecoverGame());
+        Assert.Equal(1, native.FindCount);
+        Assert.Equal(1, native.BeginCount);
+        Assert.Equal([(nint)42, 42, 42], native.ActivatedWindows);
+    }
+
+    /// <summary>验证前台、可见或最小化状态暂未恢复时返回等待且不读取客户区或输入。</summary>
+    [Theory]
+    [InlineData("foreground")]
+    [InlineData("hidden")]
+    [InlineData("minimized")]
+    public void RecoveryWaitsUntilOriginalWindowIsActuallyAvailable(string fault)
+    {
+        var native = new FixtureNativeApi();
+        var platform = new WindowsGameAutomationPlatform(directory, native);
+        platform.ActivateGame();
+        if (fault == "foreground") native.Foreground = 99;
+        if (fault == "hidden") native.Visible = false;
+        if (fault == "minimized") native.Minimized = true;
+        int reads = native.ClientReadCount;
+        Assert.False(platform.TryRecoverGame());
+        Assert.Equal(reads, native.ClientReadCount);
+        Assert.Equal(0u, native.InputCount);
+    }
+
+    /// <summary>验证窗口或进程身份变化始终永久停止，失焦同时发生也不转成暂停。</summary>
+    [Theory]
+    [InlineData("wrong-process", false)]
+    [InlineData("pid-changed", false)]
+    [InlineData("pid-changed", true)]
+    public void RecoveryRejectsChangedWindowIdentityPermanently(string fault, bool changeDuringActivation)
+    {
+        var native = new FixtureNativeApi();
+        var platform = new WindowsGameAutomationPlatform(directory, native);
+        platform.ActivateGame();
+        native.Foreground = 99;
+        Action changeIdentity = () =>
+        {
+            if (fault == "wrong-process") native.GameWindow = false;
+            else native.ProcessId = 8;
+        };
+        if (changeDuringActivation) native.AfterActivation = changeIdentity;
+        else changeIdentity();
+        Assert.Throws<InvalidOperationException>(() => platform.TryRecoverGame());
+        Assert.Throws<InvalidOperationException>(() => platform.Capture());
+        Assert.Equal(0u, native.InputCount);
+    }
+
+    /// <summary>验证恢复期间位置或尺寸变化仍永久停止，原几何锁定不会被更新。</summary>
+    [Theory]
+    [InlineData("width")]
+    [InlineData("height")]
+    [InlineData("x")]
+    [InlineData("y")]
+    public void RecoveryRejectsChangedGeometryWithoutResettingTheOriginalFrame(string fault)
+    {
+        var native = new FixtureNativeApi();
+        var platform = new WindowsGameAutomationPlatform(directory, native);
+        platform.ActivateGame();
+        switch (fault)
+        {
+            case "width": native.Client = new(0, 0, 321, 240); break;
+            case "height": native.Client = new(0, 0, 320, 241); break;
+            case "x": native.Origin = new(-299, 200); break;
+            case "y": native.Origin = new(-300, 201); break;
+        }
+        Assert.Throws<InvalidOperationException>(() => platform.TryRecoverGame());
+        Assert.Throws<InvalidOperationException>(() => platform.Capture());
+        Assert.Equal(0u, native.InputCount);
+    }
+
+    /// <summary>验证未成功锁定原窗口几何前恢复请求明确失败。</summary>
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public void RecoveryRequiresAnActivatedWindowAndInitialGeometry(bool activationPartiallySucceeded)
+    {
+        var native = new FixtureNativeApi();
+        var platform = new WindowsGameAutomationPlatform(directory, native);
+        if (activationPartiallySucceeded)
+        {
+            native.ClientSuccess = false;
+            Assert.Throws<InvalidOperationException>(() => platform.ActivateGame());
+        }
+        Assert.Throws<InvalidOperationException>(() => platform.TryRecoverGame());
+        Assert.Equal(0u, native.InputCount);
+    }
+
+    /// <summary>验证恢复前、激活过程中或几何读取期间触发的 F8 均立即取消且保留原监听。</summary>
+    [Theory]
+    [InlineData("before")]
+    [InlineData("activation")]
+    [InlineData("geometry")]
+    public void RecoveryHonorsF8BeforeAndThroughoutTheNativeAttempt(string phase)
+    {
+        var native = new FixtureNativeApi();
+        var platform = new WindowsGameAutomationPlatform(directory, native);
+        platform.ActivateGame();
+        if (phase == "before") native.F8Pressed = true;
+        if (phase == "activation") native.AfterActivation = () => native.F8Pressed = true;
+        if (phase == "geometry") native.AfterClientRead = () => native.F8Pressed = true;
+        Assert.Throws<OperationCanceledException>(() => platform.TryRecoverGame());
+        Assert.Equal(1, native.BeginCount);
+        Assert.Equal(0, native.EndCount);
+        Assert.Equal(0u, native.InputCount);
+    }
+
     /// <summary>验证异步前台切换需要多次观察时，初始化仍能获得完整客户区。</summary>
     [Fact]
     public void ActivationWaitsForAsynchronousForegroundBeforeReadingClient()
@@ -51,7 +217,7 @@ public sealed class WindowsGameAutomationTests : IDisposable
         Assert.Equal(1, native.EndCount);
     }
 
-    /// <summary>验证启动等待结束后失焦仍立即拒绝截图，不通过再次等待恢复自动化。</summary>
+    /// <summary>验证启动等待结束后失焦立即暂停截图，恢复请求由状态机单独发起。</summary>
     [Fact]
     public void RuntimeForegroundLossStillStopsImmediatelyAndLogsTheRejectedSnapshot()
     {
@@ -62,7 +228,7 @@ public sealed class WindowsGameAutomationTests : IDisposable
         native.Foreground = 99;
         native.ForegroundReadyAfterReads = native.ForegroundReadCount + 2;
         var wait = Stopwatch.StartNew();
-        Assert.Throws<InvalidOperationException>(() => platform.Capture());
+        Assert.Throws<GameWindowTemporarilyUnavailableException>(() => platform.Capture());
         Assert.True(wait.Elapsed < TimeSpan.FromMilliseconds(250));
         Assert.Equal(0u, native.InputCount);
         Assert.Equal((nint)99, Assert.Single(logger.Warnings)["ActualForeground"]);
@@ -199,7 +365,9 @@ public sealed class WindowsGameAutomationTests : IDisposable
             case "too-wide": native.Client = new(0, 0, 16385, 240); break;
             case "too-tall": native.Client = new(0, 0, 320, 16385); break;
         }
-        Assert.Throws<InvalidOperationException>(() => platform.Capture());
+        if (fault is "foreground" or "hidden" or "minimized")
+            Assert.Throws<GameWindowTemporarilyUnavailableException>(() => platform.Capture());
+        else Assert.Throws<InvalidOperationException>(() => platform.Capture());
         Assert.Empty(native.Released);
     }
 
@@ -370,6 +538,16 @@ public sealed class WindowsGameAutomationTests : IDisposable
         public int ClientReadCount { get; private set; }
         /// <summary>窗口所属进程。</summary>
         public uint ProcessId { get; set; } = 7;
+        /// <summary>寻找窗口的次数，用于证明恢复不重新选择窗口。</summary>
+        public int FindCount { get; private set; }
+        /// <summary>所有激活请求的窗口句柄。</summary>
+        public List<nint> ActivatedWindows { get; } = [];
+        /// <summary>激活成功时模拟系统恢复原窗口的前台和可见状态。</summary>
+        public bool RestoreOnActivation { get; set; }
+        /// <summary>激活请求完成后注入窗口身份变化或紧急停止。</summary>
+        public Action? AfterActivation { get; set; }
+        /// <summary>客户区读取后注入紧急停止。</summary>
+        public Action? AfterClientRead { get; set; }
         /// <summary>是否仍属于目标游戏。</summary>
         public bool GameWindow { get; set; } = true;
         /// <summary>是否可见。</summary>
@@ -419,7 +597,7 @@ public sealed class WindowsGameAutomationTests : IDisposable
         /// <summary>最后截图复制的客户区尺寸。</summary>
         public (int Width, int Height) LastCopySize { get; private set; }
         /// <summary>返回游戏窗口。</summary>
-        public nint FindGameWindow() => Window;
+        public nint FindGameWindow() { FindCount++; return Window; }
         /// <summary>确认窗口身份。</summary>
         public bool IsGameWindow(nint window) => GameWindow;
         /// <summary>返回窗口所属进程。</summary>
@@ -436,9 +614,15 @@ public sealed class WindowsGameAutomationTests : IDisposable
         /// <summary>返回窗口最小化状态。</summary>
         public bool IsWindowMinimized(nint window) => Minimized;
         /// <summary>激活窗口。</summary>
-        public bool ActivateWindow(nint window) => ActivationSuccess;
+        public bool ActivateWindow(nint window)
+        {
+            ActivatedWindows.Add(window);
+            if (ActivationSuccess && RestoreOnActivation) { Foreground = window; Visible = true; Minimized = false; }
+            AfterActivation?.Invoke();
+            return ActivationSuccess;
+        }
         /// <summary>查询客户区。</summary>
-        public bool GetClientRectangle(nint window, out AutomationNativeRectangle rectangle) { ClientReadCount++; rectangle = Client; return ClientSuccess; }
+        public bool GetClientRectangle(nint window, out AutomationNativeRectangle rectangle) { ClientReadCount++; rectangle = Client; AfterClientRead?.Invoke(); return ClientSuccess; }
         /// <summary>转换客户区原点。</summary>
         public bool ClientToScreen(nint window, ref AutomationNativePoint point) { point = Origin; return OriginSuccess; }
         /// <summary>分配窗口 DC。</summary>
