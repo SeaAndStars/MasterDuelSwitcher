@@ -460,6 +460,51 @@ public sealed class WindowsGameAutomationNativeTests
         return (frame.Width * y + x) * 4;
     }
 
+    /// <summary>精确检查自有窗口绘图像素，并有界等待该像素出现在桌面合成画面。</summary>
+    private static void WaitForOwnWindowColor(nint window, SystemWindowsGameAutomationNativeApi api, AutomationNativeRectangle desktop, uint expectedColor)
+    {
+        Assert.True(api.GetClientRectangle(window, out AutomationNativeRectangle client));
+        var origin = new AutomationNativePoint(0, 0);
+        Assert.True(api.ClientToScreen(window, ref origin));
+        var geometry = new GameFrame(window, client.Right - client.Left, client.Bottom - client.Top, origin.X, origin.Y, [], api.UtcNow);
+        int sample = GetVisibleOwnWindowPixel(geometry, desktop) / 4;
+        int x = sample % geometry.Width;
+        int y = sample / geometry.Width;
+        var screen = new AutomationNativePoint(origin.X + x, origin.Y + y);
+        Assert.Equal(window, Native.GetAncestor(Native.WindowFromPoint(screen), 2));
+        nint ownDc = Native.GetDC(window);
+        Assert.NotEqual((nint)0, ownDc);
+        uint sourceColor;
+        try
+        {
+            sourceColor = Native.GetPixel(ownDc, x, y);
+            Assert.Equal(expectedColor, sourceColor);
+        }
+        finally { Assert.Equal(1, Native.ReleaseDC(window, ownDc)); }
+        uint firstDesktopColor = uint.MaxValue;
+        uint lastDesktopColor = uint.MaxValue;
+        int samples = 0;
+        Stopwatch wait = Stopwatch.StartNew();
+        bool presented = SpinWait.SpinUntil(() =>
+        {
+            Assert.Equal(window, Native.GetAncestor(Native.WindowFromPoint(screen), 2));
+            nint desktopDc = Native.GetDC(0);
+            Assert.NotEqual((nint)0, desktopDc);
+            try { lastDesktopColor = Native.GetPixel(desktopDc, screen.X, screen.Y); }
+            finally { Assert.Equal(1, Native.ReleaseDC(0, desktopDc)); }
+            Assert.NotEqual(uint.MaxValue, lastDesktopColor);
+            if (samples++ == 0) firstDesktopColor = lastDesktopColor;
+            if (lastDesktopColor == expectedColor) return true;
+            Assert.Equal(0, Native.DwmFlush());
+            PumpOwnWindowMessages();
+            return false;
+        }, TimeSpan.FromSeconds(1));
+        Console.WriteLine($"OwnedColorReadiness Window={window} SampleScreen=({screen.X},{screen.Y}) Source=0x{sourceColor:X8} "
+            + $"FirstDesktop=0x{firstDesktopColor:X8} LastDesktop=0x{lastDesktopColor:X8} Samples={samples} ElapsedMs={wait.Elapsed.TotalMilliseconds:F1}.");
+        Assert.True(presented, $"自有窗口颜色没有在一秒内进入桌面合成画面。期望=0x{expectedColor:X8}，"
+            + $"桌面首色=0x{firstDesktopColor:X8}，桌面末色=0x{lastDesktopColor:X8}。");
+    }
+
     /// <summary>在单独线程创建、操作并销毁本测试专属窗口。</summary>
     private static void VerifyOwnWindow(TaskCompletionSource completion)
     {
@@ -527,6 +572,7 @@ public sealed class WindowsGameAutomationNativeTests
             Native.DeleteObject(brush);
             Assert.Equal(1, Native.ReleaseDC(window, dc));
             Assert.Equal(0, Native.DwmFlush());
+            WaitForOwnWindowColor(window, api, desktop, 0x00332211);
             var frame = platform.Capture();
             Assert.Equal(client.Right - client.Left, frame.Width);
             Assert.Equal(client.Bottom - client.Top, frame.Height);
@@ -548,6 +594,7 @@ public sealed class WindowsGameAutomationNativeTests
             Assert.True(Native.DeleteObject(refreshedBrush));
             Assert.Equal(1, Native.ReleaseDC(window, refreshedDc));
             Assert.Equal(0, Native.DwmFlush());
+            WaitForOwnWindowColor(window, api, desktop, 0x00665544);
             GameFrame refreshed = platform.Capture();
             Assert.Equal([0x66, 0x55, 0x44], refreshed.Pixels.Skip(center).Take(3).Select(value => (int)value).ToArray());
             Assert.False(frame.Pixels.AsSpan().SequenceEqual(refreshed.Pixels), "自有窗口重绘后截图仍为旧帧。");
@@ -582,6 +629,7 @@ public sealed class WindowsGameAutomationNativeTests
                     Assert.Equal(1, Native.ReleaseDC(window, movedDc));
                 }
                 Assert.Equal(0, Native.DwmFlush());
+                WaitForOwnWindowColor(window, api, desktop, 0x00665544);
                 inputFrame = platform.Capture();
                 int movedCenter = GetVisibleOwnWindowPixel(inputFrame, desktop);
                 Assert.Equal([0x66, 0x55, 0x44], inputFrame.Pixels.Skip(movedCenter).Take(3).Select(value => (int)value).ToArray());
@@ -795,6 +843,8 @@ public sealed class WindowsGameAutomationNativeTests
         [DllImport("dwmapi.dll")] internal static extern int DwmFlush();
         /// <summary>创建测试颜色画刷。</summary>
         [DllImport("gdi32.dll")] internal static extern nint CreateSolidBrush(uint color);
+        /// <summary>只读验证自有窗口或桌面绘图上下文的精确颜色，失败时返回无效颜色值。</summary>
+        [DllImport("gdi32.dll")] internal static extern uint GetPixel(nint dc, int x, int y);
         /// <summary>删除测试画刷。</summary>
         [DllImport("gdi32.dll")] [return: MarshalAs(UnmanagedType.Bool)] internal static extern bool DeleteObject(nint value);
         /// <summary>读取测试窗口的排队消息。</summary>
