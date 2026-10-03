@@ -1,0 +1,64 @@
+# Master Duel Switcher
+
+C# WPF + [WPF UI](https://github.com/lepoco/wpfui) 的 Windows Steam 版 Master Duel 换号和下载资源管理工具。支持 Windows 10 / 11 x64，使用 Fluent 界面。
+
+## 功能
+
+- 自动发现 Steam、游戏库与本机记住的 Steam 账号；支持手动选择路径。
+- 账号备注、在工具中隐藏账号、绑定游戏资源目录。
+- 使用同一份 `LocalData/<账号目录>/0000` 下载资源，一键切换账号并由 Steam 启动游戏。
+- 原始资源目录保留为备份；工具记录事务并支持恢复。
+- Steam 登录配置备份与还原；浅色、深色主题；标准 UAC 管理员启动。
+- MVVM 与 DI 架构，SQLite 保存账号记录与偏好，全部自写生产代码按行和分支覆盖率验证。
+
+## 首次使用
+
+1. 解压发布包并打开 `MasterDuelSwitcher.exe`，在 Windows UAC 确认提示中选择“是”。自包含版本不需要另装 .NET。
+2. 在“设置”检查自动发现的 Steam 和游戏路径。游戏路径应包含 `masterduel.exe` 和 `LocalData`。
+3. 每个 Steam 账号先在 Steam 正常登录一次并选择记住登录。新账号启动游戏到开始下载时退出，使游戏生成 `LocalData` 账号目录。
+4. 在“资源共享”选中已经完成游戏更新的账号资源作为来源。各账号应使用相同游戏语言和资源版本。
+5. 在“账号”页面为每个 Steam 账号绑定正确的八位资源目录。目录与 SteamID 的对应关系由你确认；查看新账号启动前后新增的目录即可定位。
+6. 点击“启用资源共享”，完成后切回“账号”，选择账号并点击“切换并启动”。
+
+## 换号
+
+- 先正常关闭 Master Duel，再点击“切换并启动”。Steam 正常退出后会按选中的账号重新启动游戏。
+- 首次登录、会话过期或 Steam Guard 验证由 Steam 提示，照常完成验证。
+- 来源资源更新后，已绑定共享目录的账号复用更新后的同一份资源。Konami 发布的新资源仍需下载一次；语言差异或游戏资源格式变化可能触发额外下载。
+- 工具只修改 Steam 登录选择配置和 `0000` 的目录链接；账号目录与 `LocalSave` 分别保留。
+
+## 备份与还原
+
+- “备份还原”中选择资源事务并点击还原。只移除本事务创建且仍指向预期来源的链接，并把旧目录放回原位置。
+- 原资源目录保留在对应账号目录的 `0000.mdbackup-<事务标识>`；备份可能占用原有磁盘空间。
+- 还原前关闭 Master Duel。若链接已被其他工具替换，先核对目录状态；本工具会报告冲突并保留目录。
+- “还原上次 Steam 登录配置”恢复该次切号前的配置；执行时会正常退出 Steam。之后手动打开 Steam 即可。
+- 工具账号与偏好保存在 `%LOCALAPPDATA%\MasterDuelSwitcher\accounts.db`，删除或移动 EXE 不会删除此数据库；资源事务在该目录的 `resource-backups`，Steam 登录备份在 `steam-login-backups`。
+- 不要只删除事务清单而保留尚未还原的链接，也不要在共享状态下移动或删除来源账号资源目录。
+
+## 常见情况
+
+- **未发现账号**：在此 Steam 安装中登录并记住账号，然后刷新。
+- **未发现游戏**：在“设置”手动选择包含 `masterduel.exe` 的游戏目录。
+- **目录权限错误**：确认游戏所在磁盘为 NTFS，当前用户有写入权限，并在 Windows UAC 中确认管理员启动。
+- **仍出现大包下载**：检查账号绑定、来源是否已完成更新、所有账号游戏语言是否一致。先停止下载和游戏，再核对资源共享状态。
+- **切号启动后仍是原账号**：完成 Steam 的登录提示，再核对账号是否记住登录及目录绑定。启动结果与登录结果分别确认。
+
+## 开发与验证
+
+需要 .NET 10 SDK 和 Windows。打开 `MasterDuelSwitcher.sln`，或在项目根目录运行：
+
+```powershell
+dotnet restore MasterDuelSwitcher.sln
+pwsh -File scripts/Test-Coverage.ps1
+dotnet build MasterDuelSwitcher.sln -c Release
+pwsh -File scripts/Publish.ps1
+```
+
+Core 负责目录事务、SQLite 与 Steam 集成；App 的 ViewModel 通过 DI 的接口调用服务，Views保存窗口与资源组件，App.xaml仅引用Views。Tests 使用临时数据库、临时目录及隔离系统边界验证，UIProbe 打开真实 WPF 窗口。源码中的类型、方法、字段和属性具有中文注释。测试不登录或切换真实 Steam 账号。
+
+## 依赖与范围
+
+- WPF UI 4.3.0，MIT 许可证，版权与许可证见 `THIRD-PARTY-NOTICES.md`。
+- 本工具与 Konami、Valve 无隶属关系，不处理 Steam 密码或 Steam Guard 密钥。
+- 凭据与登录状态仍由 Steam 管理；本工具的发布包不包含用户账号数据。
