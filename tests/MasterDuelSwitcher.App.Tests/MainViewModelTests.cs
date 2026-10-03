@@ -166,6 +166,7 @@ public sealed class MainViewModelTests
     [InlineData("Resources", "资源共享", 1)]
     [InlineData("Backups", "备份还原", 2)]
     [InlineData("Settings", "设置", 3)]
+    [InlineData("FreePacks", "免费开包", 0)]
     [InlineData("Unknown", "账号切换", 0)]
     [InlineData(null, "账号切换", 0)]
     public void NavigationKeepsTitlesAndPageFlagsConsistent(string? page, string title, int visiblePage)

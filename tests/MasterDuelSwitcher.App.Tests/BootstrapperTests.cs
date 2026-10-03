@@ -48,9 +48,13 @@ public sealed class BootstrapperTests
         Assert.IsType<ResourceSharingService>(services.GetRequiredService<IResourceSharingService>());
         Assert.IsType<AccountAvatarService>(services.GetRequiredService<IAccountAvatarService>());
         Assert.Same(services.GetRequiredService<IAccountAvatarService>(), services.GetRequiredService<IAccountAvatarService>());
+        Assert.IsType<OpenCvPackRecognizer>(services.GetRequiredService<IPackRecognizer>());
+        Assert.IsType<WindowsGameAutomationPlatform>(services.GetRequiredService<IGameAutomationPlatform>());
+        Assert.IsType<FreePackAutomationService>(services.GetRequiredService<IFreePackAutomationService>());
         Assert.IsType<WpfUserInteraction>(services.GetRequiredService<IUserInteraction>());
         Assert.IsType<FluentThemeService>(services.GetRequiredService<IThemeService>());
         var viewModel = services.GetRequiredService<MainViewModel>();
+        Assert.Same(services.GetRequiredService<FreePacksPageViewModel>(), viewModel.FreePacks);
         Assert.Equal(stateDirectory, viewModel.Workspace.StateDirectory);
         Assert.False(viewModel.Workspace.StorageReady);
         Assert.Same(viewModel, services.GetRequiredService<MainViewModel>());

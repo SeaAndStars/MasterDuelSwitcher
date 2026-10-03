@@ -29,6 +29,9 @@ public static class Bootstrapper
         services.AddSingleton<ISteamAccountService>(provider => new SteamAccountService(stateDirectory, logger: provider.GetRequiredService<ILogger<SteamAccountService>>()));
         services.AddSingleton<IResourceSharingService>(provider => new ResourceSharingService(stateDirectory, logger: provider.GetRequiredService<ILogger<ResourceSharingService>>()));
         services.AddSingleton<IAccountAvatarService>(provider => new AccountAvatarService(provider.GetRequiredService<ISettingsStore>().StateDirectory, logger: provider.GetRequiredService<ILogger<AccountAvatarService>>()));
+        services.AddSingleton<IPackRecognizer, OpenCvPackRecognizer>();
+        services.AddSingleton<IGameAutomationPlatform>(provider => new WindowsGameAutomationPlatform(provider.GetRequiredService<ISettingsStore>().StateDirectory, logger: provider.GetRequiredService<ILogger<WindowsGameAutomationPlatform>>()));
+        services.AddSingleton<IFreePackAutomationService, FreePackAutomationService>();
         services.AddSingleton<IUserInteraction, WpfUserInteraction>();
         services.AddSingleton<IThemeService, FluentThemeService>();
         services.AddSingleton<WorkspaceService>();
@@ -37,10 +40,12 @@ public static class Bootstrapper
         services.AddSingleton<ResourcesPageViewModel>();
         services.AddSingleton<BackupsPageViewModel>();
         services.AddSingleton<SettingsPageViewModel>();
+        services.AddSingleton<FreePacksPageViewModel>();
         services.AddSingleton<AccountsPage>();
         services.AddSingleton<ResourcesPage>();
         services.AddSingleton<BackupsPage>();
         services.AddSingleton<SettingsPage>();
+        services.AddSingleton<FreePacksPage>();
         services.AddSingleton<INavigationViewPageProvider, PageService>();
         services.AddSingleton<INavigationService, NavigationService>();
         services.AddSingleton<MainWindow>();

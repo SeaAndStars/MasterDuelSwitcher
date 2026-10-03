@@ -1,0 +1,64 @@
+<Page x:Class="MasterDuelSwitcher.App.Views.Pages.FreePacksPage"
+      xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+      xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+      xmlns:ui="http://schemas.lepo.co/wpfui/2022/xaml"
+      Title="免费开包" FontFamily="Segoe UI Variable, Microsoft YaHei UI, Segoe UI" FontSize="14"
+      Background="Transparent" Foreground="{DynamicResource TextFillColorPrimaryBrush}"
+      ScrollViewer.CanContentScroll="False" IsEnabled="{Binding Workspace.IsReady}"
+      Unloaded="OnPageUnloaded" AutomationProperties.AutomationId="FreePacksPage">
+    <ScrollViewer VerticalScrollBarVisibility="Auto" HorizontalScrollBarVisibility="Disabled">
+        <StackPanel Margin="0,0,0,24">
+            <!-- 当前阶段和操作入口使用官方 Fluent 卡片。 -->
+            <ui:Card Padding="24" Margin="0,0,0,16">
+                <StackPanel>
+                    <ui:TextBlock Text="当前账号的免费卡包" FontSize="18" FontWeight="SemiBold" />
+                    <ui:TextBlock Text="在游戏中打开卡包详情页，再点击开始。工具会核验免费入口，完成开包后继续下一包；付费卡包直接跳过。"
+                                  TextWrapping="Wrap" Foreground="{DynamicResource TextFillColorSecondaryBrush}" Margin="0,8,0,22" />
+                    <ui:TextBlock Text="当前阶段" Foreground="{DynamicResource TextFillColorSecondaryBrush}" />
+                    <ui:TextBlock x:Name="FreePacksStage" Text="{Binding Stage}" FontSize="18" FontWeight="SemiBold"
+                                  TextWrapping="Wrap" Margin="0,6,0,20" AutomationProperties.AutomationId="FreePacksStage" />
+                    <WrapPanel>
+                        <ui:Button x:Name="FreePacksStart" Content="开始免费开包" Appearance="Primary" Command="{Binding StartCommand}"
+                                   Margin="0,0,12,8" AutomationProperties.AutomationId="FreePacksStart">
+                            <ui:Button.Icon><ui:SymbolIcon Symbol="Play24" /></ui:Button.Icon>
+                        </ui:Button>
+                        <ui:Button x:Name="FreePacksStop" Content="停止" Command="{Binding StopCommand}" Margin="0,0,0,8"
+                                   AutomationProperties.AutomationId="FreePacksStop">
+                            <ui:Button.Icon><ui:SymbolIcon Symbol="Stop24" /></ui:Button.Icon>
+                        </ui:Button>
+                    </WrapPanel>
+                </StackPanel>
+            </ui:Card>
+            <!-- 两项统计只反映本轮实际扫描及已确认的开包结果。 -->
+            <Grid Margin="0,0,0,16">
+                <Grid.ColumnDefinitions><ColumnDefinition Width="*" /><ColumnDefinition Width="16" /><ColumnDefinition Width="*" /></Grid.ColumnDefinitions>
+                <ui:Card Padding="20">
+                    <StackPanel>
+                        <ui:TextBlock Text="已扫描卡包" Foreground="{DynamicResource TextFillColorSecondaryBrush}" />
+                        <ui:TextBlock x:Name="ScannedPackCount" Text="{Binding ScannedPacks}" FontSize="28" FontWeight="SemiBold" Margin="0,8,0,0"
+                                      AutomationProperties.AutomationId="ScannedPackCount" />
+                    </StackPanel>
+                </ui:Card>
+                <ui:Card Grid.Column="2" Padding="20">
+                    <StackPanel>
+                        <ui:TextBlock Text="已开免费卡包" Foreground="{DynamicResource TextFillColorSecondaryBrush}" />
+                        <ui:TextBlock x:Name="OpenedPackCount" Text="{Binding OpenedPacks}" FontSize="28" FontWeight="SemiBold" Margin="0,8,0,0"
+                                      AutomationProperties.AutomationId="OpenedPackCount" />
+                    </StackPanel>
+                </ui:Card>
+            </Grid>
+            <ui:InfoBar IsOpen="True" IsClosable="False" Severity="Informational" Title="随时停止"
+                        Message="运行时保持游戏窗口在前台。按 F8 或点击运行遮罩中的停止按钮结束；窗口变化或识别不确定时会自动结束。每轮最多扫描 200 个卡包，单阶段等待上限为 60 秒。"
+                        Margin="0,0,0,16" />
+            <ui:Card Padding="20">
+                <StackPanel>
+                    <ui:TextBlock Text="运行与调试日志" FontWeight="SemiBold" />
+                    <ui:TextBlock Text="阶段、操作和结束原因保存在本机日志目录；诊断截图保存在本机数据目录。"
+                                  TextWrapping="Wrap" Foreground="{DynamicResource TextFillColorSecondaryBrush}" Margin="0,7,0,12" />
+                    <ui:TextBlock x:Name="FreePacksLogDirectory" Text="{Binding LogDirectory}" TextWrapping="Wrap"
+                                  AutomationProperties.AutomationId="FreePacksLogDirectory" />
+                </StackPanel>
+            </ui:Card>
+        </StackPanel>
+    </ScrollViewer>
+</Page>

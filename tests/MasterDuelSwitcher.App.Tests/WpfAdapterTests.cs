@@ -83,6 +83,7 @@ public sealed class WpfAdapterTests
                 .AddSingleton<ISteamDiscoveryService>(_ => discovery)
                 .AddSingleton<ISteamAccountService>(_ => new IsolatedSteam())
                 .AddSingleton<IAccountAvatarService>(_ => new IsolatedAvatar())
+                .AddSingleton<IFreePackAutomationService>(_ => new IsolatedFreePacks())
                 .AddSingleton<IResourceSharingService>(_ => new IsolatedResources())
                 .AddSingleton<IUserInteraction>(_ => new IsolatedInteraction())
                 .AddSingleton<IThemeService>(_ => new IsolatedTheme())
@@ -94,10 +95,12 @@ public sealed class WpfAdapterTests
                 .AddSingleton<ResourcesPageViewModel>()
                 .AddSingleton<BackupsPageViewModel>()
                 .AddSingleton<SettingsPageViewModel>()
+                .AddSingleton<FreePacksPageViewModel>()
                 .AddSingleton<AccountsPage>()
                 .AddSingleton<ResourcesPage>()
                 .AddSingleton<BackupsPage>()
                 .AddSingleton<SettingsPage>()
+                .AddSingleton<FreePacksPage>()
                 .AddSingleton<INavigationViewPageProvider, PageService>()
                 .AddSingleton<INavigationService, NavigationService>()
                 .AddSingleton<MainWindow>()
@@ -105,6 +108,7 @@ public sealed class WpfAdapterTests
             Exception? failure = null;
             var bootstrapper = new IsolatedBootstrapper(services, (window, viewModel) =>
             {
+                window.ShowActivated = false;
                 VerifyEmptyNavigationSelection(window, viewModel);
                 var started = false;
                 window.ContentRendered += async (_, _) =>
@@ -167,6 +171,8 @@ public sealed class WpfAdapterTests
         await ResourcesPageViewModelTests.VerifyRealPageBindingsAsync();
         ReportStage("resources-binding-end backups-binding-start");
         await BackupsPageViewModelTests.VerifyRealPageBindingsAsync();
+        ReportStage("backups-binding-end free-packs-start");
+        await VerifyFreePacksAsync(window, services);
         ReportStage("nav-end scroll-start");
         await VerifyAccountsListScrollingAsync(window, viewModel, discovery, services);
         ReportStage("scroll-end avatars-start");
@@ -215,24 +221,34 @@ public sealed class WpfAdapterTests
         discovery.BlockNext = true;
         var refresh = viewModel.RefreshCommand.ExecuteAsync();
         Assert.True(await Task.Run(() => discovery.Entered.Wait(TimeSpan.FromSeconds(5))));
+        MainWindow? legacyWindow = null;
         try
         {
             Assert.True(workspace.IsBusy);
             await Dispatcher.Yield(DispatcherPriority.ApplicationIdle);
             Assert.False(Assert.IsType<Wpf.Ui.Controls.NavigationView>(window.FindName("MainNavigation")).IsEnabled);
-            foreach (var name in new[] { "AccountsNav", "ResourcesNav", "BackupsNav", "SettingsNav" })
+            foreach (var name in new[] { "AccountsNav", "ResourcesNav", "BackupsNav", "SettingsNav", "FreePacksNav" })
                 Assert.False(Assert.IsType<Wpf.Ui.Controls.NavigationViewItem>(window.FindName(name)).IsEnabled);
             Assert.Equal("Accounts", viewModel.CurrentPage);
             window.Close();
             Assert.True(window.IsVisible);
+            var legacyModel = new MainViewModel(workspace, services.GetRequiredService<IApplicationEnvironment>());
+            legacyWindow = new MainWindow(legacyModel, services.GetRequiredService<INavigationService>());
+            var legacyCloseCancelled = false;
+            legacyWindow.Closing += (_, args) => legacyCloseCancelled = args.Cancel;
+            legacyWindow.Close();
+            Assert.True(legacyCloseCancelled);
         }
         finally
         {
             discovery.Release.Set();
             await refresh;
+            legacyWindow?.Close();
+            services.GetRequiredService<INavigationService>().SetNavigationControl(Assert.IsType<Wpf.Ui.Controls.NavigationView>(window.FindName("MainNavigation")));
         }
         Assert.False(workspace.IsBusy);
         ReportStage("busy-close-end close-start");
+        await VerifyFreePacksClosingAsync(window, services);
         window.Close();
         Assert.False(window.IsVisible);
 
@@ -251,13 +267,15 @@ public sealed class WpfAdapterTests
     {
         var navigation = Assert.IsType<Wpf.Ui.Controls.NavigationView>(window.FindName("MainNavigation"));
         var account = Assert.IsType<Wpf.Ui.Controls.NavigationViewItem>(window.FindName("AccountsNav"));
+        var freePacks = Assert.IsType<Wpf.Ui.Controls.NavigationViewItem>(window.FindName("FreePacksNav"));
         var resources = Assert.IsType<Wpf.Ui.Controls.NavigationViewItem>(window.FindName("ResourcesNav"));
         var backups = Assert.IsType<Wpf.Ui.Controls.NavigationViewItem>(window.FindName("BackupsNav"));
         var settings = Assert.IsType<Wpf.Ui.Controls.NavigationViewItem>(window.FindName("SettingsNav"));
-        Assert.Equal(3, navigation.MenuItems.Count);
+        Assert.Equal(4, navigation.MenuItems.Count);
         Assert.Same(account, navigation.MenuItems[0]);
         Assert.Same(resources, navigation.MenuItems[1]);
         Assert.Same(backups, navigation.MenuItems[2]);
+        Assert.Same(freePacks, navigation.MenuItems[3]);
         Assert.Same(settings, Assert.Single(navigation.FooterMenuItems));
         Assert.IsAssignableFrom<FrameworkElement>(navigation.PaneHeader);
         var footer = Assert.IsAssignableFrom<FrameworkElement>(window.FindName("NavigationStatusFooter"));
@@ -270,7 +288,8 @@ public sealed class WpfAdapterTests
         var resourcesPage = services.GetRequiredService<ResourcesPage>();
         var backupsPage = services.GetRequiredService<BackupsPage>();
         var settingsPage = services.GetRequiredService<SettingsPage>();
-        foreach (var page in new Page[] { accountsPage, resourcesPage, backupsPage, settingsPage })
+        var freePacksPage = services.GetRequiredService<FreePacksPage>();
+        foreach (var page in new Page[] { accountsPage, resourcesPage, backupsPage, settingsPage, freePacksPage })
         {
             Assert.Equal(14, page.FontSize);
             Assert.Equal(new[] { "Segoe UI Variable", "Microsoft YaHei UI", "Segoe UI" }, page.FontFamily.Source.Split(',').Select(name => name.Trim()));
@@ -279,29 +298,37 @@ public sealed class WpfAdapterTests
         Assert.Same(services.GetRequiredService<ResourcesPageViewModel>(), Assert.IsAssignableFrom<INavigableView<ResourcesPageViewModel>>(resourcesPage).ViewModel);
         Assert.Same(services.GetRequiredService<BackupsPageViewModel>(), Assert.IsAssignableFrom<INavigableView<BackupsPageViewModel>>(backupsPage).ViewModel);
         Assert.Same(services.GetRequiredService<SettingsPageViewModel>(), Assert.IsAssignableFrom<INavigableView<SettingsPageViewModel>>(settingsPage).ViewModel);
+        Assert.Same(services.GetRequiredService<FreePacksPageViewModel>(), Assert.IsAssignableFrom<INavigableView<FreePacksPageViewModel>>(freePacksPage).ViewModel);
         Assert.Same(accountsPage.ViewModel, accountsPage.DataContext);
         Assert.Same(resourcesPage.ViewModel, resourcesPage.DataContext);
         Assert.Same(backupsPage.ViewModel, backupsPage.DataContext);
         Assert.Same(settingsPage.ViewModel, settingsPage.DataContext);
+        Assert.Same(freePacksPage.ViewModel, freePacksPage.DataContext);
         Assert.Same(viewModel.Workspace, accountsPage.ViewModel.Workspace);
         Assert.Same(viewModel.Workspace, resourcesPage.ViewModel.Workspace);
         Assert.Same(viewModel.Workspace, backupsPage.ViewModel.Workspace);
         Assert.Same(viewModel.Workspace, settingsPage.ViewModel.Workspace);
+        Assert.Same(viewModel.Workspace, freePacksPage.ViewModel.Workspace);
+        Assert.Same(freePacksPage.ViewModel, viewModel.FreePacks);
         accountsPage.InitializeComponent();
         ((System.Windows.Markup.IStyleConnector)accountsPage).Connect(-1, new object());
         resourcesPage.InitializeComponent();
         backupsPage.InitializeComponent();
         settingsPage.InitializeComponent();
+        freePacksPage.InitializeComponent();
+        ((System.Windows.Markup.IComponentConnector)freePacksPage).Connect(-1, new object());
         Assert.NotNull(accountsPage.FindName("AccountList"));
         Assert.NotNull(resourcesPage.FindName("ProfileList"));
         Assert.NotNull(backupsPage.FindName("BackupList"));
         Assert.NotNull(settingsPage.FindName("SteamPathBox"));
+        Assert.NotNull(freePacksPage.FindName("FreePacksStart"));
 
         var pages = new[]
         {
             (Item: resources, Name: "Resources", View: (Page)resourcesPage),
             (Item: backups, Name: "Backups", View: (Page)backupsPage),
             (Item: settings, Name: "Settings", View: (Page)settingsPage),
+            (Item: freePacks, Name: "FreePacks", View: (Page)freePacksPage),
             (Item: account, Name: "Accounts", View: (Page)accountsPage)
         };
         var provider = services.GetRequiredService<INavigationViewPageProvider>();
@@ -324,6 +351,119 @@ public sealed class WpfAdapterTests
             }
         }
         VerifyMissingNavigationTag(navigation, account, viewModel);
+    }
+
+    /// <summary>在唯一真实窗口验证免费开包绑定、忙碌遮罩停止和页面卸载取消，不操作游戏。</summary>
+    private static async Task VerifyFreePacksAsync(MainWindow window, ServiceProvider services)
+    {
+        var navigation = services.GetRequiredService<INavigationService>();
+        var page = services.GetRequiredService<FreePacksPage>();
+        var viewModel = page.ViewModel;
+        var automation = Assert.IsType<IsolatedFreePacks>(services.GetRequiredService<IFreePackAutomationService>());
+        try
+        {
+        Assert.True(navigation.Navigate(typeof(FreePacksPage)));
+        await Task.Delay(Assert.IsType<Wpf.Ui.Controls.NavigationView>(window.FindName("MainNavigation")).TransitionDuration);
+        await Dispatcher.Yield(DispatcherPriority.ApplicationIdle);
+        window.UpdateLayout();
+        var startButton = Assert.IsType<Wpf.Ui.Controls.Button>(page.FindName("FreePacksStart"));
+        var pageStop = Assert.IsType<Wpf.Ui.Controls.Button>(page.FindName("FreePacksStop"));
+        var overlayStop = Assert.IsType<Wpf.Ui.Controls.Button>(window.FindName("FreePacksOverlayStop"));
+        Assert.Same(viewModel.StartCommand, startButton.Command);
+        Assert.Same(viewModel.StopCommand, pageStop.Command);
+        Assert.Same(viewModel.StopCommand, overlayStop.Command);
+        Assert.IsType<Wpf.Ui.Controls.SymbolIcon>(startButton.Icon);
+        Assert.IsType<Wpf.Ui.Controls.SymbolIcon>(pageStop.Icon);
+        Assert.IsType<Wpf.Ui.Controls.SymbolIcon>(overlayStop.Icon);
+        Assert.Equal(viewModel.LogDirectory, Assert.IsType<Wpf.Ui.Controls.TextBlock>(page.FindName("FreePacksLogDirectory")).Text);
+        Assert.True(startButton.IsEnabled);
+        Assert.False(pageStop.IsEnabled);
+        Assert.Equal("0", Assert.IsType<Wpf.Ui.Controls.TextBlock>(page.FindName("ScannedPackCount")).Text);
+        Assert.Equal("0", Assert.IsType<Wpf.Ui.Controls.TextBlock>(page.FindName("OpenedPackCount")).Text);
+
+        var run = viewModel.StartCommand.ExecuteAsync();
+        await Dispatcher.Yield(DispatcherPriority.ApplicationIdle);
+        window.UpdateLayout();
+        Assert.True(viewModel.IsRunning);
+        Assert.True(viewModel.Workspace.IsBusy);
+        Assert.False(Assert.IsType<Grid>(window.FindName("Workspace")).IsEnabled);
+        Assert.False(startButton.IsEnabled);
+        Assert.False(pageStop.IsEnabled);
+        Assert.True(overlayStop.IsEnabled);
+        Assert.True(overlayStop.IsVisible);
+        Assert.NotNull(automation.Progress);
+        automation.Progress.Report(new FreePackProgress { Stage = "正在确认免费卡包", ScannedPacks = 3, OpenedPacks = 1 });
+        await Dispatcher.Yield(DispatcherPriority.ApplicationIdle);
+        window.UpdateLayout();
+        Assert.Equal("正在确认免费卡包", Assert.IsType<Wpf.Ui.Controls.TextBlock>(page.FindName("FreePacksStage")).Text);
+        Assert.Equal("3", Assert.IsType<Wpf.Ui.Controls.TextBlock>(page.FindName("ScannedPackCount")).Text);
+        Assert.Equal("1", Assert.IsType<Wpf.Ui.Controls.TextBlock>(page.FindName("OpenedPackCount")).Text);
+        Assert.Equal("正在确认免费卡包", Assert.IsType<TextBlock>(window.FindName("FreePacksOverlayStage")).Text);
+        Assert.Equal("3", Assert.IsType<TextBlock>(window.FindName("FreePacksOverlayScannedCount")).Text);
+        Assert.Equal("1", Assert.IsType<TextBlock>(window.FindName("FreePacksOverlayOpenedCount")).Text);
+        var peer = new ButtonAutomationPeer(overlayStop);
+        Assert.Same(overlayStop, peer.Owner);
+        Assert.IsAssignableFrom<IInvokeProvider>(peer.GetPattern(PatternInterface.Invoke)).Invoke();
+        await Dispatcher.Yield(DispatcherPriority.ApplicationIdle);
+        Assert.True(automation.CancellationToken.IsCancellationRequested);
+        Assert.True(viewModel.Workspace.IsBusy);
+        Assert.False(run.IsCompleted);
+        automation.Complete(3, 1, "已停止");
+        await run.WaitAsync(TimeSpan.FromSeconds(5));
+        await Dispatcher.Yield(DispatcherPriority.ApplicationIdle);
+        Assert.False(viewModel.IsRunning);
+        Assert.True(viewModel.Workspace.IsReady);
+        Assert.False(overlayStop.IsVisible);
+        Assert.Equal("已停止", Assert.IsType<Wpf.Ui.Controls.TextBlock>(page.FindName("FreePacksStage")).Text);
+
+        automation.Reset();
+        var leavingRun = viewModel.StartCommand.ExecuteAsync();
+        Assert.True(navigation.Navigate(typeof(AccountsPage)));
+        await Task.Delay(Assert.IsType<Wpf.Ui.Controls.NavigationView>(window.FindName("MainNavigation")).TransitionDuration);
+        await Dispatcher.Yield(DispatcherPriority.ApplicationIdle);
+        Assert.True(automation.CancellationToken.IsCancellationRequested);
+        Assert.True(viewModel.Workspace.IsBusy);
+        automation.Complete(0, 0, "页面离开，已停止");
+        await leavingRun.WaitAsync(TimeSpan.FromSeconds(5));
+        Assert.False(page.IsVisible);
+        Assert.True(viewModel.Workspace.IsReady);
+        }
+        finally
+        {
+            automation.Complete(0, 0, "验证结束");
+            await viewModel.RequestStopAsync();
+        }
+    }
+
+    /// <summary>实际点击关闭时先取消免费开包，服务清理结束后才关闭当前窗口。</summary>
+    private static async Task VerifyFreePacksClosingAsync(MainWindow window, ServiceProvider services)
+    {
+        var navigation = services.GetRequiredService<INavigationService>();
+        var viewModel = services.GetRequiredService<FreePacksPageViewModel>();
+        var automation = Assert.IsType<IsolatedFreePacks>(services.GetRequiredService<IFreePackAutomationService>());
+        Assert.True(navigation.Navigate(typeof(FreePacksPage)));
+        await Task.Delay(Assert.IsType<Wpf.Ui.Controls.NavigationView>(window.FindName("MainNavigation")).TransitionDuration);
+        await Dispatcher.Yield(DispatcherPriority.ApplicationIdle);
+        automation.Reset();
+        var run = viewModel.StartCommand.ExecuteAsync();
+        try
+        {
+        window.Close();
+        Assert.True(automation.CancellationToken.IsCancellationRequested);
+        Assert.True(viewModel.Workspace.IsBusy);
+        Assert.False(run.IsCompleted);
+        Assert.True(window.IsVisible);
+        automation.Complete(0, 0, "关闭窗口，已停止");
+        await run.WaitAsync(TimeSpan.FromSeconds(5));
+        await Dispatcher.Yield(DispatcherPriority.ApplicationIdle);
+        Assert.True(viewModel.Workspace.IsReady);
+        Assert.False(window.IsVisible);
+        }
+        finally
+        {
+            automation.Complete(0, 0, "验证结束");
+            await viewModel.RequestStopAsync();
+        }
     }
 
     /// <summary>真实窗口尚未 Loaded 时导航没有选中项，官方路由选择事件恢复默认账号标题。</summary>
@@ -475,14 +615,21 @@ public sealed class WpfAdapterTests
             var statusTop = BoundsInWindow(statusBorder, window).Top;
             Assert.True(BoundsInWindow(listViewport, window).Bottom <= statusTop + 1, "账号列表视口超过独立状态区上沿。");
             Assert.True(BoundsInWindow(details, window).Bottom <= statusTop + 1, "账号编辑视口超过独立状态区上沿。");
+            ReportStage("scroll-assertions-end");
         }
         finally
         {
             discovery.Accounts = originalAccounts;
-            await viewModel.RefreshCommand.ExecuteAsync();
+            ReportStage($"scroll-cleanup-refresh-before busy={viewModel.Workspace.IsBusy} canExecute={viewModel.RefreshCommand.CanExecute(null)}");
+            var refresh = viewModel.RefreshCommand.ExecuteAsync();
+            ReportStage($"scroll-cleanup-refresh-task-created status={refresh.Status}");
+            await refresh;
+            ReportStage("scroll-cleanup-refresh-after");
             window.Width = originalWidth;
             window.Height = originalHeight;
+            ReportStage("scroll-cleanup-idle-before");
             await Dispatcher.Yield(DispatcherPriority.ApplicationIdle);
+            ReportStage("scroll-cleanup-idle-after");
             UpdateLayoutWithDiagnostics(window, "scroll-cleanup");
         }
     }
@@ -525,8 +672,10 @@ public sealed class WpfAdapterTests
         ];
         try
         {
-            ReportStage("avatars-refresh-before");
-            await viewModel.RefreshCommand.ExecuteAsync();
+            ReportStage($"avatars-refresh-before busy={viewModel.Workspace.IsBusy} canExecute={viewModel.RefreshCommand.CanExecute(null)}");
+            var refresh = viewModel.RefreshCommand.ExecuteAsync();
+            ReportStage($"avatars-refresh-task-created status={refresh.Status}");
+            await refresh;
             ReportStage("avatars-refresh-after");
             Assert.Equal(2, accountsViewModel.Accounts.Count);
             foreach (var account in accountsViewModel.Accounts)
@@ -1041,6 +1190,33 @@ public sealed class WpfAdapterTests
             var completion = Completion;
             return Task.Run(async () => { await completion.WaitAsync(cancellationToken).ConfigureAwait(false); return path; }, cancellationToken);
         }
+    }
+
+    /// <summary>隔离免费开包的运行与清理边界，全部请求由测试完成且不访问游戏。</summary>
+    private sealed class IsolatedFreePacks : IFreePackAutomationService
+    {
+        /// <summary>当前轮由测试显式完成的服务结果。</summary>
+        private TaskCompletionSource<FreePackRunResult> _completion = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        /// <summary>当前轮由页面模型提供的进度入口。</summary>
+        public IProgress<FreePackProgress>? Progress { get; private set; }
+        /// <summary>当前轮由页面模型提供的取消令牌。</summary>
+        public CancellationToken CancellationToken { get; private set; }
+        /// <summary>保存界面边界并等待测试结果，不执行窗口激活、截图或输入。</summary>
+        public Task<FreePackRunResult> RunAsync(IProgress<FreePackProgress>? progress = null, CancellationToken cancellationToken = default)
+        {
+            Progress = progress;
+            CancellationToken = cancellationToken;
+            return _completion.Task;
+        }
+        /// <summary>准备独立下一轮任务，不复用前一轮已经完成的结果。</summary>
+        public void Reset()
+        {
+            _completion = new TaskCompletionSource<FreePackRunResult>(TaskCreationOptions.RunContinuationsAsynchronously);
+            Progress = null;
+            CancellationToken = default;
+        }
+        /// <summary>在测试确认取消和清理边界后返回明确的统计及结束原因。</summary>
+        public void Complete(int scanned, int opened, string reason) => _completion.TrySetResult(new FreePackRunResult { ScannedPacks = scanned, OpenedPacks = opened, Reason = reason, IsCancelled = true });
     }
 
     /// <summary>拥有完整像素 PNG 和签名、尾块完整但图像宽度无效的 PNG，应用退出后删除临时文件。</summary>

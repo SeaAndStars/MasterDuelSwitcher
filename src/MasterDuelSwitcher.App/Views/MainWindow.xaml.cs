@@ -31,10 +31,18 @@ public partial class MainWindow : FluentWindow
     /// <summary>只同步已被官方导航选中的页面标题，不执行页面业务。</summary>
     private void OnNavigationSelectionChanged(NavigationView sender, RoutedEventArgs e) => _viewModel.CurrentPage = sender.SelectedItem?.TargetPageTag ?? "Accounts";
 
-    /// <summary>界面正在执行操作时保留窗口，避免事务中途退出。</summary>
-    private void OnWindowClosing(object? sender, CancelEventArgs e)
+    /// <summary>免费开包停止并清理后关闭，其他事务执行期间继续保留窗口。</summary>
+    private async void OnWindowClosing(object? sender, CancelEventArgs e)
     {
-        if (DataContext is MainViewModel viewModel && viewModel.Workspace.IsBusy) e.Cancel = true;
+        if (DataContext is MainViewModel viewModel && viewModel.Workspace.IsBusy)
+        {
+            e.Cancel = true;
+            if (viewModel.FreePacks is { IsRunning: true } automation)
+            {
+                await automation.RequestStopAsync();
+                Close();
+            }
+        }
     }
 }
 
