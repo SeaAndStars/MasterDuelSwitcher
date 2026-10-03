@@ -25,6 +25,63 @@ public sealed class FreePackAutomationTests
         Assert.Empty(fixture.Platform.Diagnostics);
     }
 
+    /// <summary>购买弹窗消退后短暂显示同包详情时，只等待开包页面，不重复购买或切换下一包。</summary>
+    [Theory]
+    [InlineData(true)]
+    [InlineData(false)]
+    public async Task SamePackDetailsAfterPurchaseWaitsForOpeningAndResults(bool free)
+    {
+        var fixture = new Fixture(Detail("a", true), Dialog(), Detail("a", free), Opening(true), Results(),
+            Detail("a"), Detail("b"), Detail("a"));
+        var result = await fixture.RunAsync();
+        Assert.Equal(2, result.ScannedPacks);
+        Assert.Equal(1, result.OpenedPacks);
+        Assert.Contains("一轮", result.Reason);
+        Assert.Equal(new[] { PackScreen.PackDetails, PackScreen.FreePurchaseDialog, PackScreen.Opening,
+            PackScreen.Results, PackScreen.PackDetails, PackScreen.PackDetails }, fixture.Platform.Clicks.Select(click => click.Screen));
+        Assert.Empty(fixture.Platform.Diagnostics);
+    }
+
+    /// <summary>购买后持续停留同包详情仍遵守等待上限，授权已消耗且不会再次点击。</summary>
+    [Theory]
+    [InlineData(true)]
+    [InlineData(false)]
+    public async Task SamePackDetailsAfterPurchaseRetainsBoundedWait(bool free)
+    {
+        var fixture = new Fixture(Detail("a", true), Dialog(), Detail("a", free));
+        var result = await fixture.RunAsync();
+        Assert.Contains("等待", result.Reason);
+        Assert.Equal(0, result.OpenedPacks);
+        Assert.Equal(2, fixture.Platform.Clicks.Count);
+        Assert.Single(fixture.Platform.Diagnostics);
+        Assert.True(fixture.Platform.CaptureCount < 260);
+    }
+
+    /// <summary>购买后意外进入另一包详情仍立即停止，过渡等待只授权原卡包。</summary>
+    [Fact]
+    public async Task DifferentPackDetailsAfterPurchaseStopsWithoutAnyAdditionalAction()
+    {
+        var fixture = new Fixture(Detail("a", true), Dialog(), Detail("b"));
+        var result = await fixture.RunAsync();
+        Assert.Contains("阶段", result.Reason);
+        Assert.Equal(2, fixture.Platform.Clicks.Count);
+        Assert.Equal(0, result.OpenedPacks);
+        Assert.Single(fixture.Platform.Diagnostics);
+    }
+
+    /// <summary>等待购买后的同包过渡时，F8仍正常取消且保留一次入口和一次确认的动作记录。</summary>
+    [Fact]
+    public async Task SamePackDetailsAfterPurchaseRespondsToEmergencyStop()
+    {
+        var fixture = new Fixture(Detail("a", true), Dialog(), Detail("a"));
+        fixture.Platform.StopAfterCaptures = 7;
+        var result = await fixture.RunAsync();
+        Assert.True(result.IsCancelled);
+        Assert.Equal(2, fixture.Platform.Clicks.Count);
+        Assert.Empty(fixture.Platform.Diagnostics);
+        Assert.Equal(1, fixture.Platform.EndCalls);
+    }
+
     /// <summary>付费详情只点击下一包按钮，免费购买授权始终不存在。</summary>
     [Fact]
     public async Task PaidPacksOnlyAdvanceWithoutPurchase()

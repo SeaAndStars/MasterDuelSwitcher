@@ -182,7 +182,9 @@ public sealed class FreePackAutomationService : IFreePackAutomationService
                 context.Phase = RunPhase.AwaitNext;
                 continue;
             }
-            if (observation.Screen == PackScreen.PackDetails && context.Phase == RunPhase.AwaitNext ||
+            if (observation.Screen == PackScreen.PackDetails &&
+                (context.Phase == RunPhase.AwaitNext ||
+                 context.Phase == RunPhase.Opening && SameFingerprint(context.CurrentFingerprint, observation.Fingerprint)) ||
                 observation.Screen == PackScreen.Results && context.Phase == RunPhase.AwaitReturn)
             {
                 await DelayAsync(context, cancellationToken).ConfigureAwait(false);
