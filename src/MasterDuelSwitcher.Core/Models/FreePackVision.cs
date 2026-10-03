@@ -41,4 +41,11 @@ public enum PackScreen
 /// <param name="Fingerprint">仅详情页提供的稳定卡包图像指纹，其他状态为空。</param>
 /// <param name="Confidence">当前组合识别的最低归一化匹配分数。</param>
 public sealed record PackObservation(PackScreen Screen, PixelPoint? PrimaryTarget, PixelPoint? NextTarget,
-    bool FreeOffer, string Fingerprint, double Confidence);
+    bool FreeOffer, string Fingerprint, double Confidence)
+{
+    /// <summary>仅详情页提供的规范化完整卡包标题；空值表示文字身份尚未建立。</summary>
+    public string PackTitle { get; init; } = string.Empty;
+
+    /// <summary>仅已验证开包界面提供的动画跳过坐标；其他界面始终为空。</summary>
+    public PixelPoint? AnimationSkipTarget { get; init; }
+}

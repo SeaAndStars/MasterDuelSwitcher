@@ -11,6 +11,8 @@ public interface IGameAutomationPlatform
 {
     /// <summary>激活当前游戏窗口，未找到或不可用时抛出异常。</summary>
     void ActivateGame();
+    /// <summary>只尝试重新激活本轮原窗口与原进程，临时不可用返回假，身份或几何变化抛出异常。</summary>
+    bool TryRecoverGame();
     /// <summary>捕获保持前台和原位置的游戏客户区，异常时拒绝继续自动化。</summary>
     GameFrame Capture();
     /// <summary>再次核验截图所属窗口与几何状态后点击客户区坐标。</summary>
@@ -46,9 +48,11 @@ public sealed class FreePackAutomationService : IFreePackAutomationService
     /// <summary>同一服务只允许一个运行者持有的原子门禁。</summary>
     private int running;
     /// <summary>两次画面观察之间的短等待间隔。</summary>
-    private static readonly TimeSpan ObservationDelay = TimeSpan.FromMilliseconds(250);
+    private static readonly TimeSpan ObservationDelay = TimeSpan.FromMilliseconds(80);
     /// <summary>页面未产生有效进展时允许的最长等待。</summary>
     private static readonly TimeSpan MaximumWait = TimeSpan.FromSeconds(60);
+    /// <summary>失焦后允许用户短暂切换窗口，再主动激活原游戏窗口。</summary>
+    private static readonly TimeSpan RecoveryPause = TimeSpan.FromSeconds(3);
     /// <summary>单轮允许首次检查的最多卡包数量。</summary>
     private const int MaximumPacks = 200;
 
@@ -105,92 +109,136 @@ public sealed class FreePackAutomationService : IFreePackAutomationService
     {
         while (true)
         {
-            var observation = CaptureObservation(context, cancellationToken);
-            EnsureWithinWait(context);
-            if (observation.Screen == PackScreen.Unknown ||
-                context.LastAction is { } previous && SameActionScene(previous, observation))
+            try
             {
-                await DelayAsync(context, cancellationToken).ConfigureAwait(false);
-                continue;
-            }
-            if (context.Phase == RunPhase.AwaitNext && observation.Screen == PackScreen.PackDetails &&
-                !SameFingerprint(context.CurrentFingerprint, observation.Fingerprint))
-                context.Phase = RunPhase.InspectDetails;
-
-            if (observation.Screen == PackScreen.PackDetails && context.Phase == RunPhase.InspectDetails)
-            {
-                if (string.IsNullOrWhiteSpace(observation.Fingerprint))
-                    return Finish(context, "卡包图像身份尚未识别，已停止。", true);
-                if (!await IsStableAsync(context, observation, cancellationToken).ConfigureAwait(false)) continue;
-                if (context.Visited.Any(fingerprint => SameFingerprint(fingerprint, observation.Fingerprint)))
-                    return Finish(context, "已完成一轮卡包扫描。", false);
-                context.Visited.Add(observation.Fingerprint);
-                context.CurrentFingerprint = observation.Fingerprint;
-                if (observation.FreeOffer)
+                var observation = CaptureObservation(context, cancellationToken);
+                EnsureWithinWait(context);
+                if (observation.Screen == PackScreen.Unknown)
+                {
+                    if (context.Phase == RunPhase.Opening && context.SkipTarget is not null)
+                        await SkipAnimationAsync(context, observation, cancellationToken).ConfigureAwait(false);
+                    else await DelayAsync(context, cancellationToken).ConfigureAwait(false);
+                    continue;
+                }
+                if (observation.Screen != PackScreen.Opening &&
+                    !(context.Phase == RunPhase.AwaitReturn && observation.Screen == PackScreen.Results) &&
+                    context.LastAction is { } previous && SameActionScene(previous, observation))
+                {
+                    await DelayAsync(context, cancellationToken).ConfigureAwait(false);
+                    continue;
+                }
+                if (observation.Screen == PackScreen.PackDetails &&
+                    (context.Phase == RunPhase.InspectDetails || context.Phase == RunPhase.AwaitNext && !SameIdentity(context.CurrentPack!, observation)))
+                {
+                    if (string.IsNullOrWhiteSpace(observation.PackTitle) && string.IsNullOrWhiteSpace(observation.Fingerprint))
+                        return Finish(context, "卡包图像身份尚未识别，已停止。", true);
+                    if (!await IsStableAsync(context, observation, cancellationToken).ConfigureAwait(false)) continue;
+                    logger.LogInformation("卡包当前标题 {CurrentTitle}，首次标题 {FirstTitle}。", observation.PackTitle, context.Visited.FirstOrDefault()?.PackTitle ?? observation.PackTitle);
+                    if (context.Visited.Any(pack => SameIdentity(pack, observation)))
+                    {
+                        logger.LogInformation("卡包重复标题 {RepeatedTitle}，首次标题 {FirstTitle}。", observation.PackTitle, context.Visited[0].PackTitle);
+                        return SameIdentity(context.Visited[0], observation)
+                            ? Finish(context, "已完成一轮卡包扫描。", false)
+                            : Finish(context, "检测到非首包重复导航，已停止。", true);
+                    }
+                    if (observation.FreeOffer)
+                    {
+                        if (observation.PrimaryTarget is not { } target)
+                            return Finish(context, "免费入口按钮未识别，已停止。", true);
+                        Click(context, observation, target, "点击免费入口", cancellationToken);
+                        context.Phase = RunPhase.AwaitFreeConfirmation;
+                    }
+                    else
+                    {
+                        if (context.Visited.Count == MaximumPacks - 1)
+                        {
+                            context.Visited.Add(observation);
+                            return Finish(context, "已达到 200 包扫描上限。", false);
+                        }
+                        if (observation.NextTarget is not { } target)
+                            return Finish(context, "下一包按钮未识别，已停止。", true);
+                        Click(context, observation, target, "切换下一包", cancellationToken);
+                        context.Phase = RunPhase.AwaitNext;
+                    }
+                    context.Visited.Add(observation);
+                    context.CurrentPack = observation;
+                    context.ReturnCounted = false;
+                    context.SkipTarget = null;
+                    context.SkipFrame = null;
+                    context.SkipClicks = 0;
+                    context.SkipInterval = TimeSpan.FromMilliseconds(160);
+                    Report(context, observation.FreeOffer ? "等待免费购买确认" : "等待下一卡包详情");
+                    continue;
+                }
+                if (observation.Screen == PackScreen.FreePurchaseDialog && context.Phase == RunPhase.AwaitFreeConfirmation)
                 {
                     if (observation.PrimaryTarget is not { } target)
-                        return Finish(context, "免费入口按钮未识别，已停止。", true);
-                    Click(context, observation, target, "点击免费入口", cancellationToken);
-                    context.Phase = RunPhase.AwaitFreeConfirmation;
+                        return Finish(context, "免费购买按钮未识别，已停止。", true);
+                    if (!await IsStableAsync(context, observation, cancellationToken).ConfigureAwait(false)) continue;
+                    Click(context, observation, target, "确认免费购买", cancellationToken);
+                    context.Phase = RunPhase.Opening;
+                    continue;
                 }
-                else
+                if (context.Phase == RunPhase.Opening && observation.Screen == PackScreen.Opening)
                 {
+                    await SkipAnimationAsync(context, observation, cancellationToken).ConfigureAwait(false);
+                    continue;
+                }
+                if (observation.Screen == PackScreen.Results && context.Phase is RunPhase.Opening or RunPhase.AwaitReturn)
+                {
+                    if (context.Phase == RunPhase.AwaitReturn &&
+                        (context.ResultAttempts >= 10 || RepeatedActionElapsed(context) < context.ResultInterval))
+                    {
+                        await DelayAsync(context, cancellationToken).ConfigureAwait(false);
+                        continue;
+                    }
+                    if (observation.PrimaryTarget is not { } target)
+                    {
+                        await DelayAsync(context, cancellationToken).ConfigureAwait(false);
+                        continue;
+                    }
+                    if (!await IsStableAsync(context, observation, cancellationToken).ConfigureAwait(false)) continue;
+                    var firstConfirmation = context.Phase == RunPhase.Opening;
+                    Click(context, observation, target, "确认卡包结果", cancellationToken, firstConfirmation);
+                    context.ResultAttempts = firstConfirmation ? 1 : context.ResultAttempts + 1;
+                    context.ResultInterval = firstConfirmation ? TimeSpan.FromMilliseconds(200)
+                        : TimeSpan.FromMilliseconds(Math.Min(context.ResultInterval.TotalMilliseconds * 2, 5000));
+                    context.Phase = RunPhase.AwaitReturn;
+                    Report(context, "等待返回原卡包详情");
+                    continue;
+                }
+                if (observation.Screen == PackScreen.PackDetails && context.Phase == RunPhase.AwaitReturn)
+                {
+                    if (!SameIdentity(context.CurrentPack!, observation))
+                        return Finish(context, "结果页未返回原卡包详情，已停止。", true);
+                    if (!await IsStableAsync(context, observation, cancellationToken).ConfigureAwait(false)) continue;
+                    if (!context.ReturnCounted)
+                    {
+                        context.OpenedPacks++;
+                        context.ReturnCounted = true;
+                        Report(context, "已确认返回原卡包详情");
+                    }
                     if (context.Visited.Count == MaximumPacks) return Finish(context, "已达到 200 包扫描上限。", false);
                     if (observation.NextTarget is not { } target)
                         return Finish(context, "下一包按钮未识别，已停止。", true);
                     Click(context, observation, target, "切换下一包", cancellationToken);
                     context.Phase = RunPhase.AwaitNext;
+                    continue;
                 }
-                continue;
-            }
-            if (observation.Screen == PackScreen.FreePurchaseDialog && context.Phase == RunPhase.AwaitFreeConfirmation)
-            {
-                if (observation.PrimaryTarget is not { } target)
-                    return Finish(context, "免费购买按钮未识别，已停止。", true);
-                if (!await IsStableAsync(context, observation, cancellationToken).ConfigureAwait(false)) continue;
-                Click(context, observation, target, "确认免费购买", cancellationToken);
-                context.Phase = RunPhase.Opening;
-                continue;
-            }
-            if (context.Phase == RunPhase.Opening && observation.Screen is PackScreen.Opening or PackScreen.Results)
-            {
-                if (observation.PrimaryTarget is not { } target)
+                if (observation.Screen == PackScreen.PackDetails &&
+                    (context.Phase == RunPhase.AwaitNext ||
+                     context.Phase == RunPhase.Opening && SameIdentity(context.CurrentPack!, observation)))
                 {
                     await DelayAsync(context, cancellationToken).ConfigureAwait(false);
                     continue;
                 }
-                if (!await IsStableAsync(context, observation, cancellationToken).ConfigureAwait(false)) continue;
-                if (observation.Screen == PackScreen.Results)
-                {
-                    Click(context, observation, target, "确认卡包结果", cancellationToken);
-                    context.OpenedPacks++;
-                    context.Phase = RunPhase.AwaitReturn;
-                    Report(context, "等待返回原卡包详情");
-                }
-                else Click(context, observation, target, "跳过开包动画", cancellationToken);
-                continue;
+                return Finish(context, "当前画面与免费开包阶段不符，已停止。", true);
             }
-            if (observation.Screen == PackScreen.PackDetails && context.Phase == RunPhase.AwaitReturn)
+            catch (GameWindowTemporarilyUnavailableException exception)
             {
-                if (!SameFingerprint(context.CurrentFingerprint, observation.Fingerprint))
-                    return Finish(context, "结果页未返回原卡包详情，已停止。", true);
-                if (!await IsStableAsync(context, observation, cancellationToken).ConfigureAwait(false)) continue;
-                if (context.Visited.Count == MaximumPacks) return Finish(context, "已达到 200 包扫描上限。", false);
-                if (observation.NextTarget is not { } target)
-                    return Finish(context, "下一包按钮未识别，已停止。", true);
-                Click(context, observation, target, "切换下一包", cancellationToken);
-                context.Phase = RunPhase.AwaitNext;
-                continue;
+                logger.LogWarning(exception, "游戏窗口暂时不可用，保留当前开包阶段并等待恢复。");
+                await RecoverGameAsync(context, cancellationToken).ConfigureAwait(false);
             }
-            if (observation.Screen == PackScreen.PackDetails &&
-                (context.Phase == RunPhase.AwaitNext ||
-                 context.Phase == RunPhase.Opening && SameFingerprint(context.CurrentFingerprint, observation.Fingerprint)) ||
-                observation.Screen == PackScreen.Results && context.Phase == RunPhase.AwaitReturn)
-            {
-                await DelayAsync(context, cancellationToken).ConfigureAwait(false);
-                continue;
-            }
-            return Finish(context, "当前画面与免费开包阶段不符，已停止。", true);
         }
     }
 
@@ -199,7 +247,20 @@ public sealed class FreePackAutomationService : IFreePackAutomationService
     {
         ThrowIfStopped(cancellationToken);
         context.LastFrame = platform.Capture();
-        context.WaitStartedFrameAt ??= context.LastFrame.CapturedAtUtc;
+        if (context.RecoveryStartedTimestamp is not null)
+        {
+            EnsureRecoveryWithinWait(context);
+            if (context.RecoveryFrame is { } recoveredFirst)
+            {
+                EnsureSameGeometry(recoveredFirst, context.LastFrame);
+                context.RecoveryStartedTimestamp = null;
+                context.RecoveryDelayElapsed = TimeSpan.Zero;
+                context.RecoveryFrame = null;
+            }
+            else context.RecoveryFrame = context.LastFrame;
+        }
+        context.WaitStartedFrameAt ??= context.LastFrame.CapturedAtUtc - context.PreservedFrameElapsed;
+        context.RepeatStartedFrameAt ??= context.LastFrame.CapturedAtUtc - context.PreservedRepeatFrameElapsed;
         var observation = recognizer.Recognize(context.LastFrame);
         logger.LogDebug("识别界面 {Screen}，评分 {Confidence}。", observation.Screen, observation.Confidence);
         if (observation.Screen == PackScreen.UnverifiedPurchaseDialog ||
@@ -215,9 +276,7 @@ public sealed class FreePackAutomationService : IFreePackAutomationService
         await DelayAsync(context, cancellationToken).ConfigureAwait(false);
         var second = CaptureObservation(context, cancellationToken);
         var current = context.LastFrame!;
-        if (frame.WindowHandle != current.WindowHandle || frame.Width != current.Width || frame.Height != current.Height ||
-            frame.ScreenX != current.ScreenX || frame.ScreenY != current.ScreenY)
-            throw new InvalidOperationException("游戏窗口在双帧核验间发生变化。");
+        EnsureSameGeometry(frame, current);
         EnsureWithinWait(context);
         return SameObservation(first, second);
     }
@@ -225,17 +284,126 @@ public sealed class FreePackAutomationService : IFreePackAutomationService
     /// <summary>动作条件一致才能视为稳定，不以评分的微小波动替代画面身份校验。</summary>
     private static bool SameObservation(PackObservation first, PackObservation second)
         => first.Screen == second.Screen && first.FreeOffer == second.FreeOffer &&
-           SameFingerprint(first.Fingerprint, second.Fingerprint) && first.PrimaryTarget == second.PrimaryTarget && first.NextTarget == second.NextTarget;
+           SameStableIdentity(first, second) && first.PrimaryTarget == second.PrimaryTarget &&
+           first.NextTarget == second.NextTarget && first.AnimationSkipTarget == second.AnimationSkipTarget;
+
+    /// <summary>有真实标题时精确校验标题，没有标题的兼容截图仍允许双帧图像轻微抖动。</summary>
+    private static bool SameStableIdentity(PackObservation first, PackObservation second)
+        => first.PackTitle.Length != 0 || second.PackTitle.Length != 0
+            ? string.Equals(first.PackTitle, second.PackTitle, StringComparison.Ordinal)
+            : SameFingerprint(first.Fingerprint, second.Fingerprint);
+
+    /// <summary>轮次与当前包使用精确标题；旧测试截图缺标题时精确比较哈希，避免相似卡图被合并。</summary>
+    private static bool SameIdentity(PackObservation first, PackObservation second)
+        => first.PackTitle.Length != 0 || second.PackTitle.Length != 0
+            ? string.Equals(first.PackTitle, second.PackTitle, StringComparison.Ordinal)
+            : string.Equals(first.Fingerprint, second.Fingerprint, StringComparison.Ordinal);
+
+    /// <summary>保证新双帧与本轮已验证Skip坐标仍属于相同窗口和客户区几何。</summary>
+    private static void EnsureSameGeometry(GameFrame first, GameFrame second)
+    {
+        if (first.WindowHandle != second.WindowHandle || first.Width != second.Width || first.Height != second.Height ||
+            first.ScreenX != second.ScreenX || first.ScreenY != second.ScreenY)
+            throw new InvalidOperationException("游戏窗口在双帧核验间发生变化。");
+    }
+
+    /// <summary>购买后只复用本包双帧验证的Skip坐标，隐藏按钮点击按递增间隔节流且不续期。</summary>
+    private async Task SkipAnimationAsync(RunContext context, PackObservation observation, CancellationToken cancellationToken)
+    {
+        var candidate = observation.PrimaryTarget ?? observation.AnimationSkipTarget ?? context.SkipTarget;
+        if (candidate is not { } target)
+        {
+            await DelayAsync(context, cancellationToken).ConfigureAwait(false);
+            return;
+        }
+        // 空坐标已经在上方守卫排除，后续使用确定的物理坐标值比较与发送输入。
+        if (context.SkipTarget is { } cached && observation.PrimaryTarget != observation.AnimationSkipTarget &&
+            SameActionScene(context.LastAction!, observation)) target = observation.AnimationSkipTarget ?? cached;
+        var repeatSkip = context.SkipTarget is { } previousSkip && target == previousSkip ||
+            observation.AnimationSkipTarget is { } currentSkip && target == currentSkip;
+        if (repeatSkip && context.SkipClicks > 0 && RepeatedActionElapsed(context) < context.SkipInterval ||
+            !repeatSkip && context.LastAction is { } previous && SameActionScene(previous, observation))
+        {
+            await DelayAsync(context, cancellationToken).ConfigureAwait(false);
+            return;
+        }
+        if (!await IsStableAsync(context, observation, cancellationToken).ConfigureAwait(false)) return;
+        if (context.SkipFrame is { } verified) EnsureSameGeometry(verified, context.LastFrame!);
+        if (observation.AnimationSkipTarget is { } skip)
+        {
+            context.SkipTarget = skip;
+            context.SkipFrame = context.LastFrame;
+        }
+        var isSkip = context.SkipTarget is { } verifiedSkip && target == verifiedSkip;
+        Click(context, observation, target, "跳过开包动画", cancellationToken, !isSkip || context.SkipClicks == 0);
+        if (isSkip)
+        {
+            context.SkipClicks++;
+            if (context.SkipClicks > 1) context.SkipInterval = TimeSpan.FromMilliseconds(Math.Min(context.SkipInterval.TotalMilliseconds * 2, 800));
+        }
+    }
+
+    /// <summary>取请求等待、截图经过时间与单调经过时间的最大值，避免冻结时钟导致重试不前进。</summary>
+    private TimeSpan RepeatedActionElapsed(RunContext context)
+    {
+        var frameElapsed = context.LastFrame!.CapturedAtUtc - context.RepeatStartedFrameAt!.Value;
+        var elapsed = timeProvider.GetElapsedTime(context.RepeatStartedTimestamp);
+        return new[] { context.RepeatDelayElapsed, frameElapsed, elapsed }.Max();
+    }
+
+    /// <summary>失焦后先可取消暂停三秒，再于统一六十秒期限内只恢复原窗口，成功后丢弃旧帧。</summary>
+    private async Task RecoverGameAsync(RunContext context, CancellationToken cancellationToken)
+    {
+        var started = timeProvider.GetTimestamp();
+        var delayed = TimeSpan.Zero;
+        context.RecoveryStartedTimestamp ??= started;
+        context.RecoveryFrame = null;
+        context.PreservedFrameElapsed = context.LastFrame is { } frame && context.WaitStartedFrameAt is { } waitAt
+            ? frame.CapturedAtUtc - waitAt : context.PreservedFrameElapsed;
+        context.PreservedRepeatFrameElapsed = context.LastFrame is { } repeatedFrame && context.RepeatStartedFrameAt is { } repeatedAt
+            ? repeatedFrame.CapturedAtUtc - repeatedAt : context.PreservedRepeatFrameElapsed;
+        Report(context, "游戏暂时失焦，等待恢复原窗口");
+        while (true)
+        {
+            ThrowIfStopped(cancellationToken);
+            var elapsed = timeProvider.GetElapsedTime(started);
+            EnsureRecoveryWithinWait(context);
+            if ((delayed >= RecoveryPause || elapsed >= RecoveryPause) && platform.TryRecoverGame())
+            {
+                EnsureRecoveryWithinWait(context);
+                var pausedTicks = timeProvider.GetTimestamp() - started;
+                context.WaitStartedTimestamp += pausedTicks;
+                context.RepeatStartedTimestamp += pausedTicks;
+                context.WaitStartedFrameAt = null;
+                context.RepeatStartedFrameAt = null;
+                context.LastFrame = null;
+                logger.LogInformation("游戏原窗口已恢复，重新双帧核验当前阶段 {Phase}。", context.Phase);
+                Report(context, "原游戏窗口已恢复，重新识别当前阶段");
+                return;
+            }
+            await platform.DelayAsync(ObservationDelay, cancellationToken).ConfigureAwait(false);
+            delayed += ObservationDelay;
+            context.RecoveryDelayElapsed += ObservationDelay;
+        }
+    }
+
+    /// <summary>连续失焦直到原窗口新双帧捕获前共用六十秒期限，激活成功本身不重置期限。</summary>
+    private void EnsureRecoveryWithinWait(RunContext context)
+    {
+        if (context.RecoveryDelayElapsed >= MaximumWait || timeProvider.GetElapsedTime(context.RecoveryStartedTimestamp!.Value) >= MaximumWait)
+            throw new TimeoutException("游戏窗口恢复超过 60 秒，已停止。");
+    }
 
     /// <summary>动作锁把动画按钮最多四像素的定位抖动视作原画面，明显不同位置仍可对应开包与跳过按钮。</summary>
     private static bool SameActionScene(PackObservation first, PackObservation second)
     {
-        if (first.Screen == PackScreen.Opening && second.Screen == PackScreen.Opening && second.PrimaryTarget is { } current)
+        if (first.Screen == PackScreen.Opening && second.Screen == PackScreen.Opening &&
+            second.PrimaryTarget is { } current && first.PrimaryTarget is { } previous)
         {
-            var previous = first.PrimaryTarget!.Value;
             return Math.Abs((long)previous.X - current.X) <= 4 && Math.Abs((long)previous.Y - current.Y) <= 4;
         }
-        return SameObservation(first, second);
+        return SameObservation(first, second) &&
+            (first.Screen != PackScreen.PackDetails || SameIdentity(first, second));
     }
 
     /// <summary>十六位卡图差异哈希允许最多四位动效抖动，其他标识按原文精确比较。</summary>
@@ -249,14 +417,21 @@ public sealed class FreePackAutomationService : IFreePackAutomationService
     }
 
     /// <summary>在稳定核验后再次响应停止，成功点击才记忆动作并重置无进展期限。</summary>
-    private void Click(RunContext context, PackObservation observation, PixelPoint point, string stage, CancellationToken cancellationToken)
+    private void Click(RunContext context, PackObservation observation, PixelPoint point, string stage, CancellationToken cancellationToken, bool resetWait = true)
     {
         ThrowIfStopped(cancellationToken);
         platform.Click(context.LastFrame!, point);
         context.LastAction = observation;
-        context.WaitStartedFrameAt = context.LastFrame!.CapturedAtUtc;
-        context.WaitStartedTimestamp = timeProvider.GetTimestamp();
-        context.DelayElapsed = TimeSpan.Zero;
+        var timestamp = timeProvider.GetTimestamp();
+        if (resetWait)
+        {
+            context.WaitStartedFrameAt = context.LastFrame!.CapturedAtUtc;
+            context.WaitStartedTimestamp = timestamp;
+            context.DelayElapsed = TimeSpan.Zero;
+        }
+        context.RepeatStartedFrameAt = context.LastFrame!.CapturedAtUtc;
+        context.RepeatStartedTimestamp = timestamp;
+        context.RepeatDelayElapsed = TimeSpan.Zero;
         logger.LogDebug("动作 {Stage}，客户区坐标 {X}, {Y}。", stage, point.X, point.Y);
         Report(context, stage);
     }
@@ -267,6 +442,8 @@ public sealed class FreePackAutomationService : IFreePackAutomationService
         ThrowIfStopped(cancellationToken);
         await platform.DelayAsync(ObservationDelay, cancellationToken).ConfigureAwait(false);
         context.DelayElapsed += ObservationDelay;
+        context.RepeatDelayElapsed += ObservationDelay;
+        if (context.RecoveryStartedTimestamp is not null) context.RecoveryDelayElapsed += ObservationDelay;
     }
 
     /// <summary>累计延迟、截图 UTC 差值与单调实际时间任一路径达到六十秒均中止。</summary>
@@ -330,10 +507,10 @@ public sealed class FreePackAutomationService : IFreePackAutomationService
     {
         /// <summary>可选界面进度接收器。</summary>
         public readonly IProgress<FreePackProgress>? Progress;
-        /// <summary>本轮已检查的卡包指纹，按哈希容差比较。</summary>
-        public readonly List<string> Visited = [];
-        /// <summary>当前免费授权或返回校验所属的卡包指纹。</summary>
-        public string CurrentFingerprint = "";
+        /// <summary>本轮已检查的卡包观察，轮次仅按精确标题或兼容哈希比较。</summary>
+        public readonly List<PackObservation> Visited = [];
+        /// <summary>当前免费授权或返回校验所属的卡包标题与兼容图像身份。</summary>
+        public PackObservation? CurrentPack;
         /// <summary>已经确认返回的开包结果数量。</summary>
         public int OpenedPacks;
         /// <summary>最新有效截图，异常时作为诊断依据。</summary>
@@ -348,6 +525,36 @@ public sealed class FreePackAutomationService : IFreePackAutomationService
         public long WaitStartedTimestamp;
         /// <summary>上次动作以来累计请求的等待时间。</summary>
         public TimeSpan DelayElapsed;
+        /// <summary>恢复之前阶段已消耗的截图时间，恢复后用于重建阶段起点。</summary>
+        public TimeSpan PreservedFrameElapsed;
+        /// <summary>最近成功输入的截图时间，结果重试与Skip节流不借用旧动作锁。</summary>
+        public DateTimeOffset? RepeatStartedFrameAt;
+        /// <summary>最近成功输入的单调时间戳。</summary>
+        public long RepeatStartedTimestamp;
+        /// <summary>最近成功输入后累计请求的观察延迟。</summary>
+        public TimeSpan RepeatDelayElapsed;
+        /// <summary>恢复之前最近成功输入后已消耗的截图时间。</summary>
+        public TimeSpan PreservedRepeatFrameElapsed;
+        /// <summary>本包免费购买后经双帧验证的Skip位置，跨包即清除。</summary>
+        public PixelPoint? SkipTarget;
+        /// <summary>验证本包Skip时的窗口几何，仅用于复验隐藏按钮的位置。</summary>
+        public GameFrame? SkipFrame;
+        /// <summary>当前包成功发送Skip的次数，用于确定节流间隔。</summary>
+        public int SkipClicks;
+        /// <summary>下一次Skip允许发送前的等待间隔，最高八百毫秒。</summary>
+        public TimeSpan SkipInterval = TimeSpan.FromMilliseconds(160);
+        /// <summary>当前结果页面成功发送确认的次数，最多十次。</summary>
+        public int ResultAttempts;
+        /// <summary>下一次结果确认前的退避间隔，最高五秒。</summary>
+        public TimeSpan ResultInterval;
+        /// <summary>当前包已双帧返回原详情并计数，下一包输入暂时失败也不重复累加。</summary>
+        public bool ReturnCounted;
+        /// <summary>本次连续失焦的起始单调时间，只有原窗口新双帧捕获后清除。</summary>
+        public long? RecoveryStartedTimestamp;
+        /// <summary>连续恢复期间累计请求的延迟，冻结时钟也保持六十秒上限。</summary>
+        public TimeSpan RecoveryDelayElapsed;
+        /// <summary>恢复后首个有效窗口帧，第二个同几何新帧才结束连续恢复预算。</summary>
+        public GameFrame? RecoveryFrame;
         /// <summary>保存进度接收器与初始单调时间。</summary>
         public RunContext(IProgress<FreePackProgress>? progress, long timestamp) { Progress = progress; WaitStartedTimestamp = timestamp; }
     }

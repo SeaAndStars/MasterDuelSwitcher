@@ -93,15 +93,15 @@ public sealed class FreePackAutomationTests
         Assert.All(fixture.Platform.Clicks, click => Assert.Equal(new PixelPoint(90, 50), click.Point));
     }
 
-    /// <summary>同一卡图至多四位指纹抖动仍视为已扫描卡包，避免动效导致重复绕圈。</summary>
+    /// <summary>轮次身份精确比较图像哈希，少于四位差异也不得误认成首包。</summary>
     [Fact]
     public async Task SmallHashChangesStillCompleteTheSameCarouselCycle()
     {
-        var fixture = new Fixture(Detail("0000000000000000"), Detail("ffffffffffffffff"), Detail("000000000000000f"));
+        var fixture = new Fixture(Detail("0000000000000000"), Detail("ffffffffffffffff"), Detail("000000000000000f"), Detail("0000000000000000"));
         var result = await fixture.RunAsync();
-        Assert.Equal(2, result.ScannedPacks);
+        Assert.Equal(3, result.ScannedPacks);
         Assert.Contains("一轮", result.Reason);
-        Assert.Equal(2, fixture.Platform.Clicks.Count);
+        Assert.Equal(3, fixture.Platform.Clicks.Count);
     }
 
     /// <summary>同一服务同时运行第二次立即拒绝，首轮完成后门禁重新允许运行。</summary>
@@ -181,7 +181,6 @@ public sealed class FreePackAutomationTests
     [InlineData(PackScreen.PackDetails)]
     [InlineData(PackScreen.FreePurchaseDialog)]
     [InlineData(PackScreen.Opening)]
-    [InlineData(PackScreen.Results)]
     public async Task UnchangedScreenNeverRepeatsAnAction(PackScreen screen)
     {
         var sequence = new List<PackObservation> { Detail("a", true) };
@@ -225,7 +224,7 @@ public sealed class FreePackAutomationTests
     {
         var fixture = new Fixture(Detail("a", true), Dialog(), Results(), Detail("b"));
         var result = await fixture.RunAsync();
-        Assert.Equal(1, result.OpenedPacks);
+        Assert.Equal(0, result.OpenedPacks);
         Assert.Equal(1, result.ScannedPacks);
         Assert.Equal(3, fixture.Platform.Clicks.Count);
         Assert.Contains("原卡包", result.Reason);
@@ -402,7 +401,7 @@ public sealed class FreePackAutomationTests
         fixture.Platform.FreezeClock = true;
         var result = await fixture.RunAsync();
         Assert.Contains("60", result.Reason);
-        Assert.InRange(fixture.Platform.CaptureCount, 240, 242);
+        Assert.InRange(fixture.Platform.CaptureCount, 750, 752);
     }
 
     /// <summary>识别处理耗费的单调实际时间计入期限，即使截图时间不变也不得输入。</summary>
@@ -508,16 +507,17 @@ public sealed class FreePackAutomationTests
         Assert.Equal(2, fixture.Platform.Clicks.Count);
     }
 
-    /// <summary>确认过结果后的按钮定位变化不会重复确认，只等待返回原卡包详情。</summary>
+    /// <summary>结果目标变化后须重新双帧确认，合法重试后仍只在原包详情计数一次。</summary>
     [Fact]
     public async Task ChangedResultButtonStillWaitsForOriginalDetailsWithoutRepeatingConfirmation()
     {
         var fixture = new Fixture(Detail("a", true), Dialog(), Results(), Results() with { PrimaryTarget = new PixelPoint(51, 80) },
+            Results() with { PrimaryTarget = new PixelPoint(51, 80) },
             Detail("a", true), Detail("b"), Detail("a", true));
         var result = await fixture.RunAsync();
         Assert.Equal(1, result.OpenedPacks);
         Assert.Contains("一轮", result.Reason);
-        Assert.Single(fixture.Platform.Clicks, click => click.Screen == PackScreen.Results);
+        Assert.Equal(2, fixture.Platform.Clicks.Count(click => click.Screen == PackScreen.Results));
     }
 
     /// <summary>成功、预取消和激活部分失败均结束平台会话。</summary>
@@ -591,6 +591,539 @@ public sealed class FreePackAutomationTests
         Assert.Contains("一轮", result.Reason);
     }
 
+    /// <summary>二十个真实标题即使旧哈希全部碰撞，也扫描到首标题再次出现才完成。</summary>
+    [Fact]
+    public async Task MoreThanElevenDistinctTitlesWithCollidingHashesCompleteOnlyAtFirstTitle()
+    {
+        var packs = Enumerable.Range(0, 20).Select(index => TitledDetail("卡包" + index, "0000000000000000")).ToArray();
+        var fixture = new Fixture(packs.Concat([packs[0]]).ToArray());
+        var result = await fixture.RunAsync();
+        Assert.Equal(20, result.ScannedPacks);
+        Assert.Equal(20, fixture.Platform.Clicks.Count);
+        Assert.Contains("一轮", result.Reason);
+        Assert.Contains(fixture.Logger.Entries, item => item.Message.Contains("首次") && item.Message.Contains("卡包0"));
+        Assert.Contains(fixture.Logger.Entries, item => item.Message.Contains("当前") && item.Message.Contains("卡包19"));
+        Assert.Contains(fixture.Logger.Entries, item => item.Message.Contains("重复") && item.Message.Contains("卡包0"));
+        Assert.Empty(fixture.Platform.Diagnostics);
+    }
+
+    /// <summary>非首历史标题再次出现视为异常导航，保留已扫描数量而不宣称完成一轮。</summary>
+    [Fact]
+    public async Task RepeatedNonFirstTitleStopsWithDiagnosticInsteadOfClaimingCompletion()
+    {
+        var fixture = new Fixture(TitledDetail("首包", "a"), TitledDetail("次包", "b"), TitledDetail("三包", "c"), TitledDetail("次包", "d"));
+        var result = await fixture.RunAsync();
+        Assert.Equal(3, result.ScannedPacks);
+        Assert.DoesNotContain("完成", result.Reason);
+        Assert.Contains("非首", result.Reason);
+        Assert.Equal(3, fixture.Platform.Clicks.Count);
+        Assert.Single(fixture.Platform.Diagnostics);
+    }
+
+    /// <summary>标题已有OCR证据时，第二帧缺失或不同标题不得以相似旧哈希维持免费授权。</summary>
+    [Theory]
+    [InlineData("")]
+    [InlineData("其他包")]
+    public async Task TitleStabilityCannotFallBackToAnOldHash(string changedTitle)
+    {
+        var first = TitledDetail("首包", "0000000000000000", true);
+        var fixture = new Fixture(first);
+        fixture.Platform.Observations = [first, first with { PackTitle = changedTitle }];
+        fixture.Platform.StopAfterCaptures = 3;
+        var result = await fixture.RunAsync();
+        Assert.True(result.IsCancelled);
+        Assert.Empty(fixture.Platform.Clicks);
+    }
+
+    /// <summary>真实标题可以独立识别卡包，原图哈希为空仍可精确闭合轮次。</summary>
+    [Fact]
+    public async Task TitlesCanIdentifyAFullCycleWithoutImageHashes()
+    {
+        var fixture = new Fixture(TitledDetail("首包", ""), TitledDetail("次包", ""), TitledDetail("首包", ""));
+        var result = await fixture.RunAsync();
+        Assert.Equal(2, result.ScannedPacks);
+        Assert.Contains("一轮", result.Reason);
+    }
+
+    /// <summary>恢复覆盖入口前、免费确认、购买后动画、结果返回与下一包阶段，已成功购买不重发。</summary>
+    [Theory]
+    [InlineData(1)]
+    [InlineData(3)]
+    [InlineData(5)]
+    [InlineData(7)]
+    [InlineData(9)]
+    public async Task TemporaryCaptureFailurePreservesEveryPhaseAndSuccessfulPurchase(int capture)
+    {
+        var fixture = new Fixture(Detail("a", true), Dialog(), Results(), Detail("a"), Detail("b"), Detail("a"));
+        fixture.Platform.TemporaryCaptureAt.Add(capture);
+        fixture.Platform.UseRequestedDelay = true;
+        var result = await fixture.RunAsync();
+        Assert.Equal(2, result.ScannedPacks);
+        Assert.Equal(1, result.OpenedPacks);
+        Assert.Single(fixture.Platform.Clicks, click => click.Screen == PackScreen.FreePurchaseDialog);
+        Assert.Equal(1, fixture.Platform.RecoverCalls);
+        Assert.True(fixture.Platform.RecoverElapsed.Single() >= TimeSpan.FromSeconds(3));
+        Assert.Contains(fixture.Progress.Values, progress => progress.Stage.Contains("恢复"));
+    }
+
+    /// <summary>临时输入异常发生在免费入口提交前时，不提前记已访问，恢复后继续原包扫描。</summary>
+    [Fact]
+    public async Task TemporaryEntryClickFailureDoesNotCommitAnIncompleteVisitedPack()
+    {
+        var fixture = new Fixture(Detail("a", true), Detail("a", true), Dialog(), Results(), Detail("a"), Detail("b"), Detail("a"));
+        fixture.Platform.TemporaryClickAt = 1;
+        fixture.Platform.UseRequestedDelay = true;
+        var result = await fixture.RunAsync();
+        Assert.Equal(2, result.ScannedPacks);
+        Assert.Equal(1, result.OpenedPacks);
+        Assert.Contains("一轮", result.Reason);
+        Assert.Single(fixture.Platform.Clicks, click => click.Screen == PackScreen.FreePurchaseDialog);
+    }
+
+    /// <summary>免费确认输入在系统核验前失焦，恢复后双帧验证当前免费框并仅成功购买一次。</summary>
+    [Fact]
+    public async Task TemporaryPurchaseClickFailureRevalidatesBeforeItsOnlySuccessfulPurchase()
+    {
+        var fixture = new Fixture(Detail("a", true), Dialog(), Dialog(), Results(), Detail("a"), Detail("b"), Detail("a"));
+        fixture.Platform.TemporaryClickAt = 2;
+        fixture.Platform.UseRequestedDelay = true;
+        var result = await fixture.RunAsync();
+        Assert.Equal(1, result.OpenedPacks);
+        Assert.Single(fixture.Platform.Clicks, click => click.Screen == PackScreen.FreePurchaseDialog);
+        Assert.Equal(1, fixture.Platform.RecoverCalls);
+    }
+
+    /// <summary>双帧中途失焦使旧候选失效，恢复后至少重新捕获两帧才发送任何点击。</summary>
+    [Fact]
+    public async Task RecoveryDiscardsTheOldCandidateAndRequiresTwoFreshFrames()
+    {
+        var fixture = new Fixture(Detail("a", true), Detail("a", true));
+        fixture.Platform.TemporaryCaptureAt.Add(2);
+        fixture.Platform.StopAfterCaptures = 4;
+        fixture.Platform.UseRequestedDelay = true;
+        var result = await fixture.RunAsync();
+        Assert.True(result.IsCancelled);
+        Assert.Single(fixture.Platform.Clicks);
+        Assert.Equal(2, fixture.Platform.ClickFrameIndices.Single());
+    }
+
+    /// <summary>恢复等待期间F8或令牌取消直接结束，三秒暂停内无恢复与输入。</summary>
+    [Theory]
+    [InlineData(true)]
+    [InlineData(false)]
+    public async Task RecoveryPauseImmediatelyRespondsToStopOrCancellation(bool f8)
+    {
+        var fixture = new Fixture(Detail("a", true));
+        fixture.Platform.TemporaryCaptureAt.Add(1);
+        fixture.Platform.UseRequestedDelay = true;
+        fixture.Platform.StopAfterDelays = f8 ? 1 : int.MaxValue;
+        fixture.Platform.CancelDelay = !f8;
+        var result = await fixture.RunAsync();
+        Assert.True(result.IsCancelled);
+        Assert.Empty(fixture.Platform.Clicks);
+        Assert.Equal(0, fixture.Platform.RecoverCalls);
+    }
+
+    /// <summary>原窗口持续恢复失败到六十秒即停止，不延长恢复期限或发送后台点击。</summary>
+    [Fact]
+    public async Task RecoveryHasOneSixtySecondDeadline()
+    {
+        var fixture = new Fixture(Detail("a", true));
+        fixture.Platform.TemporaryCaptureAt.Add(1);
+        fixture.Platform.UseRequestedDelay = true;
+        fixture.Platform.RecoverSucceeds = false;
+        var result = await fixture.RunAsync();
+        Assert.Contains("恢复", result.Reason);
+        Assert.Contains("60", result.Reason);
+        Assert.InRange(fixture.Platform.Elapsed.TotalSeconds, 60, 60.2);
+        Assert.Empty(fixture.Platform.Clicks);
+        Assert.True(fixture.Platform.RecoverCalls > 1);
+    }
+
+    /// <summary>恢复识别到永久PID或窗口几何错误时直接停止，已有购买授权与点击均不重放。</summary>
+    [Fact]
+    public async Task PermanentIdentityFailureDuringRecoveryStopsWithoutReplay()
+    {
+        var fixture = new Fixture(Detail("a", true), Dialog(), Results());
+        fixture.Platform.TemporaryCaptureAt.Add(5);
+        fixture.Platform.UseRequestedDelay = true;
+        fixture.Platform.RecoverFailure = new InvalidOperationException("原PID已变化");
+        var result = await fixture.RunAsync();
+        Assert.Contains("PID", result.Reason);
+        Assert.Equal(2, fixture.Platform.Clicks.Count);
+        Assert.Equal(1, fixture.Platform.RecoverCalls);
+        Assert.Single(fixture.Platform.Diagnostics);
+    }
+
+    /// <summary>较长恢复停顿从当前阶段等待期限扣除，成功恢复后的原页面仍有剩余观察时间。</summary>
+    [Fact]
+    public async Task RecoveryTimeDoesNotImmediatelyExpireThePreservedPhase()
+    {
+        var fixture = new Fixture(Detail("a", true), Dialog(), Results(), Results(), Detail("a"), Detail("b"), Detail("a"));
+        var clock = new ManualTimeProvider();
+        fixture.Platform.UseRequestedDelay = true;
+        fixture.Platform.TemporaryCaptureAt.Add(6);
+        fixture.Platform.RecoverFailuresRemaining = 700;
+        fixture.Platform.DelayObserver = delay => clock.Timestamp += delay.Ticks;
+        fixture.Platform.ChangeFrame = (count, frame) => { if (count == 5) clock.Timestamp += TimeSpan.FromSeconds(10).Ticks; return frame; };
+        var result = await new FreePackAutomationService(fixture.Recognizer, fixture.Platform, fixture.Logger, clock).RunAsync();
+        Assert.Equal(1, result.OpenedPacks);
+        Assert.Contains("一轮", result.Reason);
+        Assert.True(fixture.Platform.Elapsed >= TimeSpan.FromSeconds(59));
+    }
+
+    /// <summary>结果页连续确认按指数退避进行，每次均重新验证双帧，返回原包只计一次。</summary>
+    [Fact]
+    public async Task ResultConfirmationRetriesExponentiallyAndCountsOnlyAfterReturning()
+    {
+        var fixture = new Fixture(Detail("a", true), Dialog(), Results());
+        fixture.Platform.UseRequestedDelay = true;
+        fixture.Platform.Tail = _ => fixture.Platform.Clicks.Count(click => click.Screen == PackScreen.Results) >= 7
+            ? Detail(fixture.Platform.Clicks.Count(click => click.Screen == PackScreen.PackDetails) == 1 ? "a" : "b") : Results();
+        fixture.Platform.StopAfterCaptures = 600;
+        var result = await fixture.RunAsync();
+        var resultTimes = fixture.Platform.ClickTimes.Where((_, index) => fixture.Platform.Clicks[index].Screen == PackScreen.Results).ToArray();
+        Assert.Equal(7, resultTimes.Length);
+        var minimums = new[] { .2, .4, .8, 1.6, 3.2, 5 };
+        for (var index = 0; index < minimums.Length; index++)
+            Assert.InRange((resultTimes[index + 1] - resultTimes[index]).TotalSeconds, minimums[index], minimums[index] + .24);
+        Assert.Equal(1, result.OpenedPacks);
+        Assert.Single(fixture.Platform.Clicks, click => click.Screen == PackScreen.FreePurchaseDialog);
+    }
+
+    /// <summary>一直停留结果页最多确认十次，重试不延长六十秒总期限且不提前累计开包。</summary>
+    [Fact]
+    public async Task ResultRetriesAreBoundedAndNeverResetTheTotalDeadline()
+    {
+        var fixture = new Fixture(Detail("a", true), Dialog(), Results());
+        fixture.Platform.UseRequestedDelay = true;
+        var result = await fixture.RunAsync();
+        Assert.Equal(10, fixture.Platform.Clicks.Count(click => click.Screen == PackScreen.Results));
+        Assert.Equal(0, result.OpenedPacks);
+        Assert.Contains("60", result.Reason);
+        Assert.InRange(fixture.Platform.Elapsed.TotalSeconds, 60, 61);
+    }
+
+    /// <summary>不稳定结果按钮导致本次重试放弃，不复用前次已验证坐标。</summary>
+    [Fact]
+    public async Task ResultRetryNeedsANewStableTarget()
+    {
+        var fixture = new Fixture(Detail("a", true), Dialog(), Results());
+        fixture.Platform.UseRequestedDelay = true;
+        fixture.Platform.Tail = index => Results() with { PrimaryTarget = new PixelPoint(index % 2 == 0 ? 50 : 51, 80) };
+        fixture.Platform.StopAfterCaptures = 30;
+        var result = await fixture.RunAsync();
+        Assert.True(result.IsCancelled);
+        Assert.Single(fixture.Platform.Clicks, click => click.Screen == PackScreen.Results);
+        Assert.Equal(0, result.OpenedPacks);
+    }
+
+    /// <summary>已双帧识别Skip并购买后，按钮隐藏的Opening与Unknown允许节流点击旧Skip目标。</summary>
+    [Theory]
+    [InlineData(PackScreen.Opening)]
+    [InlineData(PackScreen.Unknown)]
+    public async Task AValidatedSkipCanBeClickedWhileHiddenAfterPurchase(PackScreen hidden)
+    {
+        var skip = Opening(true) with { AnimationSkipTarget = new PixelPoint(80, 80) };
+        var fixture = new Fixture(Detail("a", true), Dialog(), skip);
+        fixture.Platform.UseRequestedDelay = true;
+        fixture.Platform.Tail = _ => fixture.Platform.Clicks.Count >= 6 ? Results()
+            : hidden == PackScreen.Unknown ? Unknown() : Opening(false);
+        fixture.Platform.StopAfterCaptures = 100;
+        var result = await fixture.RunAsync();
+        var skips = fixture.Platform.Clicks.Where(click => click.Point == new PixelPoint(80, 80)).ToArray();
+        Assert.True(skips.Length >= 4);
+        Assert.Contains(fixture.Platform.Clicks, click => click.Screen == hidden && click.Point == new PixelPoint(80, 80));
+        Assert.Equal(0, result.OpenedPacks);
+        Assert.True(result.IsCancelled);
+    }
+
+    /// <summary>无免费购买、无已验证Skip坐标或进入详情/结果页时均不发送旧Skip点击。</summary>
+    [Theory]
+    [InlineData("unbought")]
+    [InlineData("no-skip")]
+    [InlineData("details")]
+    [InlineData("results")]
+    public async Task HiddenSkipPermissionIsLimitedToThePurchasedOpening(string scene)
+    {
+        var skip = Opening(true) with { AnimationSkipTarget = new PixelPoint(80, 80) };
+        var sequence = scene switch
+        {
+            "unbought" => new[] { Unknown() with { AnimationSkipTarget = new PixelPoint(80, 80) } },
+            "no-skip" => new[] { Detail("a", true), Dialog(), Opening(false), Unknown() },
+            "details" => new[] { Detail("a", true), Dialog(), skip, Detail("a") },
+            _ => new[] { Detail("a", true), Dialog(), skip, Results() }
+        };
+        var fixture = new Fixture(sequence);
+        fixture.Platform.UseRequestedDelay = true;
+        fixture.Platform.StopAfterCaptures = 30;
+        await fixture.RunAsync();
+        Assert.Equal(scene is "details" or "results" ? 1 : 0,
+            fixture.Platform.Clicks.Count(click => click.Point == new PixelPoint(80, 80)));
+    }
+
+    /// <summary>隐形Skip仍复验客户区几何，变化后结束并禁止沿用旧坐标。</summary>
+    [Fact]
+    public async Task HiddenSkipRefusesAnAlteredWindowGeometry()
+    {
+        var fixture = new Fixture(Detail("a", true), Dialog(), Opening(true) with { AnimationSkipTarget = new PixelPoint(80, 80) }, Unknown());
+        fixture.Platform.UseRequestedDelay = true;
+        fixture.Platform.ChangeFrame = (count, frame) => count >= 7 ? frame with { ScreenX = 11 } : frame;
+        var result = await fixture.RunAsync();
+        Assert.Contains("窗口", result.Reason);
+        Assert.Single(fixture.Platform.Clicks, click => click.Point == new PixelPoint(80, 80));
+    }
+
+    /// <summary>隐形Skip输入有最小节流及上限，不重置整体等待预算，也响应紧急停止。</summary>
+    [Theory]
+    [InlineData(true)]
+    [InlineData(false)]
+    public async Task HiddenSkipRepeatsRemainThrottledAndBounded(bool stop)
+    {
+        var fixture = new Fixture(Detail("a", true), Dialog(), Opening(true) with { AnimationSkipTarget = new PixelPoint(80, 80) }, Unknown());
+        fixture.Platform.UseRequestedDelay = true;
+        fixture.Platform.StopAfterCaptures = stop ? 50 : int.MaxValue;
+        var result = await fixture.RunAsync();
+        Assert.Equal(stop, result.IsCancelled);
+        if (!stop) Assert.Contains("60", result.Reason);
+        var times = fixture.Platform.ClickTimes.Where((_, index) => fixture.Platform.Clicks[index].Point == new PixelPoint(80, 80)).ToArray();
+        Assert.True(times.Length > 2);
+        Assert.All(times.Zip(times.Skip(1)), pair => Assert.True(pair.Second - pair.First >= TimeSpan.FromMilliseconds(160)));
+        Assert.True(times.Length < 100);
+    }
+
+    /// <summary>已点击Open仍暂时显示原按钮时，使用本包已验证Skip目标而不持续等待原动作锁。</summary>
+    [Fact]
+    public async Task VerifiedSkipIsUsedWhileThePreviouslyClickedOpenRemainsVisible()
+    {
+        var opening = Opening(true) with { PrimaryTarget = new PixelPoint(50, 90), AnimationSkipTarget = new PixelPoint(80, 80) };
+        var fixture = new Fixture(Detail("a", true), Dialog(), opening, opening, opening, Results(), Results(), Detail("a"), Detail("b"), Detail("a"));
+        var result = await fixture.RunAsync();
+        Assert.Equal(1, result.OpenedPacks);
+        Assert.Single(fixture.Platform.Clicks, click => click.Point == new PixelPoint(50, 90));
+        Assert.Contains(fixture.Platform.Clicks, click => click.Point == new PixelPoint(80, 80));
+    }
+
+    /// <summary>隐藏动画曾复用Skip点击后，重新出现且抖动的Primary不会解引用旧观察的空目标。</summary>
+    [Fact]
+    public async Task ReappearingOpeningTargetAfterHiddenSkipKeepsTheRunAlive()
+    {
+        var skip = Opening(true) with { AnimationSkipTarget = new PixelPoint(80, 80) };
+        var reappearing = skip with { PrimaryTarget = new PixelPoint(81, 80) };
+        var fixture = new Fixture(Detail("a", true), Dialog(), skip, Opening(false), Opening(false), reappearing, Results(), Detail("a"), Detail("b"), Detail("a"));
+        var result = await fixture.RunAsync();
+        Assert.Equal(1, result.OpenedPacks);
+        Assert.Contains("一轮", result.Reason);
+        Assert.Contains(fixture.Platform.Clicks, click => click.Screen == PackScreen.Opening && click.Point == new PixelPoint(80, 80));
+    }
+
+    /// <summary>同包详情已核验并计数后下一包输入暂时失焦，恢复原详情仅重试导航且不重复计数。</summary>
+    [Fact]
+    public async Task TemporaryNextClickAfterReturnedDetailsDoesNotCountThePackTwice()
+    {
+        var fixture = new Fixture(Detail("a", true), Dialog(), Results(), Detail("a"), Detail("a"), Detail("b"), Detail("a"));
+        fixture.Platform.TemporaryClickAt = 4;
+        fixture.Platform.UseRequestedDelay = true;
+        var result = await fixture.RunAsync();
+        Assert.Equal(1, result.OpenedPacks);
+        Assert.Equal(2, result.ScannedPacks);
+        Assert.Equal(1, fixture.Platform.RecoverCalls);
+        Assert.Single(fixture.Platform.Clicks, click => click.Screen == PackScreen.FreePurchaseDialog);
+    }
+
+    /// <summary>恢复调用自身耗时达到截止线时，即使最终声称前台成功也在六十秒边界停止。</summary>
+    [Fact]
+    public async Task SuccessfulRecoveryCannotOverrunItsOwnMonotonicDeadline()
+    {
+        var fixture = new Fixture(Detail("a", true));
+        var clock = new ManualTimeProvider();
+        fixture.Platform.UseRequestedDelay = true;
+        fixture.Platform.TemporaryCaptureAt.Add(1);
+        fixture.Platform.DelayObserver = delay => clock.Timestamp += delay.Ticks;
+        fixture.Platform.RecoverObserver = () => clock.Timestamp += TimeSpan.FromSeconds(61).Ticks;
+        var result = await new FreePackAutomationService(fixture.Recognizer, fixture.Platform, fixture.Logger, clock).RunAsync();
+        Assert.Contains("恢复", result.Reason);
+        Assert.Empty(fixture.Platform.Clicks);
+    }
+
+    /// <summary>请求下一包后短暂出现不同卡包的单帧不提交新阶段，原包稳定重现仍等待实际导航。</summary>
+    [Fact]
+    public async Task ATransientNextPackFrameCannotTurnTheOriginalDetailsIntoACompletedCycle()
+    {
+        var first = TitledDetail("首包", "a");
+        var second = TitledDetail("次包", "b");
+        var jitteredFirst = first with { NextTarget = new PixelPoint(91, 50) };
+        var fixture = new Fixture(first);
+        fixture.Platform.Observations = [first, first, second, first, jitteredFirst, jitteredFirst, second, second, first, first];
+        var result = await fixture.RunAsync();
+        Assert.Equal(2, result.ScannedPacks);
+        Assert.Equal(2, fixture.Platform.Clicks.Count);
+        Assert.Contains("一轮", result.Reason);
+    }
+
+    /// <summary>每次激活声称成功但截图仍连续失焦时，共享同一恢复期限并在六十秒停止。</summary>
+    [Fact]
+    public async Task RepeatedSuccessfulActivationWithoutFreshFramesCannotRestartTheRecoveryDeadline()
+    {
+        var fixture = new Fixture(Detail("a", true));
+        fixture.Platform.UseRequestedDelay = true;
+        fixture.Platform.AlwaysTemporaryCaptureFailure = true;
+        fixture.Platform.StopAfterDelays = 1000;
+        var result = await fixture.RunAsync();
+        Assert.False(result.IsCancelled);
+        Assert.Contains("恢复", result.Reason);
+        Assert.Contains("60", result.Reason);
+        Assert.InRange(fixture.Platform.Elapsed.TotalSeconds, 60, 60.2);
+        Assert.Empty(fixture.Platform.Clicks);
+        Assert.True(fixture.Platform.RecoverCalls > 1);
+    }
+
+    /// <summary>原窗口新双帧已恢复后再次失焦开启独立恢复预算，不被上一次五十九秒耗时挤占。</summary>
+    [Fact]
+    public async Task ARecoveredPairAllowsANewPhaseItsOwnRecoveryDeadline()
+    {
+        var fixture = new Fixture(Detail("a", true), Dialog(), Results(), Detail("a"), Detail("b"), Detail("a"));
+        fixture.Platform.UseRequestedDelay = true;
+        fixture.Platform.RecoverFailuresRemaining = 700;
+        fixture.Platform.TemporaryCaptureAt.UnionWith([1, 3]);
+        var result = await fixture.RunAsync();
+        Assert.Equal(1, result.OpenedPacks);
+        Assert.Contains("一轮", result.Reason);
+        Assert.True(fixture.Platform.Elapsed >= TimeSpan.FromSeconds(62));
+    }
+
+    /// <summary>第一个真实OCR卡包日志已包含首包自身标题，不依赖后续出现第二包才补全。</summary>
+    [Fact]
+    public async Task TheFirstInspectedPackLogsItsOwnFirstTitleImmediately()
+    {
+        var fixture = new Fixture(TitledDetail("首包", "a"));
+        fixture.Platform.StopAfterCaptures = 4;
+        await fixture.RunAsync();
+        var firstIdentityLog = fixture.Logger.Entries.First(entry => entry.Message.Contains("卡包当前标题"));
+        Assert.Contains("首次标题 首包", firstIdentityLog.Message);
+    }
+
+    /// <summary>可见Skip目标双字段同时轻微抖动仍属于Skip重试，不把旧缓存坐标误当新Open而续期。</summary>
+    [Fact]
+    public async Task VisibleSkipJitterCannotResetTheOpeningDeadline()
+    {
+        var fixture = new Fixture(Detail("a", true), Dialog(), Opening(true) with { AnimationSkipTarget = new PixelPoint(80, 80) });
+        fixture.Platform.UseRequestedDelay = true;
+        fixture.Platform.StopAfterDelays = 1000;
+        fixture.Platform.Tail = index =>
+        {
+            var point = new PixelPoint(index / 4 % 2 == 0 ? 80 : 81, 80);
+            return Opening(true) with { PrimaryTarget = point, AnimationSkipTarget = point };
+        };
+        var result = await fixture.RunAsync();
+        Assert.False(result.IsCancelled);
+        Assert.Contains("60", result.Reason);
+        Assert.InRange(fixture.Platform.Elapsed.TotalSeconds, 60, 61);
+        Assert.Equal(0, result.OpenedPacks);
+        Assert.True(fixture.Platform.Clicks.Count < 100);
+    }
+
+    /// <summary>购买确认或返回详情的第二帧目标变动时不提交原动作，已确认结果也不提前计数。</summary>
+    [Theory]
+    [InlineData("purchase")]
+    [InlineData("return")]
+    public async Task UnstablePurchaseAndReturnedDetailsRetainTheirPendingPhase(string phase)
+    {
+        var detail = Detail("a", true);
+        var fixture = new Fixture(detail);
+        fixture.Platform.Observations = phase == "purchase"
+            ? [detail, detail, Dialog(), Dialog() with { PrimaryTarget = new PixelPoint(51, 60) }]
+            : [detail, detail, Dialog(), Dialog(), Results(), Results(), Detail("a"), Detail("a") with { NextTarget = new PixelPoint(91, 50) }];
+        fixture.Platform.StopAfterCaptures = phase == "purchase" ? 5 : 9;
+        var result = await fixture.RunAsync();
+        Assert.True(result.IsCancelled);
+        Assert.Equal(0, result.OpenedPacks);
+        Assert.Equal(phase == "purchase" ? 1 : 3, fixture.Platform.Clicks.Count);
+    }
+
+    /// <summary>结果确认目标暂时缺失只等待，目标重新稳定后才确认并核验原包返回。</summary>
+    [Fact]
+    public async Task AResultWithNoConfirmationTargetWaitsForAValidatedButton()
+    {
+        var fixture = new Fixture(Detail("a", true), Dialog(), Results() with { PrimaryTarget = null }, Results(), Detail("a"), Detail("b"), Detail("a"));
+        var result = await fixture.RunAsync();
+        Assert.Equal(1, result.OpenedPacks);
+        Assert.Contains("一轮", result.Reason);
+        Assert.Single(fixture.Platform.Clicks, click => click.Screen == PackScreen.Results);
+    }
+
+    /// <summary>免费入口后在购买确认前出现变化的原包详情不会被当作已购买的过渡页继续处理。</summary>
+    [Fact]
+    public async Task ChangedSamePackDetailsBeforePurchaseCannotPretendToBeThePurchasedTransition()
+    {
+        var fixture = new Fixture(Detail("a", true), Detail("a"));
+        var result = await fixture.RunAsync();
+        Assert.Contains("阶段", result.Reason);
+        Assert.Equal(0, result.OpenedPacks);
+        Assert.Single(fixture.Platform.Clicks);
+        Assert.Single(fixture.Platform.Diagnostics);
+    }
+
+    /// <summary>只有已验证动画Skip字段而没有Primary的开包页仍须双帧确认，之后复用原Skip并响应停止。</summary>
+    [Fact]
+    public async Task AVerifiedAnimationSkipTargetDoesNotRequireAPrimaryTarget()
+    {
+        var skip = Opening(false) with { AnimationSkipTarget = new PixelPoint(80, 80) };
+        var fixture = new Fixture(Detail("a", true), Dialog(), skip, skip);
+        fixture.Platform.StopAfterCaptures = 7;
+        var result = await fixture.RunAsync();
+        Assert.True(result.IsCancelled);
+        Assert.Single(fixture.Platform.Clicks, click => click.Point == new PixelPoint(80, 80));
+    }
+
+    /// <summary>第二帧Skip专用目标移动、消失或首次出现时不使用第一帧动作坐标。</summary>
+    [Theory]
+    [InlineData("different")]
+    [InlineData("missing")]
+    [InlineData("appeared")]
+    public async Task AnimationSkipTargetMustBeStableAcrossBothFrames(string change)
+    {
+        var detail = Detail("a", true);
+        var first = Opening(true) with { AnimationSkipTarget = change == "appeared" ? null : new PixelPoint(80, 80) };
+        var second = Opening(true) with { AnimationSkipTarget = change == "missing" ? null : new PixelPoint(change == "different" ? 81 : 80, 80) };
+        var fixture = new Fixture(detail);
+        fixture.Platform.Observations = [detail, detail, Dialog(), Dialog(), first, second];
+        fixture.Platform.StopAfterCaptures = 7;
+        var result = await fixture.RunAsync();
+        Assert.True(result.IsCancelled);
+        Assert.Equal(2, fixture.Platform.Clicks.Count);
+        Assert.DoesNotContain(fixture.Platform.Clicks, click => click.Screen == PackScreen.Opening);
+    }
+
+    /// <summary>隐藏Skip时Open与推断Skip同步抖动仍按Skip节流，推断短时缺失只复用已有缓存且不续期。</summary>
+    [Fact]
+    public async Task HiddenOpenAndInferredSkipJitterCannotResetTheOpeningDeadline()
+    {
+        var opening = Opening(true) with { PrimaryTarget = new PixelPoint(50, 90), AnimationSkipTarget = new PixelPoint(80, 80) };
+        var fixture = new Fixture(Detail("a", true), Dialog(), opening);
+        fixture.Platform.UseRequestedDelay = true;
+        fixture.Platform.StopAfterDelays = 1000;
+        fixture.Platform.Tail = index =>
+        {
+            var shift = index / 4 % 2;
+            return Opening(true) with
+            {
+                PrimaryTarget = new PixelPoint(50 + shift, 90),
+                AnimationSkipTarget = index / 8 % 2 == 0 ? new PixelPoint(80 + shift, 80) : null
+            };
+        };
+        var result = await fixture.RunAsync();
+        Assert.False(result.IsCancelled);
+        Assert.Contains("60", result.Reason);
+        Assert.InRange(fixture.Platform.Elapsed.TotalSeconds, 60, 61);
+        Assert.Equal(0, result.OpenedPacks);
+        Assert.True(fixture.Platform.Clicks.Count < 100);
+    }
+
+    /// <summary>构造具有真实OCR标题的已识别卡包详情。</summary>
+    private static PackObservation TitledDetail(string title, string fingerprint, bool free = false)
+        => Detail(fingerprint, free) with { PackTitle = title };
+
     /// <summary>构造已识别详情，付费按钮仍存在但仅免费入口允许购买。</summary>
     private static PackObservation Detail(string fingerprint, bool free = false) => new(PackScreen.PackDetails, new PixelPoint(50, 50), new PixelPoint(90, 50), free, fingerprint, .98);
     /// <summary>构造已验证免费文字和购买按钮的确认框。</summary>
@@ -645,6 +1178,34 @@ public sealed class FreePackAutomationTests
         public bool CancelDelay { get; set; }
         /// <summary>可暂停首轮等待以验证服务并发门禁。</summary>
         public Func<Task>? DelayHook { get; set; }
+        /// <summary>每次请求延迟的累计时长。</summary>
+        public TimeSpan Elapsed { get; private set; }
+        /// <summary>使用请求间隔推进截图时钟，便于检查退避与恢复期限。</summary>
+        public bool UseRequestedDelay { get; set; }
+        /// <summary>进入指定捕获序号前抛出一次临时失焦。</summary>
+        public HashSet<int> TemporaryCaptureAt { get; } = [];
+        /// <summary>连续制造捕获临时失焦，验证激活假阳性不得续期恢复预算。</summary>
+        public bool AlwaysTemporaryCaptureFailure { get; set; }
+        /// <summary>在指定点击成功序号前抛出一次临时失焦。</summary>
+        public int TemporaryClickAt { get; set; } = int.MaxValue;
+        /// <summary>指定恢复是否取得原窗口前台。</summary>
+        public bool RecoverSucceeds { get; set; } = true;
+        /// <summary>恢复成功前的暂时失败次数。</summary>
+        public int RecoverFailuresRemaining { get; set; }
+        /// <summary>恢复发生永久窗口错误时抛出的异常。</summary>
+        public Exception? RecoverFailure { get; set; }
+        /// <summary>模拟系统恢复调用自身耗费的处理时间。</summary>
+        public Action? RecoverObserver { get; set; }
+        /// <summary>实际尝试恢复次数。</summary>
+        public int RecoverCalls { get; private set; }
+        /// <summary>恢复尝试时的累计请求延迟。</summary>
+        public List<TimeSpan> RecoverElapsed { get; } = [];
+        /// <summary>按延迟次数触发F8，验证三秒暂停可以立即取消。</summary>
+        public int StopAfterDelays { get; set; } = int.MaxValue;
+        /// <summary>按顺序记录每一次等待请求。</summary>
+        public List<TimeSpan> Delays { get; } = [];
+        /// <summary>推进注入的单调时钟的测试边界。</summary>
+        public Action<TimeSpan>? DelayObserver { get; set; }
         /// <summary>冻结截图时间，单独验证累计延迟期限。</summary>
         public bool FreezeClock { get; set; }
         /// <summary>指定第几次点击抛异常，测试失败结果不被计数。</summary>
@@ -661,20 +1222,35 @@ public sealed class FreePackAutomationTests
         public int CaptureCount { get; private set; }
         /// <summary>只存在内存中的页面与点击坐标。</summary>
         public List<(PackScreen Screen, PixelPoint Point)> Clicks { get; } = [];
+        /// <summary>点击成功时的累计请求延迟。</summary>
+        public List<TimeSpan> ClickTimes { get; } = [];
+        /// <summary>点击所依据的最新捕获帧序号。</summary>
+        public List<int> ClickFrameIndices { get; } = [];
         /// <summary>只存在内存中的诊断截图和原因。</summary>
         public List<(GameFrame Frame, string Reason)> Diagnostics { get; } = [];
         /// <summary>每次捕获时的同步上下文，用于确认截图在后台运行。</summary>
         public List<SynchronizationContext?> CaptureContexts { get; } = [];
         /// <summary>模拟 F8 停止键状态。</summary>
-        public bool IsStopRequested => CaptureCount >= StopAfterCaptures;
+        public bool IsStopRequested => CaptureCount >= StopAfterCaptures || Delays.Count >= StopAfterDelays;
         /// <summary>保存虚构观察序列。</summary>
         public FakePlatform(PackObservation[] observations) => Observations = observations;
         /// <summary>记录激活而不寻找或操作任何窗口。</summary>
         public void ActivateGame() { Fail("activate"); Activations++; }
+        /// <summary>模拟恢复原窗口，记录恢复时机而不操作任何系统窗口。</summary>
+        public bool TryRecoverGame()
+        {
+            RecoverCalls++;
+            RecoverElapsed.Add(Elapsed);
+            RecoverObserver?.Invoke();
+            if (RecoverFailure is { } failure) throw failure;
+            if (RecoverFailuresRemaining > 0) { RecoverFailuresRemaining--; return false; }
+            return RecoverSucceeds;
+        }
         /// <summary>创建包含识别索引的虚构帧。</summary>
         public GameFrame Capture()
         {
             Fail("capture");
+            if (AlwaysTemporaryCaptureFailure || TemporaryCaptureAt.Remove(CaptureCount + 1)) throw new GameWindowTemporarilyUnavailableException("测试游戏暂时失焦");
             CaptureContexts.Add(SynchronizationContext.Current);
             var frame = new GameFrame(17, 100, 100, 10, 10, BitConverter.GetBytes(CaptureCount), clock);
             CaptureCount++;
@@ -690,8 +1266,15 @@ public sealed class FreePackAutomationTests
         public void Click(GameFrame frame, PixelPoint point)
         {
             Fail("click");
+            if (Clicks.Count + 1 == TemporaryClickAt)
+            {
+                TemporaryClickAt = int.MaxValue;
+                throw new GameWindowTemporarilyUnavailableException("点击前测试游戏暂时失焦");
+            }
             if (Clicks.Count + 1 == FailClickAt) throw new InvalidOperationException("测试确认结果输入失败");
             Clicks.Add((Observation(frame).Screen, point));
+            ClickTimes.Add(Elapsed);
+            ClickFrameIndices.Add(BitConverter.ToInt32(frame.Pixels));
         }
         /// <summary>推进虚构时间而不让测试真实等待一分钟。</summary>
         public Task DelayAsync(TimeSpan delay, CancellationToken cancellationToken)
@@ -699,7 +1282,10 @@ public sealed class FreePackAutomationTests
             Fail("delay");
             if (CancelDelay) throw new OperationCanceledException();
             cancellationToken.ThrowIfCancellationRequested();
-            if (!FreezeClock) clock += TimeSpan.FromSeconds(1);
+            Delays.Add(delay);
+            Elapsed += delay;
+            DelayObserver?.Invoke(delay);
+            if (!FreezeClock) clock += UseRequestedDelay ? delay : TimeSpan.FromSeconds(1);
             return DelayHook?.Invoke() ?? Task.CompletedTask;
         }
         /// <summary>记录诊断请求或模拟写入失败，不写入用户目录。</summary>
