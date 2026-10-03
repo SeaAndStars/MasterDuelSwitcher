@@ -10,6 +10,38 @@ namespace MasterDuelSwitcher.Tests;
 /// <summary>以用户提供的真实截图和真实 OpenCV 分类器验证免费开包完整状态转换，输入始终只记录于内存。</summary>
 public sealed class FreePackAutomationIntegrationTests
 {
+    /// <summary>真实购买后详情过渡、居中开包与秘密卡包侧栏结果须完成六次动作，不在过渡帧点击。</summary>
+    [Theory]
+    [InlineData(1.0)]
+    [InlineData(0.9375)]
+    public async Task RecordedPurchaseTransitionReachesCenteredSkipAndSidebarConfirmation(double scale)
+    {
+        using var recognizer = new OpenCvPackRecognizer();
+        var baseline = CreateSequence(scale, false);
+        var sequence = new[]
+        {
+            baseline[0], baseline[1], new RecordedFrame("purchase-transition", baseline[0].Frame),
+            new RecordedFrame("opening", LoadFrame("opening-full-window.png", scale)),
+            new RecordedFrame("results", LoadFrame("results-secret-sidebar.png", scale))
+        }.Concat(baseline.Skip(4)).ToArray();
+        var observations = sequence.Select(item => recognizer.Recognize(item.Frame)).ToArray();
+        var flow = observations.Where((_, index) => index != 2).ToArray();
+        AssertRecordedClassifications(flow);
+        var progress = new RecordingProgress();
+        var platform = new RecordedPlatform(sequence, progress);
+        var result = await new FreePackAutomationService(recognizer, platform).RunAsync(progress);
+        AssertCompletedRound(result, platform);
+        AssertActions(platform, flow, scale, true);
+        Assert.DoesNotContain(platform.Clicks, item => item.Name == "purchase-transition");
+        var transitionCaptures = platform.Captures.Where(item => item.Name == "purchase-transition").ToArray();
+        Assert.Equal(2, transitionCaptures.Length);
+        Assert.All(transitionCaptures, item =>
+        {
+            Assert.Equal(1, item.ScannedPacks);
+            Assert.Equal(0, item.OpenedPacks);
+        });
+    }
+
     /// <summary>真实免费详情、确认、开包、结果及收费轮转须只完成一次免费购买，并在返回第一标题时结束。</summary>
     [Theory]
     [InlineData(1.0)]
@@ -118,7 +150,7 @@ public sealed class FreePackAutomationIntegrationTests
     }
 
     /// <summary>逐项核对实际记录的六次动作及独立按钮区域，所有收费详情点击必须是下一包箭头。</summary>
-    private static void AssertActions(RecordedPlatform platform, PackObservation[] observations, double scale)
+    private static void AssertActions(RecordedPlatform platform, PackObservation[] observations, double scale, bool centeredOpening = false)
     {
         Assert.Equal(new[] { "free-details", "free-confirm", "opening", "results", "returned-details", "different-details" },
             platform.Clicks.Select(item => item.Name));
@@ -130,7 +162,7 @@ public sealed class FreePackAutomationIntegrationTests
         {
             new Rect(1310, 866, 493, 81),
             new Rect(1040, 652, 354, 64),
-            new Rect(1109, 941, 243, 58),
+            centeredOpening ? new Rect(1773, 1030, 249, 65) : new Rect(1109, 941, 243, 58),
             new Rect(1518, 1032, 402, 65),
             new Rect(1930, 510, 75, 129),
             new Rect(1930, 510, 75, 129)

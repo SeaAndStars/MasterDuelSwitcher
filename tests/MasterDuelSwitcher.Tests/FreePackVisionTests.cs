@@ -182,6 +182,161 @@ public sealed class FreePackVisionTests : IDisposable
         AssertConfidence(observation);
     }
 
+    /// <summary>真实完整开包画面在整窗和客户区各缩放下，应优先点击右下角跳过按钮。</summary>
+    /// <param name="scale">真实图像的缩放比例。</param>
+    /// <param name="includeTitlebar">是否保留截图的窗口标题栏。</param>
+    [Theory]
+    [InlineData(0.65, true)]
+    [InlineData(0.85, true)]
+    [InlineData(1.0, true)]
+    [InlineData(1.25, true)]
+    [InlineData(0.65, false)]
+    [InlineData(0.85, false)]
+    [InlineData(1.0, false)]
+    [InlineData(1.25, false)]
+    public void FullWindowOpeningPrefersActualSkipButton(double scale, bool includeTitlebar)
+    {
+        using var original = LoadFixture("opening-full-window.png");
+        using var input = includeTitlebar ? original.Clone() : Crop(original, new Rect(1, 31, 2048, 1152));
+        using var image = Resize(input, scale);
+        var observation = recognizer.Recognize(ToFrame(image));
+        var skipRegion = includeTitlebar ? new Rect(1776, 1062, 248, 65) : new Rect(1775, 1031, 248, 65);
+        Assert.Equal(PackScreen.Opening, observation.Screen);
+        AssertTargetInside(observation.PrimaryTarget, skipRegion, scale, image);
+        Assert.False(observation.FreeOffer);
+        Assert.Null(observation.NextTarget);
+        Assert.Empty(observation.Fingerprint);
+        AssertConfidence(observation);
+    }
+
+    /// <summary>完整开包图仅移除跳过按钮时，应回退到仍然可见的真实打开文字。</summary>
+    /// <param name="scale">真实图像的缩放比例。</param>
+    /// <param name="includeTitlebar">是否保留截图的窗口标题栏。</param>
+    [Theory]
+    [InlineData(0.65, true)]
+    [InlineData(0.85, true)]
+    [InlineData(1.0, true)]
+    [InlineData(1.25, true)]
+    [InlineData(0.65, false)]
+    [InlineData(0.85, false)]
+    [InlineData(1.0, false)]
+    [InlineData(1.25, false)]
+    public void FullWindowOpeningWithoutSkipUsesActualOpenLabel(double scale, bool includeTitlebar)
+    {
+        using var original = LoadFixture("opening-full-window.png");
+        PaintFromNearbyPixel(original, new Rect(1770, 1054, 264, 80), 1700, 1100);
+        using var input = includeTitlebar ? original.Clone() : Crop(original, new Rect(1, 31, 2048, 1152));
+        using var image = Resize(input, scale);
+        var observation = recognizer.Recognize(ToFrame(image));
+        var openRegion = includeTitlebar ? new Rect(962, 984, 119, 48) : new Rect(961, 953, 119, 48);
+        Assert.Equal(PackScreen.Opening, observation.Screen);
+        AssertTargetInside(observation.PrimaryTarget, openRegion, scale, image);
+        Assert.False(observation.FreeOffer);
+        Assert.Null(observation.NextTarget);
+        Assert.Empty(observation.Fingerprint);
+        AssertConfidence(observation);
+    }
+
+    /// <summary>真实跳过按钮移到左上方且原位置清空时，应忽略错误位置的控件并回退到打开文字。</summary>
+    /// <param name="scale">真实图像的缩放比例。</param>
+    /// <param name="includeTitlebar">是否保留截图的窗口标题栏。</param>
+    [Theory]
+    [InlineData(0.65, true)]
+    [InlineData(0.85, true)]
+    [InlineData(1.0, true)]
+    [InlineData(1.25, true)]
+    [InlineData(0.65, false)]
+    [InlineData(0.85, false)]
+    [InlineData(1.0, false)]
+    [InlineData(1.25, false)]
+    public void FullWindowOpeningIgnoresSkipMovedOutsideActionRegion(double scale, bool includeTitlebar)
+    {
+        using var original = LoadFixture("opening-full-window.png");
+        using var skip = Crop(original, new Rect(1776, 1062, 248, 65));
+        PaintFromNearbyPixel(original, new Rect(1770, 1054, 264, 80), 1700, 1100);
+        using (var destination = new Mat(original, new Rect(180, 220, skip.Width, skip.Height)))
+            skip.CopyTo(destination);
+        using var input = includeTitlebar ? original.Clone() : Crop(original, new Rect(1, 31, 2048, 1152));
+        using var image = Resize(input, scale);
+        var observation = recognizer.Recognize(ToFrame(image));
+        var openRegion = includeTitlebar ? new Rect(962, 984, 119, 48) : new Rect(961, 953, 119, 48);
+        Assert.Equal(PackScreen.Opening, observation.Screen);
+        AssertTargetInside(observation.PrimaryTarget, openRegion, scale, image);
+        Assert.False(observation.FreeOffer);
+        Assert.Null(observation.NextTarget);
+        Assert.Empty(observation.Fingerprint);
+        AssertConfidence(observation);
+    }
+
+    /// <summary>打开状态文字缺失而跳过按钮仍在时，应保留未知状态并撤回全部动作。</summary>
+    /// <param name="scale">真实图像的缩放比例。</param>
+    /// <param name="includeTitlebar">是否保留截图的窗口标题栏。</param>
+    [Theory]
+    [InlineData(0.65, true)]
+    [InlineData(0.85, true)]
+    [InlineData(1.0, true)]
+    [InlineData(1.25, true)]
+    [InlineData(0.65, false)]
+    [InlineData(0.85, false)]
+    [InlineData(1.0, false)]
+    [InlineData(1.25, false)]
+    public void FullWindowOpeningWithoutOpenAnchorDoesNotAuthorizeSkip(double scale, bool includeTitlebar)
+    {
+        using var original = LoadFixture("opening-full-window.png");
+        PaintFromNearbyPixel(original, new Rect(944, 966, 160, 88), 1310, 1008);
+        using var input = includeTitlebar ? original.Clone() : Crop(original, new Rect(1, 31, 2048, 1152));
+        using var image = Resize(input, scale);
+        AssertUnknown(recognizer.Recognize(ToFrame(image)));
+    }
+
+    /// <summary>真实结果图右侧含秘密卡包面板时，确认动作仍应落在该面板下方的真实确认按钮内。</summary>
+    /// <param name="scale">真实图像的缩放比例。</param>
+    /// <param name="includeTitlebar">是否保留截图的窗口标题栏。</param>
+    [Theory]
+    [InlineData(0.65, true)]
+    [InlineData(0.85, true)]
+    [InlineData(1.0, true)]
+    [InlineData(1.25, true)]
+    [InlineData(0.65, false)]
+    [InlineData(0.85, false)]
+    [InlineData(1.0, false)]
+    [InlineData(1.25, false)]
+    public void SecretSidebarResultsHasActualConfirmationTarget(double scale, bool includeTitlebar)
+    {
+        using var original = LoadFixture("results-secret-sidebar.png");
+        using var input = includeTitlebar ? original.Clone() : Crop(original, new Rect(1, 31, 2048, 1152));
+        using var image = Resize(input, scale);
+        var observation = recognizer.Recognize(ToFrame(image));
+        var confirmationRegion = includeTitlebar ? new Rect(1519, 1063, 402, 65) : new Rect(1518, 1032, 402, 65);
+        Assert.Equal(PackScreen.Results, observation.Screen);
+        AssertTargetInside(observation.PrimaryTarget, confirmationRegion, scale, image);
+        Assert.False(observation.FreeOffer);
+        Assert.Null(observation.NextTarget);
+        Assert.Empty(observation.Fingerprint);
+        AssertConfidence(observation);
+    }
+
+    /// <summary>结果标题和秘密卡包面板仍在而确认按钮缺失时，整窗及客户区均不得生成动作。</summary>
+    /// <param name="scale">真实图像的缩放比例。</param>
+    /// <param name="includeTitlebar">是否保留截图的窗口标题栏。</param>
+    [Theory]
+    [InlineData(0.65, true)]
+    [InlineData(0.85, true)]
+    [InlineData(1.0, true)]
+    [InlineData(1.25, true)]
+    [InlineData(0.65, false)]
+    [InlineData(0.85, false)]
+    [InlineData(1.0, false)]
+    [InlineData(1.25, false)]
+    public void SecretSidebarResultsWithoutConfirmationDoNotAuthorizeClicks(double scale, bool includeTitlebar)
+    {
+        using var original = LoadFixture("results-secret-sidebar.png");
+        PaintFromNearbyPixel(original, new Rect(1505, 1053, 432, 85), 1570, 1000);
+        using var input = includeTitlebar ? original.Clone() : Crop(original, new Rect(1, 31, 2048, 1152));
+        using var image = Resize(input, scale);
+        AssertUnknown(recognizer.Recognize(ToFrame(image)));
+    }
+
     /// <summary>收费详情只提供最右侧双箭头导航，不得授权购买或误选详情行上的单箭头。</summary>
     [Theory]
     [InlineData(0.65)]

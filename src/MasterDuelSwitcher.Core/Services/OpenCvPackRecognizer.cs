@@ -126,9 +126,11 @@ public sealed class OpenCvPackRecognizer : IPackRecognizer, IDisposable
     private PackObservation? RecognizeOpening(Mat image, double factor)
     {
         var open = FindAnchor(image, factor, "opening-label", new Rect(0, image.Height * 2 / 3,
-            image.Width / 2, image.Height - image.Height * 2 / 3));
+            image.Width, image.Height - image.Height * 2 / 3));
         if (open is null) return null;
-        var skip = FindRelative(image, factor, open.Value, "skip-label");
+        var skip = FindRelative(image, factor, open.Value, "skip-label")
+            ?? FindAnchor(image, factor, "skip-label", new Rect(image.Width / 2, image.Height * 2 / 3,
+                image.Width - image.Width / 2, image.Height - image.Height * 2 / 3));
         var target = skip ?? open.Value;
         return new(PackScreen.Opening, target.Center, null, false, string.Empty,
             Math.Min(open.Value.Score, target.Score));
@@ -255,7 +257,8 @@ public sealed class OpenCvPackRecognizer : IPackRecognizer, IDisposable
             if (score < MatchThreshold) continue;
             using var candidate = new Mat(area, new Rect(location, size));
             Cv2.MeanStdDev(candidate, out _, out var deviation);
-            if (deviation.Val0 < template.Deviation * .55) continue;
+            Cv2.MeanStdDev(resized, out _, out var templateDeviation);
+            if (deviation.Val0 < templateDeviation.Val0 * .55) continue;
             if (best is null || score > best.Value.Score)
                 best = new(template, new Rect((int)Math.Round((region.X + location.X) / factor),
                     (int)Math.Round((region.Y + location.Y) / factor),
@@ -283,7 +286,7 @@ public sealed class OpenCvPackRecognizer : IPackRecognizer, IDisposable
         return hash.ToString("x16");
     }
 
-    /// <summary>从程序集内确定存在的截图资源解码模板，并保留其对比度作为遮罩检测基准。</summary>
+    /// <summary>从程序集内确定存在的截图资源解码并缓存真实灰度模板。</summary>
     private static Template LoadTemplate(string name, int x, int y)
     {
         using var stream = typeof(OpenCvPackRecognizer).Assembly.GetManifestResourceStream(
@@ -291,8 +294,7 @@ public sealed class OpenCvPackRecognizer : IPackRecognizer, IDisposable
         using var buffer = new MemoryStream();
         stream.CopyTo(buffer);
         var gray = Cv2.ImDecode(buffer.ToArray(), ImreadModes.Grayscale);
-        Cv2.MeanStdDev(gray, out _, out var deviation);
-        return new(name, gray, x, y, deviation.Val0);
+        return new(name, gray, x, y);
     }
 
     /// <summary>创建没有可点击目标的未知界面观测。</summary>
@@ -305,13 +307,12 @@ public sealed class OpenCvPackRecognizer : IPackRecognizer, IDisposable
         foreach (var template in templates.Values) template.Gray.Dispose();
     }
 
-    /// <summary>一张原始截图文字模板及其参考坐标和对比度。</summary>
+    /// <summary>一张原始截图文字模板及其参考坐标。</summary>
     /// <param name="Name">嵌入模板名称。</param>
     /// <param name="Gray">缓存的原生灰度图像。</param>
     /// <param name="X">参考截图中的模板左边界。</param>
     /// <param name="Y">参考截图中的模板上边界。</param>
-    /// <param name="Deviation">原始模板的灰度标准差。</param>
-    private sealed record Template(string Name, Mat Gray, int X, int Y, double Deviation);
+    private sealed record Template(string Name, Mat Gray, int X, int Y);
 
     /// <summary>某一尺度下已通过相似度和对比度验证的模板匹配。</summary>
     /// <param name="Template">所匹配的模板与参考位置。</param>
