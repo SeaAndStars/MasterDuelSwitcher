@@ -46,12 +46,24 @@ public sealed class WindowsGameAutomationPlatform : IGameAutomationPlatform
         uint processId = native.GetWindowProcessId(window);
         if (processId == 0)
             throw new InvalidOperationException("游戏窗口所属进程已退出。");
+        logger.LogDebug("FreePackWindowFound ExpectedHWND={ExpectedHWND} ExpectedPID={ExpectedPID}", window, processId);
         if (!native.ActivateWindow(window))
             throw new Win32Exception(Marshal.GetLastWin32Error(), "游戏窗口激活请求未成功。");
         activeWindow = window;
         activeProcessId = processId;
-        activatedFrame = ReadClientFrame();
         native.BeginEmergencyStop();
+        if (!SpinWait.SpinUntil(() =>
+        {
+            nint foreground = native.GetForegroundWindow();
+            if (native.IsF8Pressed) throw new OperationCanceledException("F8 已请求停止免费开包。");
+            return foreground == window;
+        }, TimeSpan.FromSeconds(2)))
+        {
+            logger.LogWarning("FreePackWindowRejected Stage={Stage} ExpectedHWND={ExpectedHWND} ExpectedPID={ExpectedPID} ActualPID={ActualPID} ActualForeground={ActualForeground} Visible={Visible} Iconic={Iconic}",
+                "ActivationForegroundTimeout", window, processId, native.GetWindowProcessId(window), native.GetForegroundWindow(), native.IsWindowVisible(window), native.IsWindowMinimized(window));
+            throw new InvalidOperationException("游戏窗口在两秒内未取得前台，自动开包已停止。");
+        }
+        activatedFrame = ReadClientFrame();
         logger.LogInformation("FreePackWindowActivated Width={Width} Height={Height}", activatedFrame.Width, activatedFrame.Height);
     }
 
@@ -75,7 +87,7 @@ public sealed class WindowsGameAutomationPlatform : IGameAutomationPlatform
             nint selected = native.SelectBitmap(memoryDc, bitmap);
             if (selected == 0 || selected == -1) throw CaptureError();
             previous = selected;
-            if (!native.CopyPixels(memoryDc, windowDc, geometry.Width, geometry.Height)) throw CaptureError();
+            if (!native.CopyPixels(memoryDc, windowDc, geometry.Width, geometry.Height, geometry.ScreenX, geometry.ScreenY)) throw CaptureError();
             nint restored = native.SelectBitmap(memoryDc, previous);
             if (restored == 0 || restored == -1) throw CaptureError();
             previous = 0;
@@ -83,7 +95,7 @@ public sealed class WindowsGameAutomationPlatform : IGameAutomationPlatform
             if (native.ReadPixels(memoryDc, bitmap, geometry.Width, geometry.Height, pixels) != geometry.Height)
                 throw CaptureError();
             EnsureSameGeometry(geometry, ReadClientFrame());
-            logger.LogDebug("FreePackFrameCaptured Width={Width} Height={Height}", geometry.Width, geometry.Height);
+            logger.LogDebug("FreePackFrameCaptured Width={Width} Height={Height} SourceX={SourceX} SourceY={SourceY}", geometry.Width, geometry.Height, geometry.ScreenX, geometry.ScreenY);
             return geometry with { Pixels = pixels, CapturedAtUtc = native.UtcNow };
         }
         finally
@@ -163,9 +175,17 @@ public sealed class WindowsGameAutomationPlatform : IGameAutomationPlatform
     /// <summary>读取并校验锁定窗口的物理客户区几何状态。</summary>
     private GameFrame ReadClientFrame()
     {
-        if (activeWindow == 0 || !native.IsGameWindow(activeWindow) || native.GetWindowProcessId(activeWindow) != activeProcessId
-            || native.GetForegroundWindow() != activeWindow || !native.IsWindowVisible(activeWindow) || native.IsWindowMinimized(activeWindow))
+        bool gameWindow = native.IsGameWindow(activeWindow);
+        uint processId = native.GetWindowProcessId(activeWindow);
+        nint foreground = native.GetForegroundWindow();
+        bool visible = native.IsWindowVisible(activeWindow);
+        bool iconic = native.IsWindowMinimized(activeWindow);
+        if (activeWindow == 0 || !gameWindow || processId != activeProcessId || foreground != activeWindow || !visible || iconic)
+        {
+            logger.LogWarning("FreePackWindowRejected Stage={Stage} ExpectedHWND={ExpectedHWND} ExpectedPID={ExpectedPID} ActualPID={ActualPID} ActualForeground={ActualForeground} Visible={Visible} Iconic={Iconic} GameWindow={GameWindow}",
+                "ClientValidation", activeWindow, activeProcessId, processId, foreground, visible, iconic, gameWindow);
             throw new InvalidOperationException("游戏窗口失焦、隐藏、最小化或所属进程已经变化。");
+        }
         if (!native.GetClientRectangle(activeWindow, out AutomationNativeRectangle rectangle))
             throw new InvalidOperationException("读取游戏客户区失败。");
         AutomationNativePoint origin = new(0, 0);
@@ -212,7 +232,7 @@ public interface IWindowsGameAutomationNativeApi
     bool GetClientRectangle(nint window, out AutomationNativeRectangle rectangle);
     /// <summary>把客户区点转换为物理屏幕点。</summary>
     bool ClientToScreen(nint window, ref AutomationNativePoint point);
-    /// <summary>取得客户区设备上下文。</summary>
+    /// <summary>取得桌面设备上下文，以可见客户区屏幕原点读取游戏合成画面。</summary>
     nint GetClientDc(nint window);
     /// <summary>创建兼容内存设备上下文。</summary>
     nint CreateMemoryDc(nint source);
@@ -220,19 +240,19 @@ public interface IWindowsGameAutomationNativeApi
     nint CreateBitmap(nint source, int width, int height);
     /// <summary>选入位图并返回原对象。</summary>
     nint SelectBitmap(nint dc, nint bitmap);
-    /// <summary>复制设备上下文中的客户区像素。</summary>
-    bool CopyPixels(nint target, nint source, int width, int height);
+    /// <summary>从显式物理屏幕原点复制桌面上的可见客户区像素。</summary>
+    bool CopyPixels(nint target, nint source, int width, int height, int sourceX, int sourceY);
     /// <summary>读取自顶向下的紧密 BGRA 位图。</summary>
     int ReadPixels(nint dc, nint bitmap, int width, int height, byte[] pixels);
     /// <summary>释放兼容位图。</summary>
     void DeleteBitmap(nint bitmap);
     /// <summary>释放内存设备上下文。</summary>
     void DeleteMemoryDc(nint dc);
-    /// <summary>释放客户区设备上下文。</summary>
+    /// <summary>释放桌面截图使用的设备上下文。</summary>
     void ReleaseClientDc(nint window, nint dc);
     /// <summary>读取全部显示器组成的虚拟桌面。</summary>
     AutomationNativeRectangle GetVirtualDesktop();
-    /// <summary>发送绝对移动、左键按下和松开的连续鼠标批次。</summary>
+    /// <summary>发送绝对移动和左键按下，跨帧等待后保证松开；完整成功返回三次输入。</summary>
     uint SendMouseClick(int normalizedX, int normalizedY);
     /// <summary>读取 F8 是否处于按下状态。</summary>
     bool IsF8Pressed { get; }
@@ -283,6 +303,8 @@ public sealed class SystemWindowsGameAutomationNativeApi : IWindowsGameAutomatio
     private readonly string gameProcessName;
     /// <summary>供故障测试记录批次的输入边界；生产使用真实 SendInput。</summary>
     private readonly Func<NativeInput[], uint> sendInputs;
+    /// <summary>跨过游戏鼠标轮询帧的可注入等待；生产使用线程等待。</summary>
+    private readonly Action<TimeSpan> holdMouse;
     /// <summary>仅在自动化运行期间存在的 F8 消息监听器。</summary>
     private F8EmergencyStopListener? stopListener;
 
@@ -292,12 +314,13 @@ public sealed class SystemWindowsGameAutomationNativeApi : IWindowsGameAutomatio
 
     /// <summary>为隔离 Win32 窗口测试注入进程边界，不对真实游戏发送输入。</summary>
     internal SystemWindowsGameAutomationNativeApi(Func<Process[]> findProcesses, Func<int, Process> findProcess, string gameProcessName,
-        Func<NativeInput[], uint>? sendInputs = null)
+        Func<NativeInput[], uint>? sendInputs = null, Action<TimeSpan>? holdMouse = null)
     {
         this.findProcesses = findProcesses;
         this.findProcess = findProcess;
         this.gameProcessName = gameProcessName;
         this.sendInputs = sendInputs ?? SendSystemInputs;
+        this.holdMouse = holdMouse ?? Thread.Sleep;
     }
 
     /// <summary>寻找目标进程的第一个主窗口，并释放全部进程查询句柄。</summary>
@@ -350,8 +373,8 @@ public sealed class SystemWindowsGameAutomationNativeApi : IWindowsGameAutomatio
     public bool GetClientRectangle(nint window, out AutomationNativeRectangle rectangle) => NativeMethods.GetClientRect(window, out rectangle);
     /// <summary>转换客户区点到物理屏幕点。</summary>
     public bool ClientToScreen(nint window, ref AutomationNativePoint point) => NativeMethods.ClientToScreen(window, ref point);
-    /// <summary>获取客户区设备上下文。</summary>
-    public nint GetClientDc(nint window) => NativeMethods.GetDC(window);
+    /// <summary>取得桌面合成后的设备上下文，避免窗口 GDI 表面保留旧 DirectX 帧。</summary>
+    public nint GetClientDc(nint window) => NativeMethods.GetDC(0);
     /// <summary>创建兼容内存设备上下文。</summary>
     public nint CreateMemoryDc(nint source) => NativeMethods.CreateCompatibleDC(source);
     /// <summary>创建兼容彩色位图。</summary>
@@ -359,7 +382,7 @@ public sealed class SystemWindowsGameAutomationNativeApi : IWindowsGameAutomatio
     /// <summary>选入或还原 GDI 位图。</summary>
     public nint SelectBitmap(nint dc, nint bitmap) => NativeMethods.SelectObject(dc, bitmap);
     /// <summary>复制前台客户区的实际显示像素。</summary>
-    public bool CopyPixels(nint target, nint source, int width, int height) => NativeMethods.BitBlt(target, 0, 0, width, height, source, 0, 0, 0x40CC0020);
+    public bool CopyPixels(nint target, nint source, int width, int height, int sourceX, int sourceY) => NativeMethods.BitBlt(target, 0, 0, width, height, source, sourceX, sourceY, 0x40CC0020);
 
     /// <summary>将已取消选入的兼容位图转换为自顶向下 BGRA。</summary>
     public int ReadPixels(nint dc, nint bitmap, int width, int height, byte[] pixels)
@@ -379,8 +402,8 @@ public sealed class SystemWindowsGameAutomationNativeApi : IWindowsGameAutomatio
     public void DeleteBitmap(nint bitmap) => NativeMethods.DeleteObject(bitmap);
     /// <summary>释放创建的内存设备上下文。</summary>
     public void DeleteMemoryDc(nint dc) => NativeMethods.DeleteDC(dc);
-    /// <summary>归还客户区设备上下文。</summary>
-    public void ReleaseClientDc(nint window, nint dc) => NativeMethods.ReleaseDC(window, dc);
+    /// <summary>按 GetDC(0) 的配对句柄释放桌面设备上下文。</summary>
+    public void ReleaseClientDc(nint window, nint dc) => NativeMethods.ReleaseDC(0, dc);
 
     /// <summary>读取包含负坐标显示器的完整虚拟桌面。</summary>
     public AutomationNativeRectangle GetVirtualDesktop()
@@ -390,23 +413,33 @@ public sealed class SystemWindowsGameAutomationNativeApi : IWindowsGameAutomatio
         return new(left, top, left + NativeMethods.GetSystemMetrics(78), top + NativeMethods.GetSystemMetrics(79));
     }
 
-    /// <summary>用单个 SendInput 批次发送虚拟桌面绝对移动及左键点击。</summary>
+    /// <summary>发送虚拟桌面移动和按下，等待八十毫秒后松开，所有失败路径均尝试释放左键。</summary>
     public uint SendMouseClick(int normalizedX, int normalizedY)
     {
-        NativeInput[] inputs =
-        [
-            new() { Mouse = new() { X = normalizedX, Y = normalizedY, Flags = 0xC001 } },
-            new() { Mouse = new() { Flags = 0x0002 } },
-            new() { Mouse = new() { Flags = 0x0004 } }
-        ];
-        uint sent = sendInputs(inputs);
-        if (sent != 3)
+        bool released = false;
+        try
         {
-            int originalError = Marshal.GetLastWin32Error();
-            sendInputs([new() { Mouse = new() { Flags = 0x0004 } }]);
-            Marshal.SetLastPInvokeError(originalError);
+            uint down = sendInputs(
+            [
+                new() { Mouse = new() { X = normalizedX, Y = normalizedY, Flags = 0xC001 } },
+                new() { Mouse = new() { Flags = 0x0002 } }
+            ]);
+            if (down != 2) return down;
+            holdMouse(TimeSpan.FromMilliseconds(80));
+            uint up = sendInputs([new() { Mouse = new() { Flags = 0x0004 } }]);
+            released = up == 1;
+            return down + up;
         }
-        return sent;
+        finally
+        {
+            if (!released)
+            {
+                int originalError = Marshal.GetLastWin32Error();
+                try { sendInputs([new() { Mouse = new() { Flags = 0x0004 } }]); }
+                catch (Exception) { /* 松开边界再次失败时，保留首次输入错误或取消异常。 */ }
+                Marshal.SetLastPInvokeError(originalError);
+            }
+        }
     }
 
     /// <summary>运行时读取事件锁存，空闲时只检查 F8 当前按住状态。</summary>

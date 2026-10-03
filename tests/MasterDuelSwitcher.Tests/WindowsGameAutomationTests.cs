@@ -1,9 +1,12 @@
 using MasterDuelSwitcher.Core.Models;
 using MasterDuelSwitcher.Core.Services;
+using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Logging.Abstractions;
 using OpenCvSharp;
 using System.ComponentModel;
+using System.Diagnostics;
 using Xunit;
+using LogLevel = Microsoft.Extensions.Logging.LogLevel;
 
 namespace MasterDuelSwitcher.Tests;
 
@@ -12,6 +15,81 @@ public sealed class WindowsGameAutomationTests : IDisposable
 {
     /// <summary>本次测试的独立状态目录。</summary>
     private readonly string directory = Path.Combine(Path.GetTempPath(), "FreePackPlatform-" + Guid.NewGuid().ToString("N"));
+
+    /// <summary>验证异步前台切换需要多次观察时，初始化仍能获得完整客户区。</summary>
+    [Fact]
+    public void ActivationWaitsForAsynchronousForegroundBeforeReadingClient()
+    {
+        var native = new FixtureNativeApi { Foreground = 99, ForegroundReadyAfterReads = 3 };
+        var platform = new WindowsGameAutomationPlatform(directory, native);
+        platform.ActivateGame();
+        Assert.Equal(1, native.BeginCount);
+        Assert.Equal((nint)42, platform.Capture().WindowHandle);
+        Assert.True(native.ForegroundReadCount >= 3);
+    }
+
+    /// <summary>验证前台始终未到位时等待有上限，禁止鼠标输入并记录窗口状态和释放停止监听。</summary>
+    [Fact]
+    public void ActivationNeverReceivingForegroundStopsWithinBoundAndLogsItsState()
+    {
+        var native = new FixtureNativeApi { Foreground = 99 };
+        var logger = new WindowLogger();
+        var platform = new WindowsGameAutomationPlatform(directory, native, logger);
+        var wait = Stopwatch.StartNew();
+        Assert.Throws<InvalidOperationException>(() => platform.ActivateGame());
+        Assert.InRange(wait.Elapsed.TotalSeconds, 1.8, 3);
+        Assert.Equal(1, native.BeginCount);
+        Assert.Equal(0u, native.InputCount);
+        var state = Assert.Single(logger.Warnings);
+        Assert.Equal((nint)42, state["ExpectedHWND"]);
+        Assert.Equal(7u, state["ExpectedPID"]);
+        Assert.Equal(7u, state["ActualPID"]);
+        Assert.Equal((nint)99, state["ActualForeground"]);
+        Assert.Equal(true, state["Visible"]);
+        Assert.Equal(false, state["Iconic"]);
+        platform.EndAutomation();
+        Assert.Equal(1, native.EndCount);
+    }
+
+    /// <summary>验证启动等待结束后失焦仍立即拒绝截图，不通过再次等待恢复自动化。</summary>
+    [Fact]
+    public void RuntimeForegroundLossStillStopsImmediatelyAndLogsTheRejectedSnapshot()
+    {
+        var native = new FixtureNativeApi();
+        var logger = new WindowLogger();
+        var platform = new WindowsGameAutomationPlatform(directory, native, logger);
+        platform.ActivateGame();
+        native.Foreground = 99;
+        native.ForegroundReadyAfterReads = native.ForegroundReadCount + 2;
+        var wait = Stopwatch.StartNew();
+        Assert.Throws<InvalidOperationException>(() => platform.Capture());
+        Assert.True(wait.Elapsed < TimeSpan.FromMilliseconds(250));
+        Assert.Equal(0u, native.InputCount);
+        Assert.Equal((nint)99, Assert.Single(logger.Warnings)["ActualForeground"]);
+    }
+
+    /// <summary>验证等待异步前台期间短按并松开的 F8 被锁存，焦点后来到位也不继续读取客户区。</summary>
+    [Theory]
+    [InlineData(true)]
+    [InlineData(false)]
+    public void ActivationForegroundWaitLatchesReleasedF8AndStopsBeforeClientRead(bool foregroundEventuallyArrives)
+    {
+        var native = new FixtureNativeApi
+        {
+            Foreground = 99,
+            ForegroundReadyAfterReads = foregroundEventuallyArrives ? 3 : 0,
+            TapF8OnForegroundRead = true
+        };
+        var platform = new WindowsGameAutomationPlatform(directory, native);
+        var wait = Stopwatch.StartNew();
+        Assert.Throws<OperationCanceledException>(() => platform.ActivateGame());
+        Assert.True(wait.Elapsed < TimeSpan.FromMilliseconds(250));
+        Assert.Equal(1, native.BeginCount);
+        Assert.Equal(0, native.ClientReadCount);
+        Assert.Equal(0u, native.InputCount);
+        platform.EndAutomation();
+        Assert.Equal(1, native.EndCount);
+    }
 
     /// <summary>验证仅激活已确认的游戏窗口并获取紧密 BGRA 客户区。</summary>
     [Fact]
@@ -30,6 +108,20 @@ public sealed class WindowsGameAutomationTests : IDisposable
         Assert.Equal(native.UtcNow, frame.CapturedAtUtc);
         Assert.Equal(["dc:2", "bitmap:3", "windowdc:1"], native.Released);
         Assert.Equal(2, native.SelectionCount);
+    }
+
+    /// <summary>验证桌面截图使用复验后的客户区物理屏幕原点，包含多屏负坐标。</summary>
+    [Theory]
+    [InlineData(-300, 200)]
+    [InlineData(125, -240)]
+    public void CaptureCopiesVisibleClientFromItsPhysicalScreenOrigin(int screenX, int screenY)
+    {
+        var native = new FixtureNativeApi { Origin = new(screenX, screenY) };
+        var platform = new WindowsGameAutomationPlatform(directory, native);
+        platform.ActivateGame();
+        GameFrame frame = platform.Capture();
+        Assert.Equal((frame.ScreenX, frame.ScreenY), native.LastCopySource);
+        Assert.Equal((frame.Width, frame.Height), native.LastCopySize);
     }
 
     /// <summary>验证多屏负坐标使用虚拟桌面绝对鼠标输入。</summary>
@@ -266,6 +358,16 @@ public sealed class WindowsGameAutomationTests : IDisposable
         public nint Window { get; set; } = 42;
         /// <summary>前台窗口句柄。</summary>
         public nint Foreground { get; set; } = 42;
+        /// <summary>模拟前台异步切换在指定观察次数之后完成；零表示保持原前台。</summary>
+        public int ForegroundReadyAfterReads { get; set; }
+        /// <summary>前台窗口查询次数。</summary>
+        public int ForegroundReadCount { get; private set; }
+        /// <summary>模拟第一次前台观察期间短按并松开 F8。</summary>
+        public bool TapF8OnForegroundRead { get; set; }
+        /// <summary>已注册监听在短按松开之后保留的停止事件。</summary>
+        private bool f8TapLatched;
+        /// <summary>读取客户区矩形的次数。</summary>
+        public int ClientReadCount { get; private set; }
         /// <summary>窗口所属进程。</summary>
         public uint ProcessId { get; set; } = 7;
         /// <summary>是否仍属于目标游戏。</summary>
@@ -312,6 +414,10 @@ public sealed class WindowsGameAutomationTests : IDisposable
         public uint SendCount { get; set; } = 3;
         /// <summary>最后输入坐标。</summary>
         public (int X, int Y) LastInput { get; private set; }
+        /// <summary>最后截图在源设备上下文中的起点。</summary>
+        public (int X, int Y) LastCopySource { get; private set; }
+        /// <summary>最后截图复制的客户区尺寸。</summary>
+        public (int Width, int Height) LastCopySize { get; private set; }
         /// <summary>返回游戏窗口。</summary>
         public nint FindGameWindow() => Window;
         /// <summary>确认窗口身份。</summary>
@@ -319,7 +425,12 @@ public sealed class WindowsGameAutomationTests : IDisposable
         /// <summary>返回窗口所属进程。</summary>
         public uint GetWindowProcessId(nint window) => ProcessId;
         /// <summary>返回前台窗口。</summary>
-        public nint GetForegroundWindow() => Foreground;
+        public nint GetForegroundWindow()
+        {
+            ForegroundReadCount++;
+            if (TapF8OnForegroundRead && ForegroundReadCount == 1 && BeginCount > 0) f8TapLatched = true;
+            return ForegroundReadyAfterReads > 0 && ForegroundReadCount >= ForegroundReadyAfterReads ? Window : Foreground;
+        }
         /// <summary>返回窗口可见状态。</summary>
         public bool IsWindowVisible(nint window) => Visible;
         /// <summary>返回窗口最小化状态。</summary>
@@ -327,7 +438,7 @@ public sealed class WindowsGameAutomationTests : IDisposable
         /// <summary>激活窗口。</summary>
         public bool ActivateWindow(nint window) => ActivationSuccess;
         /// <summary>查询客户区。</summary>
-        public bool GetClientRectangle(nint window, out AutomationNativeRectangle rectangle) { rectangle = Client; return ClientSuccess; }
+        public bool GetClientRectangle(nint window, out AutomationNativeRectangle rectangle) { ClientReadCount++; rectangle = Client; return ClientSuccess; }
         /// <summary>转换客户区原点。</summary>
         public bool ClientToScreen(nint window, ref AutomationNativePoint point) { point = Origin; return OriginSuccess; }
         /// <summary>分配窗口 DC。</summary>
@@ -346,7 +457,12 @@ public sealed class WindowsGameAutomationTests : IDisposable
             return 4;
         }
         /// <summary>复制客户区像素。</summary>
-        public bool CopyPixels(nint target, nint source, int width, int height) => Fault != "copy";
+        public bool CopyPixels(nint target, nint source, int width, int height, int sourceX, int sourceY)
+        {
+            LastCopySource = (sourceX, sourceY);
+            LastCopySize = (width, height);
+            return Fault != "copy";
+        }
         /// <summary>读取位图像素。</summary>
         public int ReadPixels(nint dc, nint bitmap, int width, int height, byte[] pixels)
         {
@@ -364,7 +480,7 @@ public sealed class WindowsGameAutomationTests : IDisposable
         /// <summary>发送完整鼠标批次。</summary>
         public uint SendMouseClick(int normalizedX, int normalizedY) { InputCount = 3; LastInput = (normalizedX, normalizedY); return SendCount; }
         /// <summary>返回 F8 紧急停止状态。</summary>
-        public bool IsF8Pressed => F8Pressed || F8OnSecondRead && ++f8ReadCount == 2;
+        public bool IsF8Pressed => f8TapLatched || F8Pressed || F8OnSecondRead && ++f8ReadCount == 2;
         /// <summary>记录紧急停止监听开始。</summary>
         public void BeginEmergencyStop() => BeginCount++;
         /// <summary>记录紧急停止监听结束。</summary>
@@ -372,6 +488,23 @@ public sealed class WindowsGameAutomationTests : IDisposable
         {
             EndCount++;
             if (Fault == "end-stop") throw new Win32Exception();
+        }
+    }
+
+    /// <summary>记录窗口拒绝事件的结构化字段，避免日志丢失实际失焦原因。</summary>
+    private sealed class WindowLogger : ILogger<WindowsGameAutomationPlatform>
+    {
+        /// <summary>收到的窗口拒绝诊断字段。</summary>
+        internal List<Dictionary<string, object?>> Warnings { get; } = [];
+        /// <summary>测试无需额外日志作用域。</summary>
+        public IDisposable? BeginScope<TState>(TState state) where TState : notnull => null;
+        /// <summary>所有日志等级均参与记录。</summary>
+        public bool IsEnabled(LogLevel logLevel) => true;
+        /// <summary>提取警告中的结构化状态，不记录用户账号信息。</summary>
+        public void Log<TState>(LogLevel logLevel, EventId eventId, TState state, Exception? exception, Func<TState, Exception?, string> formatter)
+        {
+            if (logLevel == LogLevel.Warning)
+                Warnings.Add(((IEnumerable<KeyValuePair<string, object?>>)state!).ToDictionary(pair => pair.Key, pair => pair.Value));
         }
     }
 }
