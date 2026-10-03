@@ -26,6 +26,8 @@ public interface IResourceSharingService
     IReadOnlyList<ShareBackup> GetBackups(string gamePath);
     /// <summary>恢复指定持久化事务。</summary>
     void Restore(string backupId);
+    /// <summary>归档已失去原备份的单目标事务，保留当前目标并重新共享。</summary>
+    ShareBackup? RepairInvalidSharing(string backupId);
 }
 
 /// <summary>资源事务依赖的文件系统接口，允许替换磁盘错误、竞态与持久化实现。</summary>
@@ -218,7 +220,7 @@ public sealed class ResourceSharingService : IResourceSharingService
     }
 
     /// <summary>校验来源和目标，先保存意图，再逐项移动原目录并安装暂存 junction。</summary>
-    private ShareBackup? EnableSharingCore(string gamePath, string sourceFolder, IEnumerable<string> targetFolders)
+    private ShareBackup? EnableSharingCore(string gamePath, string sourceFolder, IEnumerable<string> targetFolders, string? requiredTargetIdentity = null)
     {
         ArgumentNullException.ThrowIfNull(targetFolders);
         EnsureStopped();
@@ -240,6 +242,8 @@ public sealed class ResourceSharingService : IResourceSharingService
             if (active.Any(item => ResourcePathValidation.Equal(item.SourcePath, target)))
                 throw new InvalidOperationException($"目标仍是活动共享事务的资源来源，请先还原依赖账号：{target}");
             var attributes = files.Attributes(target);
+            if (requiredTargetIdentity is not null && !string.Equals(JunctionOperations.GetDirectoryIdentity(target), requiredTargetIdentity, StringComparison.Ordinal))
+                throw new InvalidOperationException($"失效修复归档后目标已被替换，保留第三方目录：{target}");
             var pending = active.Where(item => item.Entries.Any(entry => !entry.Restored && ResourcePathValidation.Equal(entry.ResourcePath, target))).ToArray();
             if (attributes is { } linkFlags && (linkFlags & FileAttributes.ReparsePoint) != 0)
             {
@@ -257,7 +261,7 @@ public sealed class ResourceSharingService : IResourceSharingService
         }
         if (backup.Entries.Count == 0) return null;
         originalDirectoryIdentities[backup.Id] = backup.Entries.Where(entry => entry.OriginalExisted)
-            .ToDictionary(entry => entry.ResourcePath, entry => JunctionOperations.GetDirectoryIdentity(entry.ResourcePath), StringComparer.OrdinalIgnoreCase);
+            .ToDictionary(entry => entry.ResourcePath, entry => requiredTargetIdentity ?? JunctionOperations.GetDirectoryIdentity(entry.ResourcePath), StringComparer.OrdinalIgnoreCase);
         EnsureStopped();
         // 所有目标和原始存在状态先原子落盘，目录移动前即拥有可恢复的完整意图。
         SaveBackup(backup);
@@ -339,6 +343,83 @@ public sealed class ResourceSharingService : IResourceSharingService
             logger.LogError(exception, "资源还原失败，事务 {BackupId} 的备份及冲突现场保留。", backupId);
             throw;
         }
+    }
+
+    /// <summary>在明确确认旧备份已丢失后，保留现场并重新建立共享。</summary>
+    public ShareBackup? RepairInvalidSharing(string backupId)
+    {
+        logger.LogInformation("失效共享修复开始，旧事务 {BackupId}。", backupId);
+        try
+        {
+            var repaired = RepairInvalidSharingCore(backupId);
+            logger.LogInformation("失效共享修复完成，旧事务 {BackupId} 已归档。", backupId);
+            return repaired;
+        }
+        catch (Exception exception)
+        {
+            logger.LogError(exception, "失效共享修复失败，旧历史及当前资源现场保留，事务 {BackupId}。", backupId);
+            throw;
+        }
+    }
+
+    /// <summary>在同一游戏锁内归档单目标失效清单，再通过正常事务保留当前目录重新共享。</summary>
+    private ShareBackup? RepairInvalidSharingCore(string backupId)
+    {
+        ResourcePathValidation.ValidateId(backupId);
+        EnsureStopped();
+        ResourcePathValidation.EnsureNoReparseAncestors(stateDirectory);
+        var manifest = Path.Combine(stateDirectory, backupId + ".json");
+        var backup = ReadBackup(manifest);
+        var game = ResourcePathValidation.Game(backup.GamePath);
+        ResourcePathValidation.State(stateDirectory, game);
+        using var transactionLock = AcquireGameLock(game);
+        var originalText = files.ReadText(manifest);
+        backup = ReadBackup(manifest);
+        if (!ResourcePathValidation.Equal(backup.GamePath, game)) throw new InvalidOperationException("修复期间清单游戏路径已改变，保留现场。");
+        if (backup.Restored || backup.Entries.Count != 1 || backup.Entries[0].Restored || !backup.Entries[0].OriginalExisted)
+            throw new InvalidOperationException("修复仅适用于原备份已删除的单目标未还原事务，请逐条核对其他记录。");
+        var entry = backup.Entries[0];
+        var currentIdentity = ValidateRepairCandidate(backup, entry);
+        var history = Path.Combine(stateDirectory, "invalid-history");
+        var archived = Path.Combine(history, backupId + ".json");
+        ResourcePathValidation.State(history, game);
+        files.CreateDirectory(history);
+        ResourcePathValidation.State(history, game);
+        if (files.Attributes(archived) is not null) throw new InvalidOperationException($"失效历史已存在，保留当前清单：{archived}");
+        EnsureStopped();
+        if (!string.Equals(currentIdentity, ValidateRepairCandidate(backup, entry), StringComparison.Ordinal))
+            throw new InvalidOperationException("归档前当前目标目录已被替换，保留现场。");
+        ReadBackup(manifest);
+        if (!string.Equals(originalText, files.ReadText(manifest), StringComparison.Ordinal))
+            throw new InvalidOperationException("归档前旧清单内容已改变，保留现场。");
+        ResourcePathValidation.State(history, game);
+        // 原始字节原子移动到失效历史，保留旧 Restored=false 的真实事实。
+        files.MoveFile(manifest, archived);
+        logger.LogDebug("失效资源事务 {BackupId} 原样归档至 {ArchivePath}；当前目录将由新事务保留。", backupId, archived);
+        // 归档后发生错误时保留新事务现场；旧清单不回搬，不造成两个活动事务重叠。
+        return EnableSharingCore(game, Path.GetFileName(Path.GetDirectoryName(backup.SourcePath)!), [Path.GetFileName(Path.GetDirectoryName(entry.ResourcePath)!)], currentIdentity);
+    }
+
+    /// <summary>核对旧备份和暂存均缺失、当前目录为不同身份的真实目录，且没有其他活动依赖。</summary>
+    private string ValidateRepairCandidate(ShareBackup backup, ShareEntry entry)
+    {
+        ValidateMutationPaths(backup, entry);
+        if (files.Attributes(entry.BackupPath) is not null || files.Attributes(StagingPath(backup, entry)) is not null)
+            throw new InvalidOperationException("原备份或暂存目录仍存在，请使用还原或先检查现场。");
+        if (files.Attributes(entry.ResourcePath) is not { } attributes || (attributes & FileAttributes.Directory) == 0 || (attributes & FileAttributes.ReparsePoint) != 0)
+            throw new InvalidOperationException("修复目标必须是当前已存在的独立资源目录，请先刷新检查。");
+        var currentIdentity = JunctionOperations.GetDirectoryIdentity(entry.ResourcePath);
+        if (string.Equals(currentIdentity, originalDirectoryIdentities[backup.Id][entry.ResourcePath], StringComparison.Ordinal))
+            throw new InvalidOperationException("当前目录仍是旧原资源，请使用正常还原完成记录。");
+        ResourcePathValidation.RealDirectory(backup.SourcePath);
+        var source = ScanProfiles(backup.GamePath).FirstOrDefault(profile => ResourcePathValidation.Equal(profile.ResourcePath, backup.SourcePath));
+        if (source is null || source.IsLinked || source.Bytes <= 0)
+            throw new InvalidOperationException("来源未成功扫描到独立下载资源，旧记录保持活动状态。");
+        var others = GetBackups(backup.GamePath).Where(item => !item.Restored && !string.Equals(item.Id, backup.Id, StringComparison.Ordinal));
+        if (others.Any(item => ResourcePathValidation.Equal(item.SourcePath, entry.ResourcePath) ||
+            item.Entries.Any(other => !other.Restored && ResourcePathValidation.Equal(other.ResourcePath, entry.ResourcePath))))
+            throw new InvalidOperationException("当前目标仍被其他活动事务使用，请先处理其依赖。");
+        return currentIdentity;
     }
 
     /// <summary>按持久清单和实际目录身份恢复资源，保存每一步完成状态。</summary>
