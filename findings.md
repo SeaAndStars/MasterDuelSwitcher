@@ -39,3 +39,10 @@
 - 对本轮 11 个已访问标识计算，只有第 4 包 `513ac00000000000` 距离为 4；首包 `519998a8cc000000` 距离为 12。`Visited.Any(SameFingerprint)` 的四位容差把新包误作历史包。
 - 上一阶段用户日志已真实执行购买、跳过、确认并打开 6 包；新请求为 OCR 标题轮次、3 秒主动恢复、加速与指数确认重试。
 - 发布实测 NU1505：全局 RuntimeFrameworkVersion=10.0.10 同时污染 Windows SDK 的 runtime pack；改为独立 MasterDuelRuntimeVersion 与 .NET 框架引用元数据，Desktop 根运行包同版本固定。最终 deps 核验 NETCore/Desktop=10.0.10，Windows SDK=10.0.19041.57，发布 exit0。依据 SDK 官方 ProcessFrameworkReferences 的框架引用元数据优先级：https://raw.githubusercontent.com/dotnet/sdk/v10.0.201/src/Tasks/Microsoft.NET.Build.Tasks/ProcessFrameworkReferences.cs
+
+## 2026-10-04：左侧导航底部
+
+- 本机 WPF UI 4.3.0 官方模板的主菜单为星号行、设置与 PaneFooter 为底部自动行。Shell 的 MainNavigation 仅使用 Workspace 第零行，日志占第一行，真实 STA 红灯测得页脚距工作区底部 128px。
+- 左栏跨两行，完整 StatusRegion 包含原有18px下边距；Views 根据 SizeChanged 同步仅影响官方右侧内容的 FrameMargin。完整模板继续使用，无固定日志高度和数据层布局逻辑。官方模板证据：https://raw.githubusercontent.com/lepoco/wpfui/153baadeaf475875a81a4605881ca5c2dbe53972/src/Wpf.Ui/Controls/NavigationView/NavigationViewCompact.xaml
+- 保留原5秒关闭断言。两次默认并行全量运行受既有关闭后 Dispatcher continuation 延迟影响（服务清理81ms、Closed95ms、命令恢复9.493s）。未修改生产关闭逻辑、原断言或超时；最终串行完整App230/230通过、零跳过，所有App行/分支100%。串行配置使用 xUnit.ParallelizeTestCollections=false，测试范围完整；此前失败TRX继续保留。
+- 最新实际UiProbe80/80通过：标准浅色、标准深色与最小深色中日志展开/收起后，页脚距工作区底部18px、设置位于其上、右侧页面避让日志；三尺寸STA矩阵包含加高窗口。中文注释审计51文件1031声明零缺口。合并覆盖3659/3664行、1855/1857分支，唯一缺口仍为2项延后资源进程测试。

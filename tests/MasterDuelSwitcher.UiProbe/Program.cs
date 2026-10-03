@@ -55,6 +55,7 @@ public static class Program
                 await viewModel.InitializeAsync();
                 await WaitForReady(window);
                 Assert(window.ActualWidth >= 900 && window.ActualHeight >= 620, "实际窗口尺寸");
+                await VerifyNavigationFooterAsync(window, provider.GetRequiredService<AccountsPage>(), "标准浅色");
                 await VerifyAccountFeaturesAsync(window, provider.GetRequiredService<AccountsPage>(), isolatedState);
                 Screenshot(window, Path.Combine(output, "accounts-light.png"));
                 await NavigateAsync(window, provider.GetRequiredService<ResourcesPage>());
@@ -76,6 +77,7 @@ public static class Program
                 await Task.Delay(200);
                 Pump();
                 Assert(new SettingsStore(isolatedState).Load().DarkTheme, "深色主题配置已保存");
+                await VerifyNavigationFooterAsync(window, settingsPage, "标准深色");
                 Screenshot(window, Path.Combine(output, "settings-dark.png"));
                 await NavigateAsync(window, freePacksPage);
                 Screenshot(window, Path.Combine(output, "free-packs-dark.png"));
@@ -84,6 +86,7 @@ public static class Program
                 window.Width = 900;
                 window.Height = 620;
                 Pump();
+                await VerifyNavigationFooterAsync(window, provider.GetRequiredService<AccountsPage>(), "最小深色");
                 Screenshot(window, Path.Combine(output, "accounts-compact-dark.png"));
                 Assert(Find<TextBlock>(window, "StatusText").IsVisible, "状态区域可见");
                 File.WriteAllText(Path.Combine(output, "ui-verification.json"), JsonSerializer.Serialize(new
@@ -114,6 +117,47 @@ public static class Program
         app.Run();
         Console.WriteLine($"WPF 实际窗口检查：{Checks.Count} 项，退出码 {result}");
         return result;
+    }
+
+    /// <summary>真实窗口在主题切换、缩放与日志折叠后，导航设置及状态信息始终贴近工作区底部。</summary>
+    private static async Task VerifyNavigationFooterAsync(MainWindow window, Page page, string layout)
+    {
+        var workspace = Find<Grid>(window, "Workspace");
+        var region = Find<Border>(window, "StatusRegion");
+        var inner = (Border)region.Child;
+        var expander = ((StackPanel)inner.Child).Children.OfType<Wpf.Ui.Controls.CardExpander>().Single();
+        var logs = Find<ListBox>(window, "StatusLog");
+        var footer = Find<StackPanel>(window, "NavigationStatusFooter");
+        var settings = Find<Wpf.Ui.Controls.NavigationViewItem>(window, "SettingsNav");
+        Rect? fixedBounds = null;
+        try
+        {
+            foreach (var expanded in new[] { false, true })
+            {
+                expander.IsExpanded = expanded;
+                for (var attempt = 0; attempt < 50 && logs.IsVisible != expanded; attempt++) await Task.Delay(10);
+                Pump();
+                window.UpdateLayout();
+                var workspaceBounds = new Rect(workspace.TranslatePoint(new Point(), window), workspace.RenderSize);
+                var footerBounds = new Rect(footer.TranslatePoint(new Point(), window), footer.RenderSize);
+                var settingsBounds = new Rect(settings.TranslatePoint(new Point(), window), settings.RenderSize);
+                var regionTop = region.TranslatePoint(new Point(), window).Y;
+                var pageBottom = page.TranslatePoint(new Point(0, page.ActualHeight), window).Y;
+                Assert(logs.IsVisible == expanded, $"{layout}日志状态为{expanded}");
+                Assert(workspaceBounds.Bottom - footerBounds.Bottom is >= 17 and <= 19, $"{layout}导航信息固定底部（日志{expanded}）");
+                Assert(settingsBounds.Bottom <= footerBounds.Top && footerBounds.Top - settingsBounds.Bottom <= 24, $"{layout}设置位于底部信息上方（日志{expanded}）");
+                Assert(pageBottom <= regionTop + 1, $"{layout}右侧页面避让日志区域（日志{expanded}）");
+                if (fixedBounds is { } previous) Assert(previous == footerBounds, $"{layout}展开日志不移动左侧页脚");
+                fixedBounds = footerBounds;
+            }
+        }
+        finally
+        {
+            expander.IsExpanded = false;
+            for (var attempt = 0; attempt < 50 && logs.IsVisible; attempt++) await Task.Delay(10);
+            Pump();
+            window.UpdateLayout();
+        }
     }
 
     /// <summary>等待实际异步发现结束，避免对启动动画期间的状态作断言。</summary>

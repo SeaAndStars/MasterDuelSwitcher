@@ -77,9 +77,11 @@ OCR 使用 Windows 内置简体中文模型，离线识别，无额外模型下�
 
 停止原因写入系统data目录运行/Debug日志。Debug记录免费标记（FreeOffer）、识别置信度（Confidence）、OCR费用证据和卡包标题、局部宝石匹配、图像指纹、轮次判定、恢复状态、确认重试、点击坐标，以及预期/实际窗口句柄（HWND）、前台窗口、进程和可见状态；识别异常的最后有效画面保存在`%LOCALAPPDATA%\MasterDuelSwitcher\free-pack-diagnostics`，最多保留5张。
 
-本轮 Core 1085 项、App 230 项通过，均零跳过；五页真实窗口验证53项通过，25/25账号头像完整解码。免费开包状态机、OpenCV识别、Windows窗口边界、费用OCR及App的行和分支覆盖均100%。保留正在运行的游戏，两项ResourceProcessTests延后，全部生产代码合并覆盖暂为3657/3662行、1854/1856分支；完整100%门禁需游戏退出后执行原验收脚本。
+左侧“设置”、安装检测结果及管理员信息固定在窗口底部，展开右侧操作记录时位置保持不变。右侧页面与滚动视口为日志区域保留实际空间；普通、最小及加高窗口均已验证。
 
-win-x64自包含包实测离线OpenCV与Windows OCR识别5/5通过，并验证实际EXE嵌入requireAdministrator及PerMonitorV2清单。本次Windows管理员启动提示被取消，实际提升令牌和发布程序SQLite启动验证待确认UAC后完成；新版完整游戏流程也待实际验收。
+Core 1085 项已通过，本轮完整 App 串行运行230项通过，均零跳过；五页真实窗口验证80项通过，25/25账号头像完整解码。免费开包状态机、OpenCV识别、Windows窗口边界、费用OCR及App的行和分支覆盖均100%。保留正在运行的游戏，两项ResourceProcessTests延后，全部生产代码合并覆盖暂为3659/3664行、1855/1857分支；完整100%门禁需游戏退出后执行原验收脚本。
+
+上一轮自包含离线OpenCV与Windows OCR识别5/5通过；本轮仅修复导航布局，并核验实际EXE嵌入requireAdministrator及PerMonitorV2清单。上一轮Windows管理员启动提示被取消，实际提升令牌和发布程序SQLite启动验证待确认UAC后完成；新版完整游戏流程也待实际验收。
 
 ## 日志
 

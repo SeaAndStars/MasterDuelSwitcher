@@ -23,7 +23,8 @@
         <!-- 工作区包含官方导航和实际独立 Page，由同一个忙碌状态约束交互。 -->
         <Grid x:Name="Workspace" Grid.Row="1" IsEnabled="{Binding Workspace.IsReady}">
             <Grid.RowDefinitions><RowDefinition Height="*" /><RowDefinition Height="Auto" /></Grid.RowDefinitions>
-            <ui:NavigationView x:Name="MainNavigation" PaneDisplayMode="Left" IsPaneOpen="True" OpenPaneLength="182"
+            <!-- 左栏贯穿日志行，官方右侧内容按日志实际高度留白。 -->
+            <ui:NavigationView x:Name="MainNavigation" Grid.RowSpan="2" PaneDisplayMode="Left" IsPaneOpen="True" OpenPaneLength="182"
                                ClipToBounds="True"
                                IsPaneToggleVisible="False" IsBackButtonVisible="Collapsed" IsTopSeparatorVisible="False"
                                FrameMargin="0" Padding="28,0,28,0" SelectionChanged="OnNavigationSelectionChanged"
@@ -73,14 +74,17 @@
                 </ui:NavigationView.Header>
             </ui:NavigationView>
             <!-- 固定状态区占独立布局行，页面和滚动内容始终在它上方。 -->
-            <Border Grid.Row="1" Background="{DynamicResource ApplicationBackgroundBrush}"
-                    BorderBrush="{DynamicResource CardStrokeColorDefaultBrush}" BorderThickness="0,1,0,0" Margin="218,0,28,18" Padding="0,12,0,0">
-                <StackPanel>
-                    <TextBlock x:Name="StatusText" Text="{Binding Workspace.Status}" Style="{StaticResource MutedStyle}" FontSize="11" MaxHeight="44" TextTrimming="CharacterEllipsis" AutomationProperties.AutomationId="StatusText" />
-                    <ui:CardExpander Header="操作记录" IsExpanded="False" FontSize="14" Margin="0,4,0,0">
-                        <ListBox x:Name="StatusLog" ItemsSource="{Binding Workspace.Logs}" MaxHeight="95" FontSize="11" BorderThickness="0" Background="Transparent" Margin="0,7,0,0" AutomationProperties.AutomationId="StatusLog" />
-                    </ui:CardExpander>
-                </StackPanel>
+            <!-- 外层测量包括原有底部间距，日志展开时右侧视口随之更新。 -->
+            <Border x:Name="StatusRegion" Grid.Row="1" SizeChanged="OnStatusRegionSizeChanged">
+                <Border Background="{DynamicResource ApplicationBackgroundBrush}"
+                        BorderBrush="{DynamicResource CardStrokeColorDefaultBrush}" BorderThickness="0,1,0,0" Margin="218,0,28,18" Padding="0,12,0,0">
+                    <StackPanel>
+                        <TextBlock x:Name="StatusText" Text="{Binding Workspace.Status}" Style="{StaticResource MutedStyle}" FontSize="11" MaxHeight="44" TextTrimming="CharacterEllipsis" AutomationProperties.AutomationId="StatusText" />
+                        <ui:CardExpander Header="操作记录" IsExpanded="False" FontSize="14" Margin="0,4,0,0">
+                            <ListBox x:Name="StatusLog" ItemsSource="{Binding Workspace.Logs}" MaxHeight="95" FontSize="11" BorderThickness="0" Background="Transparent" Margin="0,7,0,0" AutomationProperties.AutomationId="StatusLog" />
+                        </ui:CardExpander>
+                    </StackPanel>
+                </Border>
             </Border>
         </Grid>
         <!-- 异步操作遮罩覆盖全部页面，防止重复提交。 -->

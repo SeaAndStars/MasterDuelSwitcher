@@ -31,6 +31,10 @@ public partial class MainWindow : FluentWindow
     /// <summary>只同步已被官方导航选中的页面标题，不执行页面业务。</summary>
     private void OnNavigationSelectionChanged(NavigationView sender, RoutedEventArgs e) => _viewModel.CurrentPage = sender.SelectedItem?.TargetPageTag ?? "Accounts";
 
+    /// <summary>完整日志区重新测量后，仅为官方右侧页面预留底部空间，左侧导航保持全高。</summary>
+    private void OnStatusRegionSizeChanged(object sender, SizeChangedEventArgs e) =>
+        MainNavigation.FrameMargin = new Thickness(0, 0, 0, e.NewSize.Height);
+
     /// <summary>免费开包停止并清理后关闭，其他事务执行期间继续保留窗口。</summary>
     private async void OnWindowClosing(object? sender, CancelEventArgs e)
     {

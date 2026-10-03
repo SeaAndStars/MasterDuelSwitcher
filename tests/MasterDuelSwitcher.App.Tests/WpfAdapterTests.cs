@@ -521,7 +521,7 @@ public sealed class WpfAdapterTests
         finally { item.SetCurrentValue(Wpf.Ui.Controls.NavigationViewItem.TargetPageTagProperty, previousTag); }
     }
 
-    /// <summary>实际设置页和滚动视口始终位于独立状态行上方，展开日志后仍保持边界。</summary>
+    /// <summary>导航页脚固定工作区底部，实际设置页和滚动视口始终位于独立状态行上方。</summary>
     private static async Task VerifyStatusLayoutAsync(MainWindow window, Page page, Wpf.Ui.Controls.NavigationView navigation)
     {
         await Task.Delay(navigation.TransitionDuration);
@@ -541,26 +541,43 @@ public sealed class WpfAdapterTests
         var previousHeight = window.Height;
         try
         {
-            window.Width = window.MinWidth;
-            window.Height = window.MinHeight;
-            foreach (var expanded in new[] { false, true })
+            var footer = Assert.IsType<StackPanel>(window.FindName("NavigationStatusFooter"));
+            var settings = Assert.IsType<Wpf.Ui.Controls.NavigationViewItem>(window.FindName("SettingsNav"));
+            var lastMenu = Assert.IsType<Wpf.Ui.Controls.NavigationViewItem>(window.FindName("FreePacksNav"));
+            foreach (var size in new[] { (previousWidth, previousHeight), (window.MinWidth, window.MinHeight), (1100d, 1000d) })
             {
-                expander.IsExpanded = expanded;
-                await Dispatcher.Yield(DispatcherPriority.ApplicationIdle);
-                UpdateLayoutWithDiagnostics(window, "status-expanded-" + expanded);
-                scrollViewer.ScrollToEnd();
-                await Dispatcher.Yield(DispatcherPriority.ApplicationIdle);
-                UpdateLayoutWithDiagnostics(window, "status-scrolled-" + expanded);
-                Assert.True(status.IsVisible);
-                Assert.True(statusBorder.ActualHeight > 0);
-                Assert.Equal(expanded, logs.IsVisible);
-                var statusTop = statusBorder.TransformToAncestor(window).Transform(new Point()).Y;
-                var navigationBottom = navigation.TransformToAncestor(window).Transform(new Point(0, navigation.ActualHeight)).Y;
-                var pageBottom = page.TransformToAncestor(window).Transform(new Point(0, page.ActualHeight)).Y;
-                var viewportBottom = scrollViewer.TransformToAncestor(window).Transform(new Point(0, scrollViewer.ActualHeight)).Y;
-                Assert.True(navigationBottom <= statusTop + 1, $"导航下沿 {navigationBottom} 超过状态区上沿 {statusTop}。");
-                Assert.True(pageBottom <= statusTop + 1, $"页面下沿 {pageBottom} 超过状态区上沿 {statusTop}。");
-                Assert.True(viewportBottom <= statusTop + 1, $"滚动视口下沿 {viewportBottom} 超过状态区上沿 {statusTop}。");
+                window.Width = size.Item1;
+                window.Height = size.Item2;
+                Rect? fixedFooterBounds = null;
+                foreach (var expanded in new[] { false, true })
+                {
+                    expander.IsExpanded = expanded;
+                    // 窗口尺寸矩阵会重复收起日志，等待官方折叠动画完成后核验真实可见状态。
+                    for (var attempt = 0; attempt < 50 && logs.IsVisible != expanded; attempt++) await Task.Delay(10);
+                    await Dispatcher.Yield(DispatcherPriority.ApplicationIdle);
+                    UpdateLayoutWithDiagnostics(window, "status-expanded-" + expanded);
+                    scrollViewer.ScrollToEnd();
+                    await Dispatcher.Yield(DispatcherPriority.ApplicationIdle);
+                    UpdateLayoutWithDiagnostics(window, "status-scrolled-" + expanded);
+                    Assert.True(status.IsVisible);
+                    Assert.True(statusBorder.ActualHeight > 0);
+                    Assert.Equal(expanded, logs.IsVisible);
+                    var statusTop = BoundsInWindow(statusBorder, window).Top;
+                    var workspaceBottom = BoundsInWindow(workspaceGrid, window).Bottom;
+                    var footerBounds = BoundsInWindow(footer, window);
+                    var settingsBounds = BoundsInWindow(settings, window);
+                    var lastMenuBounds = BoundsInWindow(lastMenu, window);
+                    Assert.InRange(workspaceBottom - footerBounds.Bottom, 17d, 19d);
+                    Assert.True(settingsBounds.Bottom <= footerBounds.Top, "设置菜单与底部状态信息发生重叠。");
+                    Assert.InRange(footerBounds.Top - settingsBounds.Bottom, 0d, 24d);
+                    Assert.True(lastMenuBounds.Bottom <= settingsBounds.Top, "设置菜单与主导航发生重叠。");
+                    if (fixedFooterBounds is { } previousBounds) Assert.Equal(previousBounds, footerBounds);
+                    fixedFooterBounds = footerBounds;
+                    var pageBottom = BoundsInWindow(page, window).Bottom;
+                    var viewportBottom = BoundsInWindow(scrollViewer, window).Bottom;
+                    Assert.True(pageBottom <= statusTop + 1, $"页面下沿 {pageBottom} 超过状态区上沿 {statusTop}。");
+                    Assert.True(viewportBottom <= statusTop + 1, $"滚动视口下沿 {viewportBottom} 超过状态区上沿 {statusTop}。");
+                }
             }
         }
         finally
