@@ -145,13 +145,20 @@ public sealed class SteamDiscoveryService : ISteamDiscoveryService
                 PersonaName = node.Find("PersonaName")?.Value ?? "",
                 RememberPassword = node.Find("RememberPassword")?.Value == "1",
                 AllowAutoLogin = node.Find("AllowAutoLogin")?.Value == "1",
-                MostRecent = node.Find("MostRecent")?.Value == "1"
+                MostRecent = node.Find("MostRecent")?.Value == "1",
+                LastLoginTimestamp = ParseLastLoginTimestamp(node.Find("Timestamp")?.Value)
             })
             .Where(account => !string.IsNullOrWhiteSpace(account.AccountName))
             .OrderByDescending(account => account.MostRecent)
+            .ThenByDescending(account => account.LastLoginTimestamp)
             .ThenBy(account => account.DisplayName, StringComparer.OrdinalIgnoreCase)
+            .ThenBy(account => account.SteamId, StringComparer.Ordinal)
             .ToArray();
     }
+
+    /// <summary>只接受非负十进制整数秒，缺失、非法、负数和越界时间戳使用零。</summary>
+    private static long ParseLastLoginTimestamp(string? timestamp) =>
+        long.TryParse(timestamp, NumberStyles.None, CultureInfo.InvariantCulture, out long seconds) ? seconds : 0;
 
     /// <summary>从当前用户和两种机器注册表视图中查找 Steam 可执行文件。</summary>
     private string FindSteamInstallation()

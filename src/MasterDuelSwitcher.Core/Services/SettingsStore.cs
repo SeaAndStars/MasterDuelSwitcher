@@ -30,6 +30,11 @@ public sealed class SettingsStore : ISettingsStore
             Hidden INTEGER NOT NULL DEFAULT 0,
             Present INTEGER NOT NULL DEFAULT 0
         );
+        CREATE TABLE IF NOT EXISTS account_extensions (
+            SteamId TEXT PRIMARY KEY NOT NULL,
+            Starred INTEGER NOT NULL DEFAULT 0,
+            LastLoginTimestamp INTEGER NOT NULL DEFAULT 0
+        );
         """;
 
     /// <summary>指向固定数据目录的连接字符串，关闭池化以便即时释放文件句柄。</summary>
@@ -83,17 +88,24 @@ public sealed class SettingsStore : ISettingsStore
                 if (reader.GetBoolean(3)) settings.HiddenAccounts.Add(steamId);
             }
         }
+        using (var command = CreateCommand(connection, transaction,
+            "SELECT SteamId FROM account_extensions WHERE Starred <> 0"))
+        {
+            using var reader = command.ExecuteReader();
+            while (reader.Read()) settings.StarredAccounts.Add(reader.GetString(0));
+        }
         transaction.Commit();
         return settings;
     });
 
-    /// <summary>原子保存偏好、备注、映射及隐藏状态，并保留 Steam 元数据及存在标记。</summary>
+    /// <summary>原子保存偏好、备注、映射、隐藏和星标，并保留登录时间及存在标记。</summary>
     public void Save(AppSettings settings)
     {
         ArgumentNullException.ThrowIfNull(settings);
         var notes = settings.AccountNotes ?? [];
         var bindings = settings.AccountBindings ?? [];
         var hidden = settings.HiddenAccounts ?? [];
+        var starred = settings.StarredAccounts ?? [];
         AccessDatabase(nameof(Save), connection =>
         {
             using var transaction = connection.BeginTransaction();
@@ -101,6 +113,7 @@ public sealed class SettingsStore : ISettingsStore
                 UPDATE settings SET SteamPath = $steam, GamePath = $game,
                     SourceProfile = $source, DarkTheme = $dark WHERE Id = 1;
                 UPDATE accounts SET Notes = '', ResourceFolder = '', Hidden = 0;
+                UPDATE account_extensions SET Starred = 0;
                 """))
             {
                 command.Parameters.AddWithValue("$steam", settings.SteamPath ?? "");
@@ -123,12 +136,21 @@ public sealed class SettingsStore : ISettingsStore
                 command.Parameters.AddWithValue("$hidden", hidden.Contains(steamId));
                 command.ExecuteNonQuery();
             }
+            foreach (var steamId in starred)
+            {
+                using var command = CreateCommand(connection, transaction, """
+                    INSERT INTO account_extensions (SteamId, Starred) VALUES ($id, 1)
+                    ON CONFLICT (SteamId) DO UPDATE SET Starred = excluded.Starred;
+                    """);
+                command.Parameters.AddWithValue("$id", steamId);
+                command.ExecuteNonQuery();
+            }
             transaction.Commit();
             return true;
         });
     }
 
-    /// <summary>事务同步 Steam 元数据；移除账号仅标记缺席，不删除备注和映射。</summary>
+    /// <summary>事务同步 Steam 元数据和登录时间；移除账号仅标记缺席，保留全部人工字段及星标。</summary>
     public void SynchronizeAccounts(IReadOnlyList<SteamAccount> accounts)
     {
         ArgumentNullException.ThrowIfNull(accounts);
@@ -147,6 +169,8 @@ public sealed class SettingsStore : ISettingsStore
                     ON CONFLICT (SteamId) DO UPDATE SET AccountName = excluded.AccountName,
                         PersonaName = excluded.PersonaName, RememberPassword = excluded.RememberPassword,
                         AllowAutoLogin = excluded.AllowAutoLogin, MostRecent = excluded.MostRecent, Present = 1;
+                    INSERT INTO account_extensions (SteamId, LastLoginTimestamp) VALUES ($id, $timestamp)
+                    ON CONFLICT (SteamId) DO UPDATE SET LastLoginTimestamp = excluded.LastLoginTimestamp;
                     """);
                 command.Parameters.AddWithValue("$id", account.SteamId);
                 command.Parameters.AddWithValue("$name", account.AccountName);
@@ -154,6 +178,7 @@ public sealed class SettingsStore : ISettingsStore
                 command.Parameters.AddWithValue("$remember", account.RememberPassword);
                 command.Parameters.AddWithValue("$auto", account.AllowAutoLogin);
                 command.Parameters.AddWithValue("$recent", account.MostRecent);
+                command.Parameters.AddWithValue("$timestamp", account.LastLoginTimestamp);
                 command.ExecuteNonQuery();
             }
             transaction.Commit();
@@ -161,14 +186,16 @@ public sealed class SettingsStore : ISettingsStore
         });
     }
 
-    /// <summary>读取当前仍存在的账号；最近使用账号优先，同优先级按账号标识排序。</summary>
+    /// <summary>读取当前仍存在的账号；最近使用优先，其次按登录时间倒序和账号标识排序。</summary>
     public IReadOnlyList<SteamAccount> GetAccounts() => AccessDatabase<IReadOnlyList<SteamAccount>>(nameof(GetAccounts), connection =>
     {
         var accounts = new List<SteamAccount>();
         using var command = connection.CreateCommand();
         command.CommandText = """
-            SELECT SteamId, AccountName, PersonaName, RememberPassword, AllowAutoLogin, MostRecent
-            FROM accounts WHERE Present = 1 ORDER BY MostRecent DESC, SteamId ASC
+            SELECT a.SteamId, a.AccountName, a.PersonaName, a.RememberPassword, a.AllowAutoLogin, a.MostRecent,
+                COALESCE(e.LastLoginTimestamp, 0)
+            FROM accounts AS a LEFT JOIN account_extensions AS e ON a.SteamId = e.SteamId
+            WHERE a.Present = 1 ORDER BY a.MostRecent DESC, COALESCE(e.LastLoginTimestamp, 0) DESC, a.SteamId ASC
             """;
         using var reader = command.ExecuteReader();
         while (reader.Read())
@@ -176,7 +203,8 @@ public sealed class SettingsStore : ISettingsStore
             accounts.Add(new SteamAccount
             {
                 SteamId = reader.GetString(0), AccountName = reader.GetString(1), PersonaName = reader.GetString(2),
-                RememberPassword = reader.GetBoolean(3), AllowAutoLogin = reader.GetBoolean(4), MostRecent = reader.GetBoolean(5)
+                RememberPassword = reader.GetBoolean(3), AllowAutoLogin = reader.GetBoolean(4), MostRecent = reader.GetBoolean(5),
+                LastLoginTimestamp = reader.GetInt64(6)
             });
         }
         return accounts;

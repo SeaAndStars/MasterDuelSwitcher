@@ -15,6 +15,8 @@ public sealed class SteamAccount
     public bool AllowAutoLogin { get; init; }
     /// <summary>是否为 Steam 最近使用的账号。</summary>
     public bool MostRecent { get; init; }
+    /// <summary>Steam 记录的最后登录 Unix 时间戳，单位为秒；缺失或非法时为零。</summary>
+    public long LastLoginTimestamp { get; init; }
     /// <summary>界面优先使用昵称，缺失时使用登录名。</summary>
     public string DisplayName => string.IsNullOrWhiteSpace(PersonaName) ? AccountName : PersonaName;
 }

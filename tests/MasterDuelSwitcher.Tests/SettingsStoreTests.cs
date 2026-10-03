@@ -29,6 +29,7 @@ public sealed class SettingsStoreTests : IDisposable
         Assert.Empty(settings.AccountBindings);
         Assert.Empty(settings.AccountNotes);
         Assert.Empty(settings.HiddenAccounts);
+        Assert.Empty(settings.StarredAccounts);
         Assert.Empty(store.GetAccounts());
         Assert.Equal("SQLite format 3\0", System.Text.Encoding.ASCII.GetString(File.ReadAllBytes(Path.Combine(store.StateDirectory, "accounts.db")), 0, 16));
         Assert.Empty(Directory.GetFiles(store.StateDirectory, "*.json"));
@@ -50,7 +51,8 @@ public sealed class SettingsStoreTests : IDisposable
             SourceProfile = "源目录'; DROP TABLE settings;--", DarkTheme = true,
             AccountNotes = new() { [accountId] = "中文备注 ' ; DROP TABLE accounts;--", ["note-only"] = "仅备注" },
             AccountBindings = new() { [accountId] = "资源映射';--", ["binding-only"] = "a1b2c3d4" },
-            HiddenAccounts = [accountId, "hidden-only"]
+            HiddenAccounts = [accountId, "hidden-only"],
+            StarredAccounts = [accountId, "离线星标'; DROP TABLE settings;--"]
         });
         var loaded = new SettingsStore(_directory).Load();
         Assert.Equal("D:\\游戏库\\Steam';--", loaded.SteamPath);
@@ -63,6 +65,9 @@ public sealed class SettingsStoreTests : IDisposable
         Assert.Equal("a1b2c3d4", loaded.AccountBindings["binding-only"]);
         Assert.Equal(2, loaded.HiddenAccounts.Count);
         Assert.Contains("hidden-only", loaded.HiddenAccounts);
+        Assert.Equal(2, loaded.StarredAccounts.Count);
+        Assert.Contains(accountId, loaded.StarredAccounts);
+        Assert.Contains("离线星标'; DROP TABLE settings;--", loaded.StarredAccounts);
         Assert.Empty(store.GetAccounts());
         Assert.Single(Directory.GetFiles(_directory));
         using var database = OpenDatabase(_directory);
@@ -78,7 +83,7 @@ public sealed class SettingsStoreTests : IDisposable
     {
         var store = new SettingsStore(_directory);
         store.SynchronizeAccounts([new SteamAccount { SteamId = "1", AccountName = "account", PersonaName = "昵称" }]);
-        store.Save(new AppSettings { SourceProfile = "11223344", DarkTheme = true, AccountNotes = new() { ["1"] = "旧备注" }, AccountBindings = new() { ["1"] = "aabbccdd" }, HiddenAccounts = ["1"] });
+        store.Save(new AppSettings { SourceProfile = "11223344", DarkTheme = true, AccountNotes = new() { ["1"] = "旧备注" }, AccountBindings = new() { ["1"] = "aabbccdd" }, HiddenAccounts = ["1"], StarredAccounts = ["1"] });
         store.Save(new AppSettings { SourceProfile = "aabbccdd" });
         var loaded = store.Load();
         Assert.Equal("aabbccdd", loaded.SourceProfile);
@@ -86,6 +91,7 @@ public sealed class SettingsStoreTests : IDisposable
         Assert.Empty(loaded.AccountNotes);
         Assert.Empty(loaded.AccountBindings);
         Assert.Empty(loaded.HiddenAccounts);
+        Assert.Empty(loaded.StarredAccounts);
         Assert.Equal("昵称", Assert.Single(store.GetAccounts()).PersonaName);
     }
 
@@ -203,7 +209,7 @@ public sealed class SettingsStoreTests : IDisposable
     public void NullValuesAreNormalizedToDefaults()
     {
         var store = new SettingsStore(_directory);
-        store.Save(new AppSettings { SteamPath = null!, GamePath = null!, SourceProfile = null!, AccountNotes = null!, AccountBindings = null!, HiddenAccounts = null! });
+        store.Save(new AppSettings { SteamPath = null!, GamePath = null!, SourceProfile = null!, AccountNotes = null!, AccountBindings = null!, HiddenAccounts = null!, StarredAccounts = null! });
         var loaded = store.Load();
         Assert.Empty(loaded.SteamPath);
         Assert.Empty(loaded.GamePath);
@@ -211,6 +217,129 @@ public sealed class SettingsStoreTests : IDisposable
         Assert.Empty(loaded.AccountNotes);
         Assert.Empty(loaded.AccountBindings);
         Assert.Empty(loaded.HiddenAccounts);
+        Assert.Empty(loaded.StarredAccounts);
+    }
+
+    /// <summary>真实旧数据库应无损增加扩展表，重复启动保留备注、绑定、隐藏和新星标。</summary>
+    [Fact]
+    public void LegacyDatabaseMigrationPreservesExistingRowsAndNewPreferencesAfterRestart()
+    {
+        ExecuteSql("""
+            CREATE TABLE settings (Id INTEGER PRIMARY KEY CHECK (Id = 1), SteamPath TEXT NOT NULL DEFAULT '',
+                GamePath TEXT NOT NULL DEFAULT '', SourceProfile TEXT NOT NULL DEFAULT '', DarkTheme INTEGER NOT NULL DEFAULT 0);
+            INSERT INTO settings VALUES (1, '旧Steam路径', '旧游戏路径', '1234abcd', 1);
+            CREATE TABLE accounts (SteamId TEXT PRIMARY KEY NOT NULL, AccountName TEXT NOT NULL DEFAULT '',
+                PersonaName TEXT NOT NULL DEFAULT '', RememberPassword INTEGER NOT NULL DEFAULT 0,
+                AllowAutoLogin INTEGER NOT NULL DEFAULT 0, MostRecent INTEGER NOT NULL DEFAULT 0,
+                Notes TEXT NOT NULL DEFAULT '', ResourceFolder TEXT NOT NULL DEFAULT '',
+                Hidden INTEGER NOT NULL DEFAULT 0, Present INTEGER NOT NULL DEFAULT 0);
+            INSERT INTO accounts VALUES ('legacy', '旧登录名', '旧昵称', 1, 1, 1, '旧备注', 'abcd1234', 1, 1);
+            """);
+        var store = new SettingsStore(_directory);
+        var migrated = store.Load();
+        Assert.Equal("旧Steam路径", migrated.SteamPath);
+        Assert.Equal("旧游戏路径", migrated.GamePath);
+        Assert.Equal("1234abcd", migrated.SourceProfile);
+        Assert.True(migrated.DarkTheme);
+        Assert.Equal("旧备注", migrated.AccountNotes["legacy"]);
+        Assert.Equal("abcd1234", migrated.AccountBindings["legacy"]);
+        Assert.Contains("legacy", migrated.HiddenAccounts);
+        Assert.Empty(migrated.StarredAccounts);
+        var legacyAccount = Assert.Single(store.GetAccounts());
+        Assert.Equal("旧昵称", legacyAccount.PersonaName);
+        Assert.True(legacyAccount.RememberPassword);
+        Assert.True(legacyAccount.AllowAutoLogin);
+        Assert.Equal(0, legacyAccount.LastLoginTimestamp);
+        migrated.StarredAccounts.UnionWith(["legacy", "offline"]);
+        store.Save(migrated);
+        store.SynchronizeAccounts([new SteamAccount { SteamId = "legacy", AccountName = "新登录名", LastLoginTimestamp = 5_000_000_000 }]);
+        var restarted = new SettingsStore(_directory);
+        Assert.Equal(5_000_000_000, Assert.Single(restarted.GetAccounts()).LastLoginTimestamp);
+        var loaded = restarted.Load();
+        Assert.Equal(migrated.StarredAccounts.Order(), loaded.StarredAccounts.Order());
+        Assert.Equal("旧备注", loaded.AccountNotes["legacy"]);
+        Assert.Equal("abcd1234", loaded.AccountBindings["legacy"]);
+        Assert.Contains("legacy", loaded.HiddenAccounts);
+        using var database = OpenDatabase(_directory);
+        using var query = database.CreateCommand();
+        query.CommandText = "SELECT COUNT(*) FROM pragma_table_info('accounts')";
+        Assert.Equal(10L, query.ExecuteScalar());
+        Assert.Empty(Directory.GetFiles(_directory, "*.json"));
+    }
+
+    /// <summary>最近使用优先，其余按完整登录时间倒序；刷新、离线和偏好保存均保留星标及元数据。</summary>
+    [Fact]
+    public void LoginTimeSynchronizationOrdersAccountsAndPreservesOfflineStars()
+    {
+        var store = new SettingsStore(_directory);
+        store.Save(new AppSettings { StarredAccounts = ["late", "offline"] });
+        store.SynchronizeAccounts([
+            new SteamAccount { SteamId = "late", LastLoginTimestamp = 5_000_000_000 },
+            new SteamAccount { SteamId = "recent", MostRecent = true, LastLoginTimestamp = 1 },
+            new SteamAccount { SteamId = "b", LastLoginTimestamp = 30 },
+            new SteamAccount { SteamId = "a", LastLoginTimestamp = 30 },
+            new SteamAccount { SteamId = "zero" }
+        ]);
+        var restarted = new SettingsStore(_directory);
+        Assert.Equal(["recent", "late", "a", "b", "zero"], restarted.GetAccounts().Select(account => account.SteamId));
+        Assert.Equal(5_000_000_000, restarted.GetAccounts()[1].LastLoginTimestamp);
+        var settings = restarted.Load();
+        Assert.Equal(["late", "offline"], settings.StarredAccounts.Order());
+        settings.StarredAccounts.Remove("late");
+        restarted.Save(settings);
+        Assert.Equal(5_000_000_000, restarted.GetAccounts()[1].LastLoginTimestamp);
+        restarted.SynchronizeAccounts([]);
+        Assert.Empty(new SettingsStore(_directory).GetAccounts());
+        Assert.Contains("offline", new SettingsStore(_directory).Load().StarredAccounts);
+        restarted.SynchronizeAccounts([new SteamAccount { SteamId = "offline", LastLoginTimestamp = 90 }]);
+        Assert.Equal(90, Assert.Single(new SettingsStore(_directory).GetAccounts()).LastLoginTimestamp);
+        Assert.Contains("offline", new SettingsStore(_directory).Load().StarredAccounts);
+    }
+
+    /// <summary>星标保存中途 SQL 失败应回滚旧星标、设置和人工字段，不改变登录元数据。</summary>
+    [Fact]
+    public void FailedStarSaveRollsBackAllPreferencesAndKeepsLoginTime()
+    {
+        var store = new SettingsStore(_directory);
+        store.SynchronizeAccounts([new SteamAccount { SteamId = "1", LastLoginTimestamp = 123 }]);
+        store.Save(new AppSettings { SteamPath = "原路径", AccountNotes = new() { ["1"] = "原备注" },
+            AccountBindings = new() { ["1"] = "原映射" }, HiddenAccounts = ["1"], StarredAccounts = ["1", "offline"] });
+        ExecuteSql("CREATE TRIGGER reject_star BEFORE INSERT ON account_extensions WHEN NEW.SteamId = 'reject' BEGIN SELECT RAISE(ABORT, 'fixture rejection'); END;");
+        Assert.Throws<InvalidDataException>(() => store.Save(new AppSettings { SteamPath = "新路径",
+            AccountNotes = new() { ["1"] = "新备注" }, StarredAccounts = ["2", "reject"] }));
+        var restarted = new SettingsStore(_directory);
+        var loaded = restarted.Load();
+        Assert.Equal("原路径", loaded.SteamPath);
+        Assert.Equal("原备注", loaded.AccountNotes["1"]);
+        Assert.Equal("原映射", loaded.AccountBindings["1"]);
+        Assert.Contains("1", loaded.HiddenAccounts);
+        Assert.Equal(["1", "offline"], loaded.StarredAccounts.Order());
+        Assert.Equal(123, Assert.Single(restarted.GetAccounts()).LastLoginTimestamp);
+    }
+
+    /// <summary>登录时间同步失败应回滚同批元数据、登录时间及 Present 标记，并保留星标。</summary>
+    [Fact]
+    public void FailedLoginTimeSynchronizationRollsBackWholeBatchAndKeepsStars()
+    {
+        var store = new SettingsStore(_directory);
+        store.SynchronizeAccounts([
+            new SteamAccount { SteamId = "1", AccountName = "original-one", LastLoginTimestamp = 10 },
+            new SteamAccount { SteamId = "2", AccountName = "original-two", LastLoginTimestamp = 20 },
+            new SteamAccount { SteamId = "3", LastLoginTimestamp = 30 }
+        ]);
+        store.Save(new AppSettings { StarredAccounts = ["1", "offline"] });
+        ExecuteSql("CREATE TRIGGER reject_login BEFORE UPDATE OF LastLoginTimestamp ON account_extensions WHEN NEW.LastLoginTimestamp = 999 BEGIN SELECT RAISE(ABORT, 'fixture rejection'); END;");
+        Assert.Throws<InvalidDataException>(() => store.SynchronizeAccounts([
+            new SteamAccount { SteamId = "1", AccountName = "changed-one", LastLoginTimestamp = 100 },
+            new SteamAccount { SteamId = "2", AccountName = "changed-two", LastLoginTimestamp = 999 }
+        ]));
+        var restarted = new SettingsStore(_directory);
+        var accounts = restarted.GetAccounts();
+        Assert.Equal(["3", "2", "1"], accounts.Select(account => account.SteamId));
+        Assert.Equal([30L, 20L, 10L], accounts.Select(account => account.LastLoginTimestamp));
+        Assert.Equal("original-one", accounts[2].AccountName);
+        Assert.Equal("original-two", accounts[1].AccountName);
+        Assert.Equal(["1", "offline"], restarted.Load().StarredAccounts.Order());
     }
 
     /// <summary>所有成功数据库操作应记录 Debug 开始及完成，并且不记录账号正文。</summary>

@@ -15,6 +15,8 @@ public sealed class AppSettings
     public Dictionary<string, string> AccountNotes { get; set; } = [];
     /// <summary>仅在工具中隐藏的账号标识。</summary>
     public HashSet<string> HiddenAccounts { get; set; } = [];
+    /// <summary>用户星标的账号标识，账号暂时离线后仍保留。</summary>
+    public HashSet<string> StarredAccounts { get; set; } = [];
     /// <summary>界面是否使用深色主题。</summary>
     public bool DarkTheme { get; set; }
 }

@@ -453,6 +453,72 @@ public sealed class SteamDiscoveryTests : IDisposable
         Assert.True(accounts[3].AllowAutoLogin);
     }
 
+    /// <summary>验证时间戳只读解析为非负整数秒，缺失、非法及越界值使用零。</summary>
+    [Theory]
+    [InlineData("1712345678", 1712345678L)]
+    [InlineData("9223372036854775807", long.MaxValue)]
+    [InlineData("0", 0L)]
+    [InlineData(null, 0L)]
+    [InlineData("", 0L)]
+    [InlineData(" ", 0L)]
+    [InlineData("-1", 0L)]
+    [InlineData("not-a-timestamp", 0L)]
+    [InlineData("1712345678.5", 0L)]
+    [InlineData("9223372036854775808", 0L)]
+    [InlineData("+1712345678", 0L)]
+    public void ReadAccountsParsesTimestampWithoutChangingLoginConfiguration(string? timestamp, long expectedSeconds)
+    {
+        Directory.CreateDirectory(Path.Combine(root, "config"));
+        string loginFile = Path.Combine(root, "config", "loginusers.vdf");
+        string timestampEntry = timestamp is null ? "" : "Timestamp \"" + timestamp + "\"";
+        string original = "users { 76561198000000001 { AccountName account " + timestampEntry + " } }";
+        File.WriteAllText(loginFile, original);
+
+        var account = Assert.Single(new SteamDiscoveryService().ReadAccounts(root));
+
+        Assert.Equal(expectedSeconds, account.LastLoginTimestamp);
+        Assert.Equal(original, File.ReadAllText(loginFile));
+    }
+
+    /// <summary>验证对象类型的非法时间戳不作为登录时间。</summary>
+    [Fact]
+    public void ReadAccountsTreatsObjectTimestampAsMissing()
+    {
+        Directory.CreateDirectory(Path.Combine(root, "config"));
+        File.WriteAllText(Path.Combine(root, "config", "loginusers.vdf"),
+            "users { 76561198000000001 { AccountName account Timestamp { nested ignored } } }");
+
+        Assert.Equal(0L, Assert.Single(new SteamDiscoveryService().ReadAccounts(root)).LastLoginTimestamp);
+    }
+
+    /// <summary>验证最近账号优先，再按时间降序、显示名及 SteamId 排出稳定顺序。</summary>
+    [Fact]
+    public void ReadAccountsOrdersRecentThenNewestTimestampThenDisplayNameAndSteamId()
+    {
+        Directory.CreateDirectory(Path.Combine(root, "config"));
+        File.WriteAllText(Path.Combine(root, "config", "loginusers.vdf"), """
+            users {
+              76561198000000004 { AccountName fourth PersonaName ALPHA Timestamp 300 }
+              76561198000000005 { AccountName fifth PersonaName Zulu Timestamp 300 }
+              76561198000000008 { AccountName alpha-recent-old MostRecent 1 Timestamp 100 }
+              76561198000000001 { AccountName no-time }
+              76561198000000003 { AccountName third PersonaName alpha Timestamp 300 }
+              76561198000000002 { AccountName bravo Timestamp 300 }
+              76561198000000006 { AccountName newest Timestamp 900 }
+              76561198000000007 { AccountName zulu-recent-new MostRecent 1 Timestamp 200 }
+            }
+            """);
+
+        var accounts = new SteamDiscoveryService().ReadAccounts(root);
+
+        Assert.Equal(new[]
+        {
+            "76561198000000007", "76561198000000008", "76561198000000006", "76561198000000003",
+            "76561198000000004", "76561198000000002", "76561198000000005", "76561198000000001"
+        }, accounts.Select(account => account.SteamId));
+        Assert.Equal(new[] { 200L, 100L, 900L, 300L, 300L, 300L, 300L, 0L }, accounts.Select(account => account.LastLoginTimestamp));
+    }
+
     /// <summary>验证账号读取拒绝缺失的安装目录参数。</summary>
     [Theory]
     [InlineData(null)]
