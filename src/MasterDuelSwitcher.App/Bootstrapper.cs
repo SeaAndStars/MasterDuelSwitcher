@@ -29,6 +29,8 @@ public static class Bootstrapper
         services.AddSingleton<ISteamAccountService>(provider => new SteamAccountService(stateDirectory, logger: provider.GetRequiredService<ILogger<SteamAccountService>>()));
         services.AddSingleton<IResourceSharingService>(provider => new ResourceSharingService(stateDirectory, logger: provider.GetRequiredService<ILogger<ResourceSharingService>>()));
         services.AddSingleton<IAccountAvatarService>(provider => new AccountAvatarService(provider.GetRequiredService<ISettingsStore>().StateDirectory, logger: provider.GetRequiredService<ILogger<AccountAvatarService>>()));
+        services.AddSingleton<IPackTextReader, WindowsPackTextReader>();
+        services.AddSingleton<IPackFeeVerifier, OcrFreePackCostVerifier>();
         services.AddSingleton<IPackRecognizer, OpenCvPackRecognizer>();
         services.AddSingleton<IGameAutomationPlatform>(provider => new WindowsGameAutomationPlatform(provider.GetRequiredService<ISettingsStore>().StateDirectory, logger: provider.GetRequiredService<ILogger<WindowsGameAutomationPlatform>>()));
         services.AddSingleton<IFreePackAutomationService, FreePackAutomationService>();

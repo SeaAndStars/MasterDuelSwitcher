@@ -48,6 +48,8 @@ public sealed class BootstrapperTests
         Assert.IsType<ResourceSharingService>(services.GetRequiredService<IResourceSharingService>());
         Assert.IsType<AccountAvatarService>(services.GetRequiredService<IAccountAvatarService>());
         Assert.Same(services.GetRequiredService<IAccountAvatarService>(), services.GetRequiredService<IAccountAvatarService>());
+        Assert.IsType<WindowsPackTextReader>(services.GetRequiredService<IPackTextReader>());
+        Assert.IsType<OcrFreePackCostVerifier>(services.GetRequiredService<IPackFeeVerifier>());
         Assert.IsType<OpenCvPackRecognizer>(services.GetRequiredService<IPackRecognizer>());
         Assert.IsType<WindowsGameAutomationPlatform>(services.GetRequiredService<IGameAutomationPlatform>());
         Assert.IsType<FreePackAutomationService>(services.GetRequiredService<IFreePackAutomationService>());
