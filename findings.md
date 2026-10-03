@@ -46,3 +46,9 @@
 - 左栏跨两行，完整 StatusRegion 包含原有18px下边距；Views 根据 SizeChanged 同步仅影响官方右侧内容的 FrameMargin。完整模板继续使用，无固定日志高度和数据层布局逻辑。官方模板证据：https://raw.githubusercontent.com/lepoco/wpfui/153baadeaf475875a81a4605881ca5c2dbe53972/src/Wpf.Ui/Controls/NavigationView/NavigationViewCompact.xaml
 - 保留原5秒关闭断言。两次默认并行全量运行受既有关闭后 Dispatcher continuation 延迟影响（服务清理81ms、Closed95ms、命令恢复9.493s）。未修改生产关闭逻辑、原断言或超时；最终串行完整App230/230通过、零跳过，所有App行/分支100%。串行配置使用 xUnit.ParallelizeTestCollections=false，测试范围完整；此前失败TRX继续保留。
 - 最新实际UiProbe80/80通过：标准浅色、标准深色与最小深色中日志展开/收起后，页脚距工作区底部18px、设置位于其上、右侧页面避让日志；三尺寸STA矩阵包含加高窗口。中文注释审计51文件1031声明零缺口。合并覆盖3659/3664行、1855/1857分支，唯一缺口仍为2项延后资源进程测试。
+
+## 2026-10-04：最终验收脚本一致性
+
+- 原 scripts/Test-Coverage.ps1 尚未携带已验证的 App 集合串行参数，现仅追加 xUnit.ParallelizeTestCollections=false，保持 Core 命令、全部断言、用例与 100% 行/分支门槛。
+- 从真实脚本 AST 提取 App 命令执行，TRX 230/230 通过、零跳过，App 行/分支 100%；合并现有同版 Core 原始报告后仍为 3659/3664 行、1855/1857 分支。原 100% 门槛正常返回 exit1，唯一缺口仍是 ResourceSharingService.cs 671–675 与 674 的两分支，没有排除或修改报告。
+- 本轮只读环境核对：真实游戏 PID 92516 仍运行，工具已退出；系统日志止于02:03，早于02:18最新开包修复提交。该日志不作为新版实际开包证据。最新发布EXE的实际提升和SQLite启动、完整游戏流程仍待实际验收。

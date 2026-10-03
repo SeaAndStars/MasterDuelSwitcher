@@ -17,6 +17,7 @@ dotnet test (Join-Path $taskRepository 'tests\MasterDuelSwitcher.Tests\MasterDue
 if ($LASTEXITCODE -ne 0) { throw 'Core 测试失败，请先修复测试。' }
 # 最终合并报告同时生成机器 JSON 与通用 Cobertura XML。
 $taskMergedReport = Join-Path $taskCoverageDirectory 'merged'
-dotnet test (Join-Path $taskRepository 'tests\MasterDuelSwitcher.App.Tests\MasterDuelSwitcher.App.Tests.csproj') -c Debug --logger 'trx;LogFileName=App.trx' --results-directory $taskResultsDirectory '-p:CollectCoverage=true' ('-p:CoverletOutput=' + $taskMergedReport) '-p:CoverletOutputFormat=json%2ccobertura' ('-p:MergeWith=' + $taskCoreReport + '.json') '-p:Include=[MasterDuelSwitcher]*%2c[MasterDuelSwitcher.Core]*' '-p:Threshold=100' '-p:ThresholdType=line%2cbranch' '-p:ThresholdStat=total'
+# App 包含真实 STA 窗口、Dispatcher 与输入边界，集合串行运行以避免共享桌面竞争；所有测试和覆盖门槛保持完整。
+dotnet test (Join-Path $taskRepository 'tests\MasterDuelSwitcher.App.Tests\MasterDuelSwitcher.App.Tests.csproj') -c Debug --logger 'trx;LogFileName=App.trx' --results-directory $taskResultsDirectory '-p:CollectCoverage=true' ('-p:CoverletOutput=' + $taskMergedReport) '-p:CoverletOutputFormat=json%2ccobertura' ('-p:MergeWith=' + $taskCoreReport + '.json') '-p:Include=[MasterDuelSwitcher]*%2c[MasterDuelSwitcher.Core]*' '-p:Threshold=100' '-p:ThresholdType=line%2cbranch' '-p:ThresholdStat=total' -- xUnit.ParallelizeTestCollections=false
 if ($LASTEXITCODE -ne 0) { throw '应用测试或100%行与分支覆盖率验收尚未通过，请查看报告。' }
 Get-ChildItem -LiteralPath $taskCoverageDirectory | Select-Object Name,Length

@@ -101,6 +101,8 @@ Core 1085 项已通过，本轮完整 App 串行运行230项通过，均零跳�
 
 运行全量测试前正常退出 Master Duel。进程保护测试会在临时目录启动并关闭自有进程夹具，保留已运行的真实游戏。
 
+验收脚本串行运行包含真实窗口的 App 测试集合；保留全部用例、断言及合并行/分支 100% 阈值。
+
 ```powershell
 dotnet restore MasterDuelSwitcher.sln
 pwsh -File scripts/Test-Coverage.ps1
