@@ -29,4 +29,6 @@
 
 授权：用户已要求新建 GitHub private 仓库和 D 盘 repos 下项目；私有仓库 https://github.com/SeaAndStars/MasterDuelSwitcher 已创建。
 
+新增免费开包：用户已确认 OpenCV 多尺度模板方案 A；按 docs/free-pack-plan.md 实现当前账号免费开包、免费确认核验、下一包与循环结束、可取消运行及独立 Fluent Page/MVVM/DI；每阶段提交，完成后重新全量覆盖、发布和更新现有 PR。
+
 迁移记录：D盘Git完整可用，原工作目录残留空.git，不影响项目或交付。

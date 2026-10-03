@@ -1,5 +1,7 @@
 # 进度记录
 
+- 2026-10-03：用户确认免费开包方案 A（OpenCV 多尺度模板），已建立实现计划；开始分层实现识别、状态机、Windows边界与独立页面。
+
 - 2026-10-03：研究和方案确认完成；WPF UI 方案已获用户批准。
 - 项目已放在 D:\repos\MasterDuelSwitcher；GitHub private SeaAndStars/MasterDuelSwitcher 已建立；master 已推送，dev 开发中。
 - 3b56eab：项目设计与计划基线；26ff504：基础项目及中文公共模型。
