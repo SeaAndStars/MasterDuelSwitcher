@@ -48,7 +48,7 @@
                 </ui:Card>
             </Grid>
             <ui:InfoBar IsOpen="True" IsClosable="False" Severity="Informational" Title="随时停止"
-                        Message="运行时保持游戏窗口在前台。按 F8 或点击运行遮罩中的停止按钮结束；窗口变化或识别不确定时会自动结束。每轮最多扫描 200 个卡包，单阶段等待上限为 60 秒。"
+                        Message="按 F8 或点击停止按钮结束。失焦后暂停 3 秒，再拉回原游戏窗口并继续；60 秒未恢复则结束。每轮最多扫描 200 包，结果确认最多重试 10 次；进程、位置或尺寸变化时结束。"
                         Margin="0,0,0,16" />
             <ui:Card Padding="20">
                 <StackPanel>

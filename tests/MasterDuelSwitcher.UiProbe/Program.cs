@@ -45,6 +45,7 @@ public static class Program
         using var provider = Bootstrapper.Build(["--state-dir", isolatedState]);
         var viewModel = provider.GetRequiredService<MainViewModel>();
         var window = provider.GetRequiredService<MainWindow>();
+        window.ShowActivated = false;
         app.MainWindow = window;
         var result = 1;
         window.ContentRendered += async (_, _) =>
@@ -59,6 +60,13 @@ public static class Program
                 await NavigateAsync(window, provider.GetRequiredService<ResourcesPage>());
                 Screenshot(window, Path.Combine(output, "resources-light.png"));
                 await NavigateAsync(window, provider.GetRequiredService<BackupsPage>());
+                var freePacksPage = provider.GetRequiredService<FreePacksPage>();
+                await NavigateAsync(window, freePacksPage);
+                Assert(Find<System.Windows.Controls.Primitives.ButtonBase>(freePacksPage, "FreePacksStart").IsEnabled, "免费开包开始按钮可用");
+                Assert(!Find<System.Windows.Controls.Primitives.ButtonBase>(freePacksPage, "FreePacksStop").IsEnabled, "免费开包空闲停止按钮禁用");
+                Assert(Find<TextBlock>(freePacksPage, "ScannedPackCount").Text == "0", "免费开包扫描初始计数");
+                Assert(Find<TextBlock>(freePacksPage, "OpenedPackCount").Text == "0", "免费开包初始完成计数");
+                Screenshot(window, Path.Combine(output, "free-packs-light.png"));
                 var settingsPage = provider.GetRequiredService<SettingsPage>();
                 await NavigateAsync(window, settingsPage);
                 Screenshot(window, Path.Combine(output, "settings-light.png"));
@@ -69,6 +77,8 @@ public static class Program
                 Pump();
                 Assert(new SettingsStore(isolatedState).Load().DarkTheme, "深色主题配置已保存");
                 Screenshot(window, Path.Combine(output, "settings-dark.png"));
+                await NavigateAsync(window, freePacksPage);
+                Screenshot(window, Path.Combine(output, "free-packs-dark.png"));
                 await CaptureOfficialDialogAsync(window, provider.GetRequiredService<IUserInteraction>(), Path.Combine(output, "content-dialog-dark.png"));
                 await NavigateAsync(window, provider.GetRequiredService<AccountsPage>());
                 window.Width = 900;

@@ -445,24 +445,50 @@ public sealed class WpfAdapterTests
         await Task.Delay(Assert.IsType<Wpf.Ui.Controls.NavigationView>(window.FindName("MainNavigation")).TransitionDuration);
         await Dispatcher.Yield(DispatcherPriority.ApplicationIdle);
         automation.Reset();
+        System.ComponentModel.PropertyChangedEventHandler stateChanged = (sender, args) =>
+            ReportStage($"close-state source={sender?.GetType().Name} property={args.PropertyName} running={viewModel.IsRunning} busy={viewModel.Workspace.IsBusy}");
+        System.ComponentModel.CancelEventHandler closing = (_, args) =>
+            ReportStage($"close-event-closing cancelled={args.Cancel} running={viewModel.IsRunning} busy={viewModel.Workspace.IsBusy}");
+        EventHandler closed = (_, _) => ReportStage("close-event-closed");
+        viewModel.PropertyChanged += stateChanged;
+        viewModel.Workspace.PropertyChanged += stateChanged;
+        window.Closing += closing;
+        window.Closed += closed;
         var run = viewModel.StartCommand.ExecuteAsync();
+        ReportStage($"close-run-created command={run.Status} operation={viewModel.RunningTask.Status} service={automation.CompletionTask.Status}");
+        _ = automation.CompletionTask.ContinueWith(task => ReportStage("close-service-result " + task.Status), CancellationToken.None, TaskContinuationOptions.ExecuteSynchronously, TaskScheduler.Default);
+        _ = viewModel.RunningTask.ContinueWith(task => ReportStage("close-operation-completed " + task.Status), CancellationToken.None, TaskContinuationOptions.ExecuteSynchronously, TaskScheduler.Default);
+        _ = run.ContinueWith(task => ReportStage("close-command-completed " + task.Status), CancellationToken.None, TaskContinuationOptions.ExecuteSynchronously, TaskScheduler.Default);
         try
         {
+        ReportStage("close-call-before");
         window.Close();
+        ReportStage("close-call-after");
         Assert.True(automation.CancellationToken.IsCancellationRequested);
         Assert.True(viewModel.Workspace.IsBusy);
         Assert.False(run.IsCompleted);
         Assert.True(window.IsVisible);
+        ReportStage($"close-complete-before command={run.Status} operation={viewModel.RunningTask.Status} service={automation.CompletionTask.Status}");
         automation.Complete(0, 0, "关闭窗口，已停止");
-        await run.WaitAsync(TimeSpan.FromSeconds(5));
+        ReportStage($"close-complete-after command={run.Status} operation={viewModel.RunningTask.Status} service={automation.CompletionTask.Status}");
+        var completion = run.WaitAsync(TimeSpan.FromSeconds(5));
+        _ = completion.ContinueWith(task => ReportStage("close-wait-completed " + task.Status), CancellationToken.None, TaskContinuationOptions.ExecuteSynchronously, TaskScheduler.Default);
+        await completion;
+        ReportStage("close-command-awaited");
         await Dispatcher.Yield(DispatcherPriority.ApplicationIdle);
         Assert.True(viewModel.Workspace.IsReady);
         Assert.False(window.IsVisible);
         }
         finally
         {
+            ReportStage($"close-cleanup-before command={run.Status} operation={viewModel.RunningTask.Status} service={automation.CompletionTask.Status}");
             automation.Complete(0, 0, "验证结束");
             await viewModel.RequestStopAsync();
+            ReportStage("close-cleanup-after");
+            viewModel.PropertyChanged -= stateChanged;
+            viewModel.Workspace.PropertyChanged -= stateChanged;
+            window.Closing -= closing;
+            window.Closed -= closed;
         }
     }
 
@@ -1201,6 +1227,8 @@ public sealed class WpfAdapterTests
         public IProgress<FreePackProgress>? Progress { get; private set; }
         /// <summary>当前轮由页面模型提供的取消令牌。</summary>
         public CancellationToken CancellationToken { get; private set; }
+        /// <summary>供关闭路径诊断读取服务完成时刻，不改变测试服务的完成条件。</summary>
+        public Task<FreePackRunResult> CompletionTask => _completion.Task;
         /// <summary>保存界面边界并等待测试结果，不执行窗口激活、截图或输入。</summary>
         public Task<FreePackRunResult> RunAsync(IProgress<FreePackProgress>? progress = null, CancellationToken cancellationToken = default)
         {
