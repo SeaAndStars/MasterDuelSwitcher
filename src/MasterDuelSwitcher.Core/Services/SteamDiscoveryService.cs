@@ -28,27 +28,44 @@ public interface ISteamDiscoveryEnvironment
 /// <summary>通过 Windows 注册表只读查询 Steam 安装候选。</summary>
 public sealed class WindowsSteamDiscoveryEnvironment : ISteamDiscoveryEnvironment
 {
+    /// <summary>只读查询的 Steam 安装注册表子键。</summary>
+    private readonly string registrySubKey;
+
     /// <summary>使用指定注册表子键与默认 Steam 目录创建只读查询环境。</summary>
     public WindowsSteamDiscoveryEnvironment(string registrySubKey = @"Software\Valve\Steam", string? fallbackSteamDirectory = null)
     {
-        throw new NotImplementedException();
+        ArgumentException.ThrowIfNullOrWhiteSpace(registrySubKey);
+        this.registrySubKey = registrySubKey;
+        FallbackSteamDirectory = fallbackSteamDirectory
+            ?? Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ProgramFilesX86), "Steam");
     }
 
     /// <summary>注册表无有效结果时尝试的默认 Steam 目录。</summary>
-    public string FallbackSteamDirectory => throw new NotImplementedException();
+    public string FallbackSteamDirectory { get; }
 
     /// <summary>读取指定注册表根与视图中的已知 Steam 安装值。</summary>
-    public IReadOnlyList<object?> ReadRegistryValues(RegistryHive hive, RegistryView view) => throw new NotImplementedException();
+    public IReadOnlyList<object?> ReadRegistryValues(RegistryHive hive, RegistryView view)
+    {
+        using var root = RegistryKey.OpenBaseKey(hive, view);
+        using var key = root.OpenSubKey(registrySubKey, writable: false);
+        return [key?.GetValue("SteamPath"), key?.GetValue("InstallPath"), key?.GetValue("SteamExe")];
+    }
 }
 
 /// <summary>读取 Steam 安装位置、游戏库与已记住的账号。</summary>
 public sealed class SteamDiscoveryService : ISteamDiscoveryService
 {
+    /// <summary>读取安装候选的只读环境。</summary>
+    private readonly ISteamDiscoveryEnvironment environment;
+
+    /// <summary>读取 VDF 与安装清单文本的函数。</summary>
+    private readonly Func<string, string> readText;
+
     /// <summary>使用可选只读发现环境和文本读取器；默认使用 Windows 注册表与真实文件。</summary>
     public SteamDiscoveryService(ISteamDiscoveryEnvironment? environment = null, Func<string, string>? readText = null)
     {
-        if (environment is not null || readText is not null)
-            throw new NotImplementedException();
+        this.environment = environment ?? new WindowsSteamDiscoveryEnvironment();
+        this.readText = readText ?? File.ReadAllText;
     }
 
     /// <summary>发现 Steam、Master Duel 与登录账号，可使用手工目录覆盖。</summary>
@@ -76,7 +93,7 @@ public sealed class SteamDiscoveryService : ISteamDiscoveryService
         if (!File.Exists(loginFile))
             return [];
 
-        var users = VdfDocument.Parse(File.ReadAllText(loginFile)).Find("users");
+        var users = VdfDocument.Parse(readText(loginFile)).Find("users");
         if (users is null || users.Value is not null)
             return [];
 
@@ -98,7 +115,7 @@ public sealed class SteamDiscoveryService : ISteamDiscoveryService
     }
 
     /// <summary>从当前用户和两种机器注册表视图中查找 Steam 可执行文件。</summary>
-    private static string FindSteamInstallation()
+    private string FindSteamInstallation()
     {
         var candidates = new List<string>();
         foreach (RegistryHive hive in new[] { RegistryHive.CurrentUser, RegistryHive.LocalMachine })
@@ -107,11 +124,9 @@ public sealed class SteamDiscoveryService : ISteamDiscoveryService
             {
                 try
                 {
-                    using var root = RegistryKey.OpenBaseKey(hive, view);
-                    using var key = root.OpenSubKey(@"Software\Valve\Steam");
-                    foreach (string name in new[] { "SteamPath", "InstallPath", "SteamExe" })
+                    foreach (object? candidate in environment.ReadRegistryValues(hive, view))
                     {
-                        if (key?.GetValue(name) is string value && !string.IsNullOrWhiteSpace(value))
+                        if (candidate is string value && !string.IsNullOrWhiteSpace(value))
                             candidates.Add(value);
                     }
                 }
@@ -121,7 +136,7 @@ public sealed class SteamDiscoveryService : ISteamDiscoveryService
                 }
             }
         }
-        candidates.Add(Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ProgramFilesX86), "Steam"));
+        candidates.Add(environment.FallbackSteamDirectory);
         foreach (string candidate in candidates.Distinct(StringComparer.OrdinalIgnoreCase))
         {
             string directory = GetExecutableDirectory(candidate, "steam.exe");
@@ -132,7 +147,7 @@ public sealed class SteamDiscoveryService : ISteamDiscoveryService
     }
 
     /// <summary>按主库和附加库清单定位 Master Duel 的真实安装目录。</summary>
-    private static string FindGameInstallation(string steamPath)
+    private string FindGameInstallation(string steamPath)
     {
         if (string.IsNullOrEmpty(steamPath))
             return "";
@@ -143,7 +158,7 @@ public sealed class SteamDiscoveryService : ISteamDiscoveryService
         {
             try
             {
-                var folders = VdfDocument.Parse(File.ReadAllText(foldersFile)).Find("libraryfolders");
+                var folders = VdfDocument.Parse(readText(foldersFile)).Find("libraryfolders");
                 if (folders?.Value is null)
                 {
                     foreach (var node in folders?.Children ?? [])
@@ -169,7 +184,7 @@ public sealed class SteamDiscoveryService : ISteamDiscoveryService
                 continue;
             try
             {
-                var app = VdfDocument.Parse(File.ReadAllText(manifestFile)).Find("AppState");
+                var app = VdfDocument.Parse(readText(manifestFile)).Find("AppState");
                 string? installDirectory = app?.Find("installdir")?.Value;
                 if (app?.Find("appid")?.Value != "1449850" || string.IsNullOrWhiteSpace(installDirectory)
                     || installDirectory is "." or ".." || installDirectory.IndexOfAny([Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar]) >= 0

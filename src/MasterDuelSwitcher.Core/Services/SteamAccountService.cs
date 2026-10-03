@@ -72,9 +72,9 @@ public sealed class SteamAccountService : ISteamAccountService
         if (matches.Length > 1)
             throw new InvalidOperationException("Steam 登录配置中出现重复账号标识，请先修复配置再切换。");
         var selected = matches.SingleOrDefault();
-        string? accountName = selected?.Find("AccountName")?.Value;
-        if (users?.Value is not null || selected is null || string.IsNullOrWhiteSpace(accountName))
+        if (selected is null)
             throw new InvalidOperationException("所选账号已不在当前 Steam 登录配置中，请刷新账号列表。");
+        string accountName = selected.Find("AccountName")!.Value!;
         if (!string.Equals(account.AccountName, accountName, StringComparison.Ordinal))
             throw new InvalidOperationException("所选账号信息已变化，请刷新账号列表。");
 
@@ -146,7 +146,7 @@ public sealed class SteamAccountService : ISteamAccountService
         var latest = ReadBackups(steam).FirstOrDefault(item => item.Backup.Status is "prepared" or "applied" or "launched" or "restoring");
         if (latest.Backup is null)
             throw new InvalidOperationException("当前 Steam 安装目录没有可还原的登录配置备份。");
-        ValidateBackup(latest.Directory, latest.Backup, steam);
+        ValidateBackup(latest.Directory, latest.Backup);
         cancellationToken.ThrowIfCancellationRequested();
         await platform.ShutdownSteamAsync(steam, cancellationToken);
         EnsureGameStopped();
@@ -248,12 +248,9 @@ public sealed class SteamAccountService : ISteamAccountService
             RestoreBackup(latest.Directory, latest.Backup, steam, "rolled-back");
     }
 
-    /// <summary>核验路径、备份校验值与注册表字段，避免误还原。</summary>
-    private static void ValidateBackup(string directory, SteamLoginBackup backup, string steam)
+    /// <summary>核验原始文件与注册表数据；路径与事务标识已由备份枚举边界检查。</summary>
+    private static void ValidateBackup(string directory, SteamLoginBackup backup)
     {
-        if (!string.Equals(backup.SteamPath, steam, StringComparison.OrdinalIgnoreCase)
-            || !string.Equals(backup.Id, Path.GetFileName(directory), StringComparison.Ordinal))
-            throw new InvalidOperationException("此登录备份与所选 Steam 安装目录不匹配。");
         string originalFile = Path.Combine(directory, "loginusers.vdf");
         if (!File.Exists(originalFile)
             || !string.Equals(Convert.ToHexString(SHA256.HashData(File.ReadAllBytes(originalFile))), backup.OriginalSha256, StringComparison.OrdinalIgnoreCase))
@@ -269,25 +266,36 @@ public sealed class SteamAccountService : ISteamAccountService
             || values.Count(value => value.Name == "RememberPassword") != 1)
             throw new InvalidOperationException("登录注册表备份字段不完整或含有额外字段。");
         foreach (var value in values.Where(value => value.Exists))
+            _ = GetRegistryData(value);
+    }
+
+    /// <summary>统一校验与转换注册表原值，避免写入层重复类型分支产生不可达路径。</summary>
+    internal static object GetRegistryData(SteamRegistryValue value)
+    {
+        switch (value.Kind)
         {
-            bool valid = value.Kind switch
-            {
-                RegistryValueKind.String or RegistryValueKind.ExpandString => value.Text is not null,
-                RegistryValueKind.DWord => value.Number.HasValue && value.Number >= int.MinValue && value.Number <= int.MaxValue,
-                RegistryValueKind.QWord => value.Number.HasValue,
-                RegistryValueKind.MultiString => value.Texts is not null,
-                RegistryValueKind.Binary => value.Bytes is not null,
-                _ => false
-            };
-            if (!valid)
-                throw new InvalidOperationException("登录注册表备份的数据类型或内容无效。");
+            case RegistryValueKind.String:
+            case RegistryValueKind.ExpandString:
+                return value.Text ?? throw new InvalidOperationException("登录注册表字符串数据缺失。");
+            case RegistryValueKind.DWord:
+                if (!value.Number.HasValue || value.Number < int.MinValue || value.Number > int.MaxValue)
+                    throw new InvalidOperationException("登录注册表 DWORD 数据缺失或超出范围。");
+                return (int)value.Number.Value;
+            case RegistryValueKind.QWord:
+                return value.Number ?? throw new InvalidOperationException("登录注册表 QWORD 数据缺失。");
+            case RegistryValueKind.MultiString:
+                return value.Texts ?? throw new InvalidOperationException("登录注册表多字符串数据缺失。");
+            case RegistryValueKind.Binary:
+                return value.Bytes ?? throw new InvalidOperationException("登录注册表二进制数据缺失。");
+            default:
+                throw new InvalidOperationException("登录注册表数据类型无效。");
         }
     }
 
     /// <summary>核验备份后原子还原文件及注册表，再记录完成状态。</summary>
     private void RestoreBackup(string directory, SteamLoginBackup backup, string steam, string status)
     {
-        ValidateBackup(directory, backup, steam);
+        ValidateBackup(directory, backup);
         backup.Status = "restoring";
         WriteManifest(directory, backup);
         string loginFile = Path.Combine(steam, "config", "loginusers.vdf");
@@ -379,15 +387,7 @@ public sealed class SteamRegistryStore
                 key.DeleteValue(value.Name, false);
                 continue;
             }
-            object data = value.Kind switch
-            {
-                RegistryValueKind.String or RegistryValueKind.ExpandString => value.Text!,
-                RegistryValueKind.DWord => checked((int)value.Number!.Value),
-                RegistryValueKind.QWord => value.Number!.Value,
-                RegistryValueKind.MultiString => value.Texts!,
-                RegistryValueKind.Binary => value.Bytes!,
-                _ => throw new InvalidOperationException("登录注册表数据类型无效。")
-            };
+            object data = SteamAccountService.GetRegistryData(value);
             key.SetValue(value.Name, data, value.Kind);
         }
     }

@@ -1,4 +1,6 @@
 using MasterDuelSwitcher.Core.Services;
+using Microsoft.Win32;
+using System.Security;
 using Xunit;
 
 namespace MasterDuelSwitcher.Tests;
@@ -235,6 +237,145 @@ public sealed class SteamDiscoveryTests : IDisposable
         Assert.Throws<InvalidOperationException>(() => new SteamDiscoveryService().Discover(root));
     }
 
+    /// <summary>验证四种注册表候选中有效的程序文件路径可被发现，其他类型与空值被忽略。</summary>
+    [Fact]
+    public void DiscoverFindsSteamFromInjectedRegistryViewAndIgnoresInvalidValues()
+    {
+        string steam = CreateSteamFixture();
+        string game = CreateGameFixture(steam, "Primary Duel");
+        var environment = new TestDiscoveryEnvironment(
+            (hive, view) => hive == RegistryHive.LocalMachine && view == RegistryView.Registry32
+                ? [null, 123, " ", Path.Combine(root, "Missing"), Path.Combine(steam, "steam.exe"), steam]
+                : [],
+            Path.Combine(root, "MissingFallback"));
+
+        var result = new SteamDiscoveryService(environment).Discover();
+
+        Assert.Equal(steam, result.SteamPath);
+        Assert.Equal(game, result.GamePath);
+    }
+
+    /// <summary>验证各类注册表读取失败均继续使用默认安装目录。</summary>
+    [Theory]
+    [InlineData("security")]
+    [InlineData("unauthorized")]
+    [InlineData("io")]
+    public void DiscoverUsesFallbackWhenRegistryViewsAreUnreadable(string failure)
+    {
+        string steam = CreateSteamFixture();
+        string game = CreateGameFixture(steam, "Primary Duel");
+        var environment = new TestDiscoveryEnvironment((_, _) => throw CreateReadFailure(failure), steam);
+
+        var result = new SteamDiscoveryService(environment).Discover();
+
+        Assert.Equal(steam, result.SteamPath);
+        Assert.Equal(game, result.GamePath);
+    }
+
+    /// <summary>验证没有有效 Steam 候选时返回空发现结果而不读取账号。</summary>
+    [Fact]
+    public void DiscoverReturnsEmptyWhenEverySteamCandidateIsMissing()
+    {
+        var environment = new TestDiscoveryEnvironment((_, _) => [], Path.Combine(root, "Missing"));
+
+        var result = new SteamDiscoveryService(environment).Discover(" ", " ");
+
+        Assert.Equal("", result.SteamPath);
+        Assert.Equal("", result.GamePath);
+        Assert.Empty(result.Accounts);
+    }
+
+    /// <summary>验证只读原生注册表适配器从专属临时键找到 Steam 程序，且测试结束还原键。</summary>
+    [Fact]
+    public void DiscoverReadsNativeRegistryFromTemporaryTestKey()
+    {
+        string steam = CreateSteamFixture();
+        string game = CreateGameFixture(steam, "Primary Duel");
+        string subKey = @"Software\MasterDuelSwitcherTests\" + Guid.NewGuid().ToString("N");
+        try
+        {
+            using (var key = Registry.CurrentUser.CreateSubKey(subKey))
+            {
+                key.SetValue("SteamPath", " ");
+                key.SetValue("InstallPath", 123, RegistryValueKind.DWord);
+                key.SetValue("SteamExe", Path.Combine(steam, "steam.exe"));
+            }
+
+            var environment = new WindowsSteamDiscoveryEnvironment(subKey, Path.Combine(root, "Missing"));
+            var result = new SteamDiscoveryService(environment).Discover();
+
+            Assert.Equal(steam, result.SteamPath);
+            Assert.Equal(game, result.GamePath);
+        }
+        finally
+        {
+            Registry.CurrentUser.DeleteSubKey(subKey, false);
+        }
+    }
+
+    /// <summary>验证原生注册表适配器遇到缺失键时使用指定默认安装目录。</summary>
+    [Fact]
+    public void DiscoverUsesNativeFallbackWhenTestRegistryKeyDoesNotExist()
+    {
+        string steam = CreateSteamFixture();
+        string game = CreateGameFixture(steam, "Primary Duel");
+        var environment = new WindowsSteamDiscoveryEnvironment(@"Software\MasterDuelSwitcherTests\" + Guid.NewGuid().ToString("N"), steam);
+
+        var result = new SteamDiscoveryService(environment).Discover();
+
+        Assert.Equal(steam, result.SteamPath);
+        Assert.Equal(game, result.GamePath);
+    }
+
+    /// <summary>验证读取器返回访问拒绝时仍按清单与库配置的回退规则发现游戏。</summary>
+    [Theory]
+    [InlineData("manifest")]
+    [InlineData("folders")]
+    public void DiscoverContinuesWhenKnownFileReadIsDenied(string deniedFile)
+    {
+        string steam = CreateSteamFixture();
+        string primary = CreateGameFixture(steam, "Primary Duel");
+        string library = Path.Combine(root, "Secondary");
+        string secondary = CreateGameFixture(library, "Secondary Duel");
+        WriteLibraryFolders(steam, "1 \"" + EscapePath(library) + "\"");
+        string deniedPath = Path.Combine(steam, "steamapps", deniedFile == "manifest" ? "appmanifest_1449850.acf" : "libraryfolders.vdf");
+        string original = File.ReadAllText(deniedPath);
+        Func<string, string> readText = path => path == deniedPath
+            ? throw new UnauthorizedAccessException("测试读取器拒绝此临时文件。")
+            : File.ReadAllText(path);
+
+        var result = new SteamDiscoveryService(readText: readText).Discover(steam);
+
+        Assert.Equal(deniedFile == "manifest" ? secondary : primary, result.GamePath);
+        Assert.Equal(original, File.ReadAllText(deniedPath));
+    }
+
+    /// <summary>验证发现不吞掉不属于已知读取失败的程序异常。</summary>
+    [Fact]
+    public void DiscoverPropagatesUnexpectedRegistryFailure()
+    {
+        var environment = new TestDiscoveryEnvironment((_, _) => throw new InvalidOperationException("测试异常。"), root);
+
+        Assert.Throws<InvalidOperationException>(() => new SteamDiscoveryService(environment).Discover());
+    }
+
+    /// <summary>验证库配置与清单读取不吞掉不属于已知读取失败的程序异常。</summary>
+    [Theory]
+    [InlineData("appmanifest_1449850.acf")]
+    [InlineData("libraryfolders.vdf")]
+    public void DiscoverPropagatesUnexpectedFileReadFailure(string failedFile)
+    {
+        string steam = CreateSteamFixture();
+        CreateGameFixture(steam, "Primary Duel");
+        WriteLibraryFolders(steam, "1 ignored");
+        string failedPath = Path.Combine(steam, "steamapps", failedFile);
+        Func<string, string> readText = path => path == failedPath
+            ? throw new InvalidOperationException("测试异常。")
+            : File.ReadAllText(path);
+
+        Assert.Throws<InvalidOperationException>(() => new SteamDiscoveryService(readText: readText).Discover(steam));
+    }
+
     /// <summary>验证手工游戏目录必须含有实际游戏可执行文件。</summary>
     [Fact]
     public void DiscoverRejectsManualGameDirectoryWithoutExecutable()
@@ -349,6 +490,34 @@ public sealed class SteamDiscoveryTests : IDisposable
 
     /// <summary>转义 VDF 引号路径中的反斜杠。</summary>
     private static string EscapePath(string path) => path.Replace("\\", "\\\\");
+
+    /// <summary>创建模拟只读环境所需的指定读取异常。</summary>
+    private static Exception CreateReadFailure(string failure) => failure switch
+    {
+        "security" => new SecurityException("测试注册表安全异常。"),
+        "unauthorized" => new UnauthorizedAccessException("测试注册表权限异常。"),
+        _ => new IOException("测试注册表读取异常。")
+    };
+
+    /// <summary>向实际发现逻辑提供可控注册表候选和默认目录。</summary>
+    private sealed class TestDiscoveryEnvironment : ISteamDiscoveryEnvironment
+    {
+        /// <summary>生成各注册表根与视图候选的测试读取器。</summary>
+        private readonly Func<RegistryHive, RegistryView, IReadOnlyList<object?>> registryValues;
+
+        /// <summary>创建只读测试环境。</summary>
+        public TestDiscoveryEnvironment(Func<RegistryHive, RegistryView, IReadOnlyList<object?>> registryValues, string fallbackSteamDirectory)
+        {
+            this.registryValues = registryValues;
+            FallbackSteamDirectory = fallbackSteamDirectory;
+        }
+
+        /// <summary>发现注册表候选失败时使用的真实临时目录。</summary>
+        public string FallbackSteamDirectory { get; }
+
+        /// <summary>返回指定根与视图对应的测试候选。</summary>
+        public IReadOnlyList<object?> ReadRegistryValues(RegistryHive hive, RegistryView view) => registryValues(hive, view);
+    }
 
     /// <summary>清理每次测试独占的临时目录。</summary>
     public void Dispose() => Directory.Delete(root, true);

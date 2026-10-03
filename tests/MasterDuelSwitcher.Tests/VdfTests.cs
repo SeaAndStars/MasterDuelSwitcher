@@ -70,6 +70,16 @@ public sealed class VdfTests
         Assert.Equal("value", document.Find("root")?.Find("key")?.Value);
     }
 
+    /// <summary>验证裸令牌紧邻引号或两种结构括号时正确终止，而不吞掉边界字符。</summary>
+    [Fact]
+    public void Parse_AcceptsAdjacentUnquotedTokensAndBoundaries()
+    {
+        var document = VdfDocument.Parse("root{key\"value\" tail end}");
+
+        Assert.Equal("value", document.Find("root")?.Find("key")?.Value);
+        Assert.Equal("end", document.Find("root")?.Find("tail")?.Value);
+    }
+
     /// <summary>验证空文本和纯注释可表示空文档。</summary>
     [Theory]
     [InlineData("")]

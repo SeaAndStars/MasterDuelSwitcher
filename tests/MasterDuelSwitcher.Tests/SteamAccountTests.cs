@@ -217,6 +217,109 @@ public sealed class SteamAccountTests : IDisposable
         Assert.Equal("applied", backup.Status);
     }
 
+    /// <summary>验证缺失、标量和无效标识账号配置均在写入之前被拒绝。</summary>
+    [Theory]
+    [InlineData("Extra value")]
+    [InlineData("users scalar")]
+    [InlineData("users { invalid { AccountName second } }")]
+    [InlineData("users { invalididentifier { AccountName second } }")]
+    [InlineData("users { \"76561198000000002\" { } }")]
+    [InlineData("users { \"76561198000000002\" { AccountName { } } }")]
+    [InlineData("users { \"76561198000000002\" { AccountName \"\" } }")]
+    [InlineData("users { \"76561198000000002\" scalar }")]
+    public async Task SwitchRejectsMalformedAccountShapesWithoutMutation(string content)
+    {
+        File.WriteAllText(LoginPath, content);
+        await Assert.ThrowsAsync<InvalidOperationException>(() => new SteamAccountService(statePath, platform).SwitchAndLaunchAsync(steamPath, Selected));
+        Assert.Equal(content, File.ReadAllText(LoginPath));
+    }
+
+    /// <summary>验证陈旧账号名称与不存在登录配置被明确拒绝。</summary>
+    [Fact]
+    public async Task SwitchRejectsStaleNameAndMissingLoginConfiguration()
+    {
+        var service = new SteamAccountService(statePath, platform);
+        await Assert.ThrowsAsync<InvalidOperationException>(() => service.SwitchAndLaunchAsync(steamPath, new SteamAccount { SteamId = Selected.SteamId, AccountName = "stale" }));
+        Assert.Equal(Original, File.ReadAllText(LoginPath));
+        File.Delete(LoginPath);
+        await Assert.ThrowsAsync<InvalidOperationException>(() => service.SwitchAndLaunchAsync(steamPath, Selected));
+        Assert.False(File.Exists(LoginPath));
+    }
+
+    /// <summary>验证排他事务锁在另一个实例持有时阻止配置变更。</summary>
+    [Fact]
+    public async Task SwitchRejectsConcurrentTransactionLock()
+    {
+        Directory.CreateDirectory(statePath);
+        using var held = new FileStream(Path.Combine(statePath, "steam-login.lock"), FileMode.Create, FileAccess.ReadWrite, FileShare.None);
+        await Assert.ThrowsAsync<InvalidOperationException>(() => new SteamAccountService(statePath, platform).SwitchAndLaunchAsync(steamPath, Selected));
+        Assert.Equal(Original, File.ReadAllText(LoginPath));
+    }
+
+    /// <summary>验证启动前写入及自动回滚均失败时保留可重试事务。</summary>
+    [Fact]
+    public async Task DoubleRegistryFailureRetainsRecoverableTransaction()
+    {
+        platform.RemainingRegistryFailures = 2;
+        var service = new SteamAccountService(statePath, platform);
+        var failure = await Assert.ThrowsAsync<AggregateException>(() => service.SwitchAndLaunchAsync(steamPath, Selected));
+        Assert.Equal(2, failure.InnerExceptions.Count);
+        Assert.Equal(Original, File.ReadAllText(LoginPath));
+        await service.RestoreLatestAsync(steamPath);
+        Assert.Equal("first", platform.Values.Single(value => value.Name == "AutoLoginUser").Text);
+    }
+
+    /// <summary>验证无清单的中断备份目录被忽略，损坏或不匹配清单则保留现场并拒绝。</summary>
+    [Theory]
+    [InlineData("not-json")]
+    [InlineData("null")]
+    [InlineData("{\"Id\":\"wrong\"}")]
+    public async Task InvalidManifestRejectsOperationAndPreservesConfiguration(string content)
+    {
+        string orphan = Path.Combine(statePath, "steam-login-backups", "orphan");
+        string invalid = Path.Combine(statePath, "steam-login-backups", "invalid");
+        Directory.CreateDirectory(orphan);
+        Directory.CreateDirectory(invalid);
+        File.WriteAllText(Path.Combine(invalid, "manifest.json"), content);
+        await Assert.ThrowsAsync<InvalidOperationException>(() => new SteamAccountService(statePath, platform).SwitchAndLaunchAsync(steamPath, Selected));
+        Assert.Equal(Original, File.ReadAllText(LoginPath));
+        Assert.Equal(content, File.ReadAllText(Path.Combine(invalid, "manifest.json")));
+    }
+
+    /// <summary>验证无清单的中断目录不会阻断下一次正常切换。</summary>
+    [Fact]
+    public async Task SwitchIgnoresOrphanBackupDirectoryWithoutManifest()
+    {
+        Directory.CreateDirectory(Path.Combine(statePath, "steam-login-backups", "orphan"));
+        await new SteamAccountService(statePath, platform).SwitchAndLaunchAsync(steamPath, Selected);
+        Assert.Equal("second", platform.Values.Single(value => value.Name == "AutoLoginUser").Text);
+        Assert.Single(Directory.GetFiles(statePath, "manifest.json", SearchOption.AllDirectories));
+    }
+
+    /// <summary>验证备份文件被删除时拒绝还原，当前文件保持完整。</summary>
+    [Fact]
+    public async Task RestoreRejectsMissingBackupFileWithoutMutation()
+    {
+        var service = new SteamAccountService(statePath, platform);
+        await service.SwitchAndLaunchAsync(steamPath, Selected);
+        string switched = File.ReadAllText(LoginPath);
+        File.Delete(Assert.Single(Directory.GetFiles(statePath, "loginusers.vdf", SearchOption.AllDirectories)));
+        await Assert.ThrowsAsync<InvalidOperationException>(() => service.RestoreLatestAsync(steamPath));
+        Assert.Equal(switched, File.ReadAllText(LoginPath));
+    }
+
+    /// <summary>验证默认构造、路径和空账号边界在任何系统变更前被处理。</summary>
+    [Fact]
+    public async Task ArgumentValidationPrecedesSystemMutation()
+    {
+        _ = new SteamAccountService(statePath);
+        Assert.Throws<ArgumentException>(() => new SteamAccountService(" "));
+        var service = new SteamAccountService(statePath, platform);
+        await Assert.ThrowsAsync<ArgumentNullException>(() => service.SwitchAndLaunchAsync(steamPath, null!));
+        await Assert.ThrowsAsync<InvalidOperationException>(() => service.SwitchAndLaunchAsync(Path.Combine(root, "missing"), Selected));
+        Assert.Equal(Original, File.ReadAllText(LoginPath));
+    }
+
     /// <summary>清理测试独占目录中的所有隔离文件。</summary>
     public void Dispose() => Directory.Delete(root, true);
 
@@ -231,6 +334,8 @@ public sealed class SteamAccountTests : IDisposable
         public Exception? LaunchError { get; set; }
         /// <summary>在下一次注册表写入时中断，用于检验部分还原恢复。</summary>
         public bool FailNextRegistryWrite { get; set; }
+        /// <summary>还需注入的连续注册表写入失败次数。</summary>
+        public int RemainingRegistryFailures { get; set; }
         /// <summary>模拟启动成功之后出现的系统状态变化。</summary>
         public Action? AfterLaunch { get; set; }
         /// <summary>隔离测试中保存的注册表快照。</summary>
@@ -248,6 +353,11 @@ public sealed class SteamAccountTests : IDisposable
             {
                 FailNextRegistryWrite = false;
                 throw new IOException("fixture registry write interrupted");
+            }
+            if (RemainingRegistryFailures > 0)
+            {
+                RemainingRegistryFailures--;
+                throw new IOException("fixture repeated registry failure");
             }
             Values = values.ToList();
         }

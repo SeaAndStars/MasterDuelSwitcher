@@ -163,6 +163,43 @@ public sealed class SteamPlatformTests : IDisposable
         _ = new WindowsSteamPlatform();
     }
 
+    /// <summary>验证不完整、额外和重复注册表字段在写测试键之前被拒绝。</summary>
+    [Fact]
+    public void RegistryStoreRejectsInvalidFieldListsBeforeWriting()
+    {
+        var store = new SteamRegistryStore(registryPath);
+        Assert.Throws<InvalidOperationException>(() => store.Write(null!));
+        Assert.Throws<InvalidOperationException>(() => store.Write([]));
+        Assert.Throws<InvalidOperationException>(() => store.Write([new() { Name = "AutoLoginUser" }, new() { Name = "AutoLoginUser" }]));
+        Assert.Throws<InvalidOperationException>(() => store.Write([new() { Name = "AutoLoginUser" }, new() { Name = "unexpected" }]));
+        using var key = Registry.CurrentUser.OpenSubKey(registryPath);
+        Assert.Null(key);
+    }
+
+    /// <summary>验证每种受支持注册表类型都拒绝缺失数据，DWORD 拒绝超范围数据。</summary>
+    [Theory]
+    [InlineData(RegistryValueKind.String)]
+    [InlineData(RegistryValueKind.ExpandString)]
+    [InlineData(RegistryValueKind.DWord)]
+    [InlineData(RegistryValueKind.QWord)]
+    [InlineData(RegistryValueKind.MultiString)]
+    [InlineData(RegistryValueKind.Binary)]
+    [InlineData(RegistryValueKind.Unknown)]
+    public void RegistryStoreRejectsMissingTypedData(RegistryValueKind kind)
+    {
+        var store = new SteamRegistryStore(registryPath);
+        Assert.Throws<InvalidOperationException>(() => store.Write([new() { Name = "AutoLoginUser", Exists = true, Kind = kind }, new() { Name = "RememberPassword" }]));
+    }
+
+    /// <summary>验证 DWORD 类型范围两侧的越界值均被拒绝。</summary>
+    [Theory]
+    [InlineData((long)int.MinValue - 1)]
+    [InlineData((long)int.MaxValue + 1)]
+    public void RegistryStoreRejectsOutOfRangeDword(long number)
+    {
+        Assert.Throws<InvalidOperationException>(() => new SteamRegistryStore(registryPath).Write([new() { Name = "AutoLoginUser", Exists = true, Kind = RegistryValueKind.DWord, Number = number }, new() { Name = "RememberPassword" }]));
+    }
+
     /// <summary>删除本次测试创建的独占注册表键。</summary>
     public void Dispose() => Registry.CurrentUser.DeleteSubKeyTree(registryPath, false);
 
