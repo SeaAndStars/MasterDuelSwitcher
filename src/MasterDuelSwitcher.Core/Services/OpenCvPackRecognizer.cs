@@ -1,3 +1,4 @@
+using System.Runtime.InteropServices;
 using MasterDuelSwitcher.Core.Models;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Logging.Abstractions;
@@ -27,20 +28,25 @@ public sealed class OpenCvPackRecognizer : IPackRecognizer, IDisposable
     private readonly Dictionary<string, Template> templates;
     /// <summary>记录界面和最低匹配分数的诊断日志。</summary>
     private readonly ILogger<OpenCvPackRecognizer> logger;
+    /// <summary>对局部费用文字和宝石图标建立独立免费证据。</summary>
+    private readonly IPackFeeVerifier feeVerifier;
     /// <summary>原生模板资源是否已经释放。</summary>
     private bool disposed;
 
     /// <summary>读取嵌入的真实游戏截图模板，建立可重复使用的原生图像缓存。</summary>
     /// <param name="logger">识别诊断日志；省略时使用空日志。</param>
-    public OpenCvPackRecognizer(ILogger<OpenCvPackRecognizer>? logger = null)
+    /// <param name="feeVerifier">可注入的费用文字与宝石校验器；省略时使用系统中文识别。</param>
+    public OpenCvPackRecognizer(ILogger<OpenCvPackRecognizer>? logger = null, IPackFeeVerifier? feeVerifier = null)
     {
         this.logger = logger ?? NullLogger<OpenCvPackRecognizer>.Instance;
+        this.feeVerifier = feeVerifier ?? new OcrFreePackCostVerifier(new WindowsPackTextReader());
         templates = new[]
         {
             LoadTemplate("details-label", 1336, 377), LoadTemplate("next-arrow", 1938, 551),
             LoadTemplate("free-entry-text", 1608, 844), LoadTemplate("one-pack-text", 1404, 844),
             LoadTemplate("dialog-title", 485, 245), LoadTemplate("dialog-free-text", 608, 382),
             LoadTemplate("dialog-cancel", 325, 480), LoadTemplate("dialog-purchase", 713, 480),
+            LoadTemplate("dialog-gem", 938, 571),
             LoadTemplate("opening-label", 292, 853), LoadTemplate("skip-label", 1203, 953),
             LoadTemplate("results-title", 26, 82), LoadTemplate("results-confirm", 1690, 1073)
         }.ToDictionary(template => template.Name);
@@ -68,23 +74,38 @@ public sealed class OpenCvPackRecognizer : IPackRecognizer, IDisposable
         using var search = new Mat();
         Cv2.Resize(gray, search, new Size((int)Math.Round(gray.Width * factor), (int)Math.Round(gray.Height * factor)),
             0, 0, InterpolationFlags.Area);
-        var observation = RecognizeDialog(search, factor) ?? RecognizeResults(search, factor)
-            ?? RecognizeOpening(search, factor) ?? RecognizeDetails(search, gray, factor) ?? Unknown();
+        var observation = RecognizeDialog(search, bgra, factor) ?? RecognizeResults(search, factor)
+            ?? RecognizeOpening(search, factor) ?? RecognizeDetails(search, gray, bgra, factor) ?? Unknown();
         logger.LogDebug("卡包画面识别：{Screen}，免费 {FreeOffer}，分数 {Confidence:F4}，卡图 {Fingerprint}",
             observation.Screen, observation.FreeOffer, observation.Confidence, observation.Fingerprint);
         return observation;
     }
 
-    /// <summary>限定免费文字位于弹窗费用行，并同时核验取消和购买按钮。</summary>
-    private PackObservation? RecognizeDialog(Mat image, double factor)
+    /// <summary>限定免费文字位于弹窗费用行，同时核验按钮、局部宝石图标和真实费用文字。</summary>
+    private PackObservation? RecognizeDialog(Mat image, Mat color, double factor)
     {
         var title = FindAnchor(image, factor, "dialog-title", new Rect(image.Width / 5, image.Height / 8,
             image.Width * 3 / 5, image.Height * 5 / 8));
         if (title is null) return null;
         var cancel = FindRelative(image, factor, title.Value, "dialog-cancel");
         var purchase = FindRelative(image, factor, title.Value, "dialog-purchase");
-        var free = FindRelative(image, factor, title.Value, "dialog-free-text");
-        if (cancel is null || purchase is null || free is null)
+        var anchor = title.Value;
+        var feeRegion = new Rect((int)Math.Floor((anchor.Bounds.X - 370 * anchor.Scale) * factor),
+            (int)Math.Floor((anchor.Bounds.Y + 123 * anchor.Scale) * factor),
+            (int)Math.Ceiling(880 * anchor.Scale * factor), (int)Math.Ceiling(59 * anchor.Scale * factor));
+        var free = Find(image, factor, templates["dialog-free-text"], feeRegion,
+            new[] { anchor.Scale * .98, anchor.Scale, anchor.Scale * 1.02 });
+        var gemHeight = cancel is null ? 320 * anchor.Scale
+            : Math.Max(1, cancel.Value.Bounds.Y - anchor.Bounds.Y - 114 * anchor.Scale);
+        var gemRegion = new Rect((int)Math.Floor((anchor.Bounds.X - 370 * anchor.Scale) * factor),
+            (int)Math.Floor((anchor.Bounds.Y + 100 * anchor.Scale) * factor),
+            (int)Math.Ceiling(880 * anchor.Scale * factor), (int)Math.Ceiling(gemHeight * factor));
+        var gem = Find(image, factor, templates["dialog-gem"], gemRegion,
+            new[] { anchor.Scale * .98, anchor.Scale, anchor.Scale * 1.02 });
+        var feePixels = new Rect((int)Math.Floor(anchor.Bounds.X - 370 * anchor.Scale),
+            (int)Math.Floor(anchor.Bounds.Y + 123 * anchor.Scale),
+            (int)Math.Ceiling(880 * anchor.Scale), (int)Math.Ceiling(59 * anchor.Scale));
+        if (cancel is null || purchase is null || free is null || !VerifyFreeFee(color, feePixels, gem is not null))
             return new(PackScreen.UnverifiedPurchaseDialog, null, null, false, string.Empty, title.Value.Score);
         return new(PackScreen.FreePurchaseDialog, purchase.Value.Center, null, true, string.Empty,
             Math.Min(title.Value.Score, Math.Min(cancel.Value.Score, Math.Min(purchase.Value.Score, free.Value.Score))));
@@ -114,7 +135,7 @@ public sealed class OpenCvPackRecognizer : IPackRecognizer, IDisposable
     }
 
     /// <summary>详情必须具备菜单锚点和下一包双箭头，免费入口必须再核验两段文字。</summary>
-    private PackObservation? RecognizeDetails(Mat image, Mat original, double factor)
+    private PackObservation? RecognizeDetails(Mat image, Mat original, Mat color, double factor)
     {
         var label = FindAnchor(image, factor, "details-label", new Rect(image.Width / 2, 0,
             image.Width - image.Width / 2, image.Height * 2 / 3));
@@ -123,13 +144,74 @@ public sealed class OpenCvPackRecognizer : IPackRecognizer, IDisposable
         if (next is null) return null;
         var fingerprint = Fingerprint(original, label.Value);
         if (fingerprint is null) return null;
-        var free = FindRelative(image, factor, label.Value, "free-entry-text");
-        var one = FindRelative(image, factor, label.Value, "one-pack-text");
+        var free = FindFreeEntry(image, factor, label.Value);
+        var one = free is null ? null : FindRelative(image, factor, free.Value, "one-pack-text");
         var score = Math.Min(label.Value.Score, next.Value.Score);
-        if (free is null || one is null)
+        if (free is null || one is null || !OnSameYellowButton(color, one.Value, free.Value)
+            || !VerifyFreeFee(color, FeeButtonBounds(one.Value, free.Value), false))
             return new(PackScreen.PackDetails, null, next.Value.Center, false, fingerprint, score);
         return new(PackScreen.PackDetails, free.Value.Center, next.Value.Center, true, fingerprint,
             Math.Min(score, Math.Min(free.Value.Score, one.Value.Score)));
+    }
+
+    /// <summary>由同一按钮上的数量和免费文字推导费用像素矩形，仅补充字形周围的黄色背景。</summary>
+    private static Rect FeeButtonBounds(Match one, Match free)
+    {
+        var margin = 14 * free.Scale;
+        var top = Math.Min(one.Bounds.Y, free.Bounds.Y);
+        var bottom = Math.Max(one.Bounds.Bottom, free.Bounds.Bottom);
+        return new Rect((int)Math.Floor(one.Bounds.X - margin), (int)Math.Floor(top - margin),
+            (int)Math.Ceiling(free.Bounds.Right - one.Bounds.X + 2 * margin),
+            (int)Math.Ceiling(bottom - top + 2 * margin));
+    }
+
+    /// <summary>复制原图局部为紧密 BGRA 后校验费用；宝石图标独立否决文字边界的批准结果。</summary>
+    private bool VerifyFreeFee(Mat color, Rect region, bool gemDetected)
+    {
+        region = region.Intersect(new Rect(0, 0, color.Width, color.Height));
+        using var area = new Mat(color, region);
+        using var isolated = area.Clone();
+        var pixels = new byte[region.Width * region.Height * 4];
+        Marshal.Copy(isolated.Data, pixels, 0, pixels.Length);
+        var approved = feeVerifier.IsFree(pixels, region.Width, region.Height, gemDetected);
+        return !gemDetected && approved;
+    }
+
+    /// <summary>只在右下购买区域匹配免费文字，兼容单行免费和双行收费控件布局。</summary>
+    private Match? FindFreeEntry(Mat image, double factor, Match anchor)
+    {
+        var region = new Rect((int)Math.Floor((anchor.Bounds.X - 46 * anchor.Scale) * factor),
+            (int)Math.Floor((anchor.Bounds.Y + 418 * anchor.Scale) * factor),
+            (int)Math.Ceiling(525 * anchor.Scale * factor), (int)Math.Ceiling(240 * anchor.Scale * factor));
+        return Find(image, factor, templates["free-entry-text"], region,
+            new[] { anchor.Scale * .98, anchor.Scale, anchor.Scale * 1.02 });
+    }
+
+    /// <summary>核验同一行的数量与免费文字下面具有连续黄色按钮背景，拒绝跨按钮拼接。</summary>
+    private static bool OnSameYellowButton(Mat color, Match one, Match free)
+    {
+        var region = new Rect(one.Bounds.X, Math.Max(one.Bounds.Bottom, free.Bounds.Bottom) + (int)Math.Round(3 * free.Scale),
+            free.Bounds.Right - one.Bounds.X, Math.Max(1, (int)Math.Round(3 * free.Scale)));
+        if (region.Intersect(new Rect(0, 0, color.Width, color.Height)) != region) return false;
+        using var band = new Mat(color, region);
+        using var bgr = new Mat();
+        using var hsv = new Mat();
+        using var mask = new Mat();
+        Cv2.CvtColor(band, bgr, ColorConversionCodes.BGRA2BGR);
+        Cv2.CvtColor(bgr, hsv, ColorConversionCodes.BGR2HSV);
+        Cv2.InRange(hsv, new Scalar(15, 80, 120), new Scalar(40, 255, 255), mask);
+        if (Cv2.CountNonZero(mask) < region.Width * region.Height * .9) return false;
+        using var columns = new Mat();
+        Cv2.Reduce(mask, columns, ReduceDimension.Row, ReduceTypes.Max, -1);
+        var maximumGap = Math.Max(1, (int)Math.Round(3 * free.Scale));
+        var gap = 0;
+        var columnCount = columns.Width;
+        for (var x = 0; x < columnCount; x++)
+        {
+            gap = columns.At<byte>(0, x) == 0 ? gap + 1 : 0;
+            if (gap > maximumGap) return false;
+        }
+        return true;
     }
 
     /// <summary>在状态专属大区域中搜索模板，并加入当前窗口宽度对应的细粒度缩放候选。</summary>
@@ -182,20 +264,22 @@ public sealed class OpenCvPackRecognizer : IPackRecognizer, IDisposable
         return best;
     }
 
-    /// <summary>从插画中心的稳定区域计算六十四位差值指纹，避开 NEW、日期、余额和免费按钮。</summary>
+    /// <summary>从标题文字的水平前景投影计算六十四位指纹，排除背景纹理和卡图动画。</summary>
     private static string? Fingerprint(Mat image, Match anchor)
     {
-        var region = new Rect((int)Math.Round(anchor.Bounds.X - 916 * anchor.Scale),
-            (int)Math.Round(anchor.Bounds.Y - 77 * anchor.Scale),
-            (int)Math.Round(650 * anchor.Scale), (int)Math.Round(330 * anchor.Scale));
+        var region = new Rect((int)Math.Round(anchor.Bounds.X - 1052 * anchor.Scale),
+            (int)Math.Round(anchor.Bounds.Y - 307 * anchor.Scale),
+            (int)Math.Round(500 * anchor.Scale), (int)Math.Round(50 * anchor.Scale));
         if (region.Intersect(new Rect(0, 0, image.Width, image.Height)) != region) return null;
-        using var artwork = new Mat(image, region);
+        using var title = new Mat(image, region);
+        using var foreground = new Mat();
+        Cv2.Threshold(title, foreground, 120, 255, ThresholdTypes.Tozero);
+        if (Cv2.CountNonZero(foreground) == 0) return null;
         using var sample = new Mat();
-        Cv2.Resize(artwork, sample, new Size(9, 8), 0, 0, InterpolationFlags.Area);
+        Cv2.Resize(foreground, sample, new Size(65, 1), 0, 0, InterpolationFlags.Area);
         ulong hash = 0;
-        for (var y = 0; y < 8; y++)
-            for (var x = 0; x < 8; x++)
-                hash = (hash << 1) | (sample.At<byte>(y, x) > sample.At<byte>(y, x + 1) ? 1UL : 0UL);
+        for (var x = 0; x < 64; x++)
+            hash = (hash << 1) | (sample.At<byte>(0, x) - sample.At<byte>(0, x + 1) > 1 ? 1UL : 0UL);
         return hash.ToString("x16");
     }
 

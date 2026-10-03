@@ -473,8 +473,9 @@ public sealed class WindowsGameAutomationNativeTests
             Assert.Equal((nint)0, empty.FindGameWindow());
             var desktop = raw.GetVirtualDesktop();
             Assert.True(Native.SystemParametersInfo(0x0030, 0, out AutomationNativeRectangle workArea, 0));
+            Assert.True(Native.GetCursorPos(out AutomationNativePoint originalCursor));
             window = Native.CreateWindowEx(0, className, "FreePack native fixture", 0x10CF0000,
-                workArea.Left + 50, workArea.Top + 50, 420, 340, 0, 0, registration.Instance, 0);
+                originalCursor.X - 100, originalCursor.Y - 100, 420, 340, 0, 0, registration.Instance, 0);
             Assert.NotEqual((nint)0, window);
             using var currentProcess = Process.GetCurrentProcess();
             var api = new SystemWindowsGameAutomationNativeApi(
@@ -531,7 +532,12 @@ public sealed class WindowsGameAutomationNativeTests
             GameFrame refreshed = platform.Capture();
             Assert.Equal([0x66, 0x55, 0x44], refreshed.Pixels.Skip(center).Take(3).Select(value => (int)value).ToArray());
             Assert.False(frame.Pixels.AsSpan().SequenceEqual(refreshed.Pixels), "自有窗口重绘后截图仍为旧帧。");
-            var target = new PixelPoint(frame.Width / 2, frame.Height / 2);
+            var target = new PixelPoint(originalCursor.X - frame.ScreenX, originalCursor.Y - frame.ScreenY);
+            Assert.InRange(target.X, 0, frame.Width - 1);
+            Assert.InRange(target.Y, 0, frame.Height - 1);
+            Assert.Equal(window, Native.GetAncestor(Native.WindowFromPoint(originalCursor), 2));
+            Assert.True(Native.GetCursorPos(out AutomationNativePoint cursorBeforeInput));
+            Assert.Equal(originalCursor, cursorBeforeInput);
             nint foregroundBeforeInput = api.GetForegroundWindow();
             platform.Click(frame, target);
             Stopwatch wait = Stopwatch.StartNew();
