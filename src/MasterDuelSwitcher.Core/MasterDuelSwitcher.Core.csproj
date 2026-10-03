@@ -5,5 +5,10 @@
     <PackageReference Include="Serilog" Version="4.4.0" />
     <PackageReference Include="Serilog.Extensions.Logging" Version="10.0.0" />
     <PackageReference Include="Serilog.Sinks.File" Version="7.0.0" />
+    <PackageReference Include="OpenCvSharp4" Version="4.13.0.20260627" />
+    <PackageReference Include="OpenCvSharp4.runtime.win.slim" Version="4.13.0.20260627" />
+  </ItemGroup>
+  <ItemGroup>
+    <EmbeddedResource Include="Assets\PackTemplates\*.png" />
   </ItemGroup>
 </Project>

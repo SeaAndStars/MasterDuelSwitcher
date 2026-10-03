@@ -1,5 +1,13 @@
 # 第三方组件
 
+## OpenCvSharp 与 OpenCV
+
+- OpenCvSharp4与OpenCvSharp4.runtime.win.slim：4.13.0.20260627，Apache-2.0；项目：https://github.com/shimat/opencvsharp。
+- OpenCV：4.13.0，Apache-2.0；项目：https://opencv.org/。
+- 原生精简包启用core、imgproc、imgcodecs等模块，本工具使用图像编码、模板匹配与缩放；未使用OCR运行包。
+- 完整许可原件分别见licenses/OpenCvSharp-LICENSE和licenses/OpenCV-LICENSE。
+- 游戏界面识别模板来源为用户提供的截图；游戏图像和商标归其原权利人所有。
+
 ## WPF UI
 
 - 项目：https://github.com/lepoco/wpfui

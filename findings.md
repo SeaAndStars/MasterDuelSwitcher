@@ -1,5 +1,8 @@
 # 证据与决策
 
+- 用户确认免费开包方案A：OpenCvSharp4及Windows x64 Slim 4.13.0.20260627，使用真实模板；软件包已还原，DLL导入表仅含Windows系统组件，没有独立VC运行库导入。
+- 识别76项实际测试通过，报告artifacts/coverage/free-pack-vision.json为160/160行、78/78分支100%；不同真实卡包图指纹距离32，大于状态机4bit容差。
+
 - 用户确认 Windows Steam；自写 WPF UI 方案已批准。
 - WPF UI NuGet 当前4.3.0，官方源 https://github.com/lepoco/wpfui。
 - 本机 SDK10.0.201，Windows10 19045；提供 Windows11 Fluent 设计并兼容 Windows10，无 Mica 时采用普通窗口背景。

@@ -1,6 +1,7 @@
 # 进度记录
 
 - 2026-10-03：用户确认免费开包方案 A（OpenCV 多尺度模板），已建立实现计划；开始分层实现识别、状态机、Windows边界与独立页面。
+- OpenCV截图识别76/76真实图像回归通过，160/160行与78/78分支100%；免费按钮与购买确认分层核验，支持四档缩放、客户区裁剪及付费黄色按钮负例。Windows精简原生DLL的直接依赖均为Windows系统组件。
 
 - 2026-10-03：研究和方案确认完成；WPF UI 方案已获用户批准。
 - 项目已放在 D:\repos\MasterDuelSwitcher；GitHub private SeaAndStars/MasterDuelSwitcher 已建立；master 已推送，dev 开发中。
