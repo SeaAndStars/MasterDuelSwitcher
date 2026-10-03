@@ -1,4 +1,6 @@
 using MasterDuelSwitcher.Core.Models;
+using Microsoft.Extensions.Logging;
+using Microsoft.Extensions.Logging.Abstractions;
 using Microsoft.Win32;
 using System.Diagnostics;
 using System.Globalization;
@@ -39,25 +41,46 @@ public sealed class SteamAccountService : ISteamAccountService
     private readonly string stateDirectory;
     /// <summary>正常退出、启动与注册表操作的系统边界。</summary>
     private readonly ISteamPlatform platform;
+    /// <summary>只记录操作阶段、事务标识与异常，不记录登录配置正文。</summary>
+    private readonly ILogger<SteamAccountService> logger;
     /// <summary>事务清单使用便于检查的 JSON 格式。</summary>
     private static readonly JsonSerializerOptions JsonOptions = new() { WriteIndented = true };
 
     /// <summary>创建使用指定备份目录和系统边界的切号服务。</summary>
-    public SteamAccountService(string stateDirectory, ISteamPlatform? platform = null)
+    public SteamAccountService(string stateDirectory, ISteamPlatform? platform = null, ILogger<SteamAccountService>? logger = null)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(stateDirectory);
         this.stateDirectory = Path.GetFullPath(stateDirectory);
         this.platform = platform ?? new WindowsSteamPlatform();
+        this.logger = logger ?? NullLogger<SteamAccountService>.Instance;
     }
 
     /// <summary>正常退出 Steam，备份并切换配置，然后请求启动 Master Duel。</summary>
     public async Task<string> SwitchAndLaunchAsync(string steamPath, SteamAccount account, CancellationToken cancellationToken = default)
+    {
+        logger.LogInformation("开始 Steam 账号切换操作。");
+        try
+        {
+            string result = await SwitchCoreAsync(steamPath, account, cancellationToken);
+            logger.LogInformation("Steam 账号切换配置已完成并已发送游戏启动请求。");
+            return result;
+        }
+        catch (Exception exception)
+        {
+            logger.LogError(exception, "Steam 账号切换操作失败。");
+            throw;
+        }
+    }
+
+    /// <summary>执行已记住账号的受保护配置事务，保留原有失败还原行为。</summary>
+    private async Task<string> SwitchCoreAsync(string steamPath, SteamAccount account, CancellationToken cancellationToken)
     {
         ArgumentNullException.ThrowIfNull(account);
         string steam = ValidateSteamPath(steamPath);
         EnsureGameStopped();
         using var transactionLock = AcquireTransactionLock();
         cancellationToken.ThrowIfCancellationRequested();
+        logger.LogDebug("正在请求 Steam 正常退出，配置尚未写入。");
         await platform.ShutdownSteamAsync(steam, cancellationToken);
         EnsureGameStopped();
         RecoverInterruptedTransaction(steam);
@@ -93,6 +116,7 @@ public sealed class SteamAccountService : ISteamAccountService
         ValidateRegistryValues(backup.RegistryValues);
         AtomicWrite(Path.Combine(backupDirectory, "loginusers.vdf"), original);
         WriteManifest(backupDirectory, backup);
+        logger.LogDebug("登录配置备份已保存，事务 {TransactionId} 进入准备状态。", id);
 
         bool launchRequested = false;
         bool launchSucceeded = false;
@@ -108,9 +132,11 @@ public sealed class SteamAccountService : ISteamAccountService
             ]);
             backup.Status = "applied";
             WriteManifest(backupDirectory, backup);
+            logger.LogDebug("登录选择配置已应用，事务 {TransactionId} 将发送 AppID 1449850 启动请求。", id);
             launchRequested = true;
             await platform.LaunchGameAsync(steam, cancellationToken);
             launchSucceeded = true;
+            logger.LogDebug("Steam 已接收游戏启动请求，事务 {TransactionId} 正在提交完成状态。", id);
             backup.Status = "launched";
             WriteManifest(backupDirectory, backup);
             return "已请求 Steam 启动 Master Duel；登录及验证状态以 Steam 提示为准。";
@@ -118,9 +144,13 @@ public sealed class SteamAccountService : ISteamAccountService
         catch (Exception operationError)
         {
             if (launchSucceeded)
+            {
+                logger.LogWarning("事务 {TransactionId} 在启动请求完成后记录失败，已保留当前配置。", id);
                 throw new InvalidOperationException("Steam 已收到启动请求，但备份状态记录失败；当前登录配置已保留，请先正常退出游戏再使用备份还原。", operationError);
+            }
             try
             {
+                logger.LogDebug("事务 {TransactionId} 在启动完成前失败，开始自动还原。", id);
                 if (launchRequested)
                 {
                     EnsureGameStopped();
@@ -140,6 +170,23 @@ public sealed class SteamAccountService : ISteamAccountService
     /// <summary>还原指定 Steam 安装目录最近的有效登录配置备份。</summary>
     public async Task<string> RestoreLatestAsync(string steamPath, CancellationToken cancellationToken = default)
     {
+        logger.LogInformation("开始 Steam 登录配置还原操作。");
+        try
+        {
+            string result = await RestoreCoreAsync(steamPath, cancellationToken);
+            logger.LogInformation("Steam 登录配置还原操作已完成。");
+            return result;
+        }
+        catch (Exception exception)
+        {
+            logger.LogError(exception, "Steam 登录配置还原操作失败。");
+            throw;
+        }
+    }
+
+    /// <summary>定位并核验同一安装目录最近的有效事务，然后正常退出客户端并还原。</summary>
+    private async Task<string> RestoreCoreAsync(string steamPath, CancellationToken cancellationToken)
+    {
         string steam = ValidateSteamPath(steamPath);
         EnsureGameStopped();
         using var transactionLock = AcquireTransactionLock();
@@ -148,6 +195,7 @@ public sealed class SteamAccountService : ISteamAccountService
             throw new InvalidOperationException("当前 Steam 安装目录没有可还原的登录配置备份。");
         ValidateBackup(latest.Directory, latest.Backup);
         cancellationToken.ThrowIfCancellationRequested();
+        logger.LogDebug("已核验备份事务 {TransactionId}，正在请求 Steam 正常退出后还原。", latest.Backup.Id);
         await platform.ShutdownSteamAsync(steam, cancellationToken);
         EnsureGameStopped();
         RestoreBackup(latest.Directory, latest.Backup, steam, "restored");
@@ -245,7 +293,10 @@ public sealed class SteamAccountService : ISteamAccountService
     {
         var latest = ReadBackups(steam).FirstOrDefault(item => item.Backup.Status is "prepared" or "applied" or "launched" or "restoring");
         if (latest.Backup?.Status is "prepared" or "applied" or "restoring")
+        {
+            logger.LogWarning("发现中断登录事务 {TransactionId}，正在先恢复其原始状态。", latest.Backup.Id);
             RestoreBackup(latest.Directory, latest.Backup, steam, "rolled-back");
+        }
     }
 
     /// <summary>核验原始文件与注册表数据；路径与事务标识已由备份枚举边界检查。</summary>
@@ -295,6 +346,7 @@ public sealed class SteamAccountService : ISteamAccountService
     /// <summary>核验备份后原子还原文件及注册表，再记录完成状态。</summary>
     private void RestoreBackup(string directory, SteamLoginBackup backup, string steam, string status)
     {
+        logger.LogDebug("开始恢复登录备份事务 {TransactionId}。", backup.Id);
         ValidateBackup(directory, backup);
         backup.Status = "restoring";
         WriteManifest(directory, backup);
@@ -304,6 +356,7 @@ public sealed class SteamAccountService : ISteamAccountService
         platform.WriteLoginRegistry(backup.RegistryValues);
         backup.Status = status;
         WriteManifest(directory, backup);
+        logger.LogDebug("登录备份事务 {TransactionId} 已完成恢复，状态 {Status}。", backup.Id, status);
     }
 
     /// <summary>在同目录内替换事务清单，避免截断原清单。</summary>

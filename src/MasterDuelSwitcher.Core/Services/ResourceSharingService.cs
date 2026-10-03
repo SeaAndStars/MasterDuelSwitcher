@@ -5,7 +5,10 @@ using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
 using System.Text.Json.Nodes;
+using System.Text.RegularExpressions;
 using MasterDuelSwitcher.Core.Models;
+using Microsoft.Extensions.Logging;
+using Microsoft.Extensions.Logging.Abstractions;
 
 // 测试程序集可直接构造真实 NTFS 文件身份夹具，生产接口保持独立。
 [assembly: InternalsVisibleTo("MasterDuelSwitcher.Tests")]
@@ -25,6 +28,97 @@ public interface IResourceSharingService
     void Restore(string backupId);
 }
 
+/// <summary>资源事务依赖的文件系统接口，允许替换磁盘错误、竞态与持久化实现。</summary>
+public interface IResourceFileSystem
+{
+    /// <summary>读取路径本身属性；不存在时返回空值。</summary>
+    FileAttributes? Attributes(string path);
+    /// <summary>判断目录是否存在。</summary>
+    bool DirectoryExists(string path);
+    /// <summary>创建事务目录。</summary>
+    void CreateDirectory(string path);
+    /// <summary>在同一卷内移动目录本身。</summary>
+    void MoveDirectory(string source, string target);
+    /// <summary>判断普通文件是否存在。</summary>
+    bool FileExists(string path);
+    /// <summary>读取完整 UTF-8 清单文本。</summary>
+    string ReadText(string path);
+    /// <summary>读取普通文件长度。</summary>
+    long FileLength(string path);
+    /// <summary>物化目录的直接条目。</summary>
+    string[] Entries(string path);
+    /// <summary>枚举状态目录的清单文件。</summary>
+    string[] ManifestFiles(string path);
+    /// <summary>以独占新文件方式写入并强制刷新到磁盘。</summary>
+    void WriteDurable(string path, byte[] bytes);
+    /// <summary>原子替换既有清单。</summary>
+    void ReplaceFile(string source, string target);
+    /// <summary>原子安装首次清单。</summary>
+    void MoveFile(string source, string target);
+    /// <summary>移除本事务拥有的临时文件。</summary>
+    void DeleteFile(string path);
+}
+
+/// <summary>使用实际 Windows 文件系统的资源事务适配器。</summary>
+public sealed class WindowsResourceFileSystem : IResourceFileSystem
+{
+    /// <summary>读取不跟随最终重解析点的路径属性。</summary>
+    public FileAttributes? Attributes(string path) => ResourcePathValidation.Attributes(path);
+    /// <summary>检查目录是否存在。</summary>
+    public bool DirectoryExists(string path) => Directory.Exists(path);
+    /// <summary>创建清单目录。</summary>
+    public void CreateDirectory(string path) => Directory.CreateDirectory(path);
+    /// <summary>移动目录或目录 junction 本身。</summary>
+    public void MoveDirectory(string source, string target) => Directory.Move(source, target);
+    /// <summary>检查普通文件是否存在。</summary>
+    public bool FileExists(string path) => File.Exists(path);
+    /// <summary>读取完整清单文本。</summary>
+    public string ReadText(string path) => File.ReadAllText(path);
+    /// <summary>读取普通文件长度。</summary>
+    public long FileLength(string path) => new FileInfo(path).Length;
+    /// <summary>物化目录的直接条目。</summary>
+    public string[] Entries(string path) => Directory.GetFileSystemEntries(path);
+    /// <summary>物化状态目录的直接 JSON 清单。</summary>
+    public string[] ManifestFiles(string path) => Directory.GetFiles(path, "*.json", SearchOption.TopDirectoryOnly);
+    /// <summary>写入独占临时文件并将所有缓冲强制落盘。</summary>
+    public void WriteDurable(string path, byte[] bytes)
+    {
+        using var stream = new FileStream(path, FileMode.CreateNew, FileAccess.Write, FileShare.None, 4096, FileOptions.WriteThrough);
+        stream.Write(bytes);
+        stream.Flush(true);
+    }
+    /// <summary>原子替换已存在的清单。</summary>
+    public void ReplaceFile(string source, string target) => File.Replace(source, target, null);
+    /// <summary>原子安装首次创建的清单。</summary>
+    public void MoveFile(string source, string target) => File.Move(source, target);
+    /// <summary>移除本事务的临时文件。</summary>
+    public void DeleteFile(string path) => File.Delete(path);
+}
+
+/// <summary>事务锁依赖的互斥平台接口，用于模拟超时与进程中断。</summary>
+internal interface IResourceMutex : IDisposable
+{
+    /// <summary>在限定时间内等待锁。</summary>
+    bool Wait(TimeSpan timeout);
+    /// <summary>释放当前线程持有的锁。</summary>
+    void Release();
+}
+
+/// <summary>使用 Windows 命名互斥对象的默认事务锁适配器。</summary>
+internal sealed class WindowsResourceMutex : IResourceMutex
+{
+    /// <summary>实际 Windows 互斥句柄。</summary>
+    private readonly Mutex mutex;
+    /// <summary>打开指定名称的互斥对象。</summary>
+    internal WindowsResourceMutex(string name) => mutex = new Mutex(false, name);
+    /// <summary>在限定时间内等待互斥对象。</summary>
+    public bool Wait(TimeSpan timeout) => mutex.WaitOne(timeout);
+    /// <summary>释放当前线程拥有的互斥对象。</summary>
+    public void Release() => mutex.ReleaseMutex();
+    /// <summary>释放互斥句柄。</summary>
+    public void Dispose() => mutex.Dispose();
+}
+
 /// <summary>管理下载资源目录的共享和原始目录恢复。</summary>
 public sealed class ResourceSharingService : IResourceSharingService
 {
@@ -32,25 +126,52 @@ public sealed class ResourceSharingService : IResourceSharingService
     private readonly string stateDirectory;
     /// <summary>游戏运行状态检查，测试时可注入临时状态。</summary>
     private readonly Func<bool> isGameRunning;
+    /// <summary>事务所使用的可注入文件系统。</summary>
+    private readonly IResourceFileSystem files;
+    /// <summary>资源操作与事务步骤的结构化日志，不记录资源内容或登录凭据。</summary>
+    private readonly ILogger<ResourceSharingService> logger;
     /// <summary>用于清单持久化的 JSON 序列化设置。</summary>
     private static readonly JsonSerializerOptions JsonOptions = new() { WriteIndented = true };
     /// <summary>每份清单记录的原目录稳定身份，随清单扩展字段一起持久化。</summary>
     private readonly ConcurrentDictionary<string, Dictionary<string, string>> originalDirectoryIdentities = new(StringComparer.Ordinal);
 
     /// <summary>创建资源服务，以应用状态根目录下的 resource-backups 隔离事务；构造阶段不创建目录。</summary>
-    public ResourceSharingService(string stateDirectory, Func<bool>? isGameRunning = null)
+    public ResourceSharingService(string stateDirectory, Func<bool>? isGameRunning = null, ILogger<ResourceSharingService>? logger = null) : this(stateDirectory, new WindowsResourceFileSystem(), isGameRunning, logger) { }
+
+    /// <summary>通过文件系统接口创建资源服务，供依赖注入和磁盘故障验证。</summary>
+    public ResourceSharingService(string stateDirectory, IResourceFileSystem fileSystem, Func<bool>? isGameRunning = null, ILogger<ResourceSharingService>? logger = null)
     {
+        ArgumentNullException.ThrowIfNull(fileSystem);
         this.stateDirectory = Path.Combine(ResourcePathValidation.Normalize(stateDirectory), "resource-backups");
         this.isGameRunning = isGameRunning ?? DetectRunningGame;
+        files = fileSystem;
+        this.logger = logger ?? NullLogger<ResourceSharingService>.Instance;
     }
 
     /// <summary>扫描严格八位账号目录，计算资源大小时不跟随任意深度的重解析点。</summary>
     public IReadOnlyList<ResourceProfile> ScanProfiles(string gamePath)
     {
+        logger.LogInformation("资源扫描开始。");
+        try
+        {
+            var profiles = ScanProfilesCore(gamePath);
+            logger.LogInformation("资源扫描完成，共 {ProfileCount} 个账号目录。", profiles.Count);
+            return profiles;
+        }
+        catch (Exception exception)
+        {
+            logger.LogError(exception, "资源扫描失败。");
+            throw;
+        }
+    }
+
+    /// <summary>执行账号资源扫描，个别目录访问失败时保留其余扫描结果。</summary>
+    private IReadOnlyList<ResourceProfile> ScanProfilesCore(string gamePath)
+    {
         var game = ResourcePathValidation.Game(gamePath);
         var data = Path.Combine(game, "LocalData");
         ResourcePathValidation.EnsureNoReparseAncestors(data);
-        if (!Directory.Exists(data)) return [];
+        if (!files.DirectoryExists(data)) return [];
         var profiles = new List<ResourceProfile>();
         foreach (var account in SafeEntries(data))
         {
@@ -58,11 +179,10 @@ public sealed class ResourceSharingService : IResourceSharingService
             if (!ResourcePathValidation.IsAccount(folder)) continue;
             try
             {
-                var attributes = ResourcePathValidation.Attributes(account);
-                if (attributes is null || (attributes & FileAttributes.Directory) == 0 || (attributes & FileAttributes.ReparsePoint) != 0) continue;
+                if (files.Attributes(account) is not { } attributes || (attributes & FileAttributes.Directory) == 0 || (attributes & FileAttributes.ReparsePoint) != 0) continue;
                 var resource = Path.Combine(account, "0000");
-                var resourceAttributes = ResourcePathValidation.Attributes(resource);
-                var linked = resourceAttributes is not null && (resourceAttributes & FileAttributes.ReparsePoint) != 0;
+                var resourceAttributes = files.Attributes(resource);
+                var linked = resourceAttributes is { } resourceFlags && (resourceFlags & FileAttributes.ReparsePoint) != 0;
                 profiles.Add(new ResourceProfile
                 {
                     FolderName = folder,
@@ -74,7 +194,7 @@ public sealed class ResourceSharingService : IResourceSharingService
             }
             catch (Exception exception) when (exception is IOException or UnauthorizedAccessException)
             {
-                // 个别账号无访问权限时跳过该账号，其余账号仍可扫描。
+                logger.LogDebug(exception, "资源扫描跳过不可访问账号 {AccountPath}。", account);
             }
         }
         return profiles.OrderBy(profile => profile.FolderName, StringComparer.OrdinalIgnoreCase).ToArray();
@@ -82,6 +202,23 @@ public sealed class ResourceSharingService : IResourceSharingService
 
     /// <summary>将目标账号的 0000 备份到同一账号目录，再创建指向来源的真实 NTFS junction；已有相同共享时返回空值。</summary>
     public ShareBackup? EnableSharing(string gamePath, string sourceFolder, IEnumerable<string> targetFolders)
+    {
+        logger.LogInformation("资源共享开始。");
+        try
+        {
+            var backup = EnableSharingCore(gamePath, sourceFolder, targetFolders);
+            logger.LogInformation("资源共享完成，事务 {BackupId}，新目标 {TargetCount}。", backup?.Id, backup?.Entries.Count ?? 0);
+            return backup;
+        }
+        catch (Exception exception)
+        {
+            logger.LogError(exception, "资源共享失败，原资源和已保存清单保留供还原检查。");
+            throw;
+        }
+    }
+
+    /// <summary>校验来源和目标，先保存意图，再逐项移动原目录并安装暂存 junction。</summary>
+    private ShareBackup? EnableSharingCore(string gamePath, string sourceFolder, IEnumerable<string> targetFolders)
     {
         ArgumentNullException.ThrowIfNull(targetFolders);
         EnsureStopped();
@@ -102,20 +239,20 @@ public sealed class ResourceSharingService : IResourceSharingService
         {
             if (active.Any(item => ResourcePathValidation.Equal(item.SourcePath, target)))
                 throw new InvalidOperationException($"目标仍是活动共享事务的资源来源，请先还原依赖账号：{target}");
-            var attributes = ResourcePathValidation.Attributes(target);
+            var attributes = files.Attributes(target);
             var pending = active.Where(item => item.Entries.Any(entry => !entry.Restored && ResourcePathValidation.Equal(entry.ResourcePath, target))).ToArray();
-            if (attributes is not null && (attributes & FileAttributes.ReparsePoint) != 0)
+            if (attributes is { } linkFlags && (linkFlags & FileAttributes.ReparsePoint) != 0)
             {
                 if (!IsMatchingJunction(target, source) || pending.Any(item => !ResourcePathValidation.Equal(item.SourcePath, source)))
                     throw new InvalidOperationException($"目标已有其他共享链接，请先处理原事务：{target}");
                 continue;
             }
             if (pending.Length > 0) throw new InvalidOperationException($"目标存在尚未还原的资源事务：{target}");
-            if (attributes is not null && (attributes & FileAttributes.Directory) == 0)
+            if (attributes is { } directoryFlags && (directoryFlags & FileAttributes.Directory) == 0)
                 throw new InvalidOperationException($"目标资源路径被文件占用：{target}");
             var entry = new ShareEntry { ResourcePath = target, BackupPath = target + ".mdbackup-" + backup.Id, OriginalExisted = attributes is not null };
-            if (ResourcePathValidation.Attributes(entry.BackupPath) is not null) throw new InvalidOperationException($"备份路径已经存在：{entry.BackupPath}");
-            if (ResourcePathValidation.Attributes(StagingPath(backup, entry)) is not null) throw new InvalidOperationException($"junction 暂存路径已经存在：{StagingPath(backup, entry)}");
+            if (files.Attributes(entry.BackupPath) is not null) throw new InvalidOperationException($"备份路径已经存在：{entry.BackupPath}");
+            if (files.Attributes(StagingPath(backup, entry)) is not null) throw new InvalidOperationException($"junction 暂存路径已经存在：{StagingPath(backup, entry)}");
             backup.Entries.Add(entry);
         }
         if (backup.Entries.Count == 0) return null;
@@ -124,17 +261,19 @@ public sealed class ResourceSharingService : IResourceSharingService
         EnsureStopped();
         // 所有目标和原始存在状态先原子落盘，目录移动前即拥有可恢复的完整意图。
         SaveBackup(backup);
+        logger.LogDebug("资源事务 {BackupId} 已保存完整意图，来源 {SourcePath}，目标 {TargetCount}。", backup.Id, source, backup.Entries.Count);
         foreach (var entry in backup.Entries)
         {
             EnsureStopped();
             ValidateMutationPaths(backup, entry);
-            var current = ResourcePathValidation.Attributes(entry.ResourcePath);
+            var current = files.Attributes(entry.ResourcePath);
             if (entry.OriginalExisted)
             {
-                if (current is null || (current & FileAttributes.ReparsePoint) != 0 || (current & FileAttributes.Directory) == 0)
+                if (current is not { } currentFlags || (currentFlags & FileAttributes.ReparsePoint) != 0 || (currentFlags & FileAttributes.Directory) == 0)
                     throw new InvalidOperationException($"目标在事务期间发生变化，保留清单：{entry.ResourcePath}");
                 EnsureOriginalIdentity(backup, entry, entry.ResourcePath);
-                Directory.Move(entry.ResourcePath, entry.BackupPath);
+                files.MoveDirectory(entry.ResourcePath, entry.BackupPath);
+                logger.LogDebug("资源事务 {BackupId} 移动原目录 {ResourcePath} 至 {BackupPath}。", backup.Id, entry.ResourcePath, entry.BackupPath);
                 entry.Moved = true;
                 SaveBackup(backup);
             }
@@ -144,12 +283,14 @@ public sealed class ResourceSharingService : IResourceSharingService
             ResourcePathValidation.RealDirectory(source);
             var staging = StagingPath(backup, entry);
             JunctionOperations.Create(staging, source);
+            logger.LogDebug("资源事务 {BackupId} 创建暂存 junction {StagingPath}，来源 {SourcePath}。", backup.Id, staging, source);
             SaveBackup(backup);
             EnsureStopped();
             ValidateMutationPaths(backup, entry);
-            if (ResourcePathValidation.Attributes(entry.ResourcePath) is not null || !IsMatchingJunction(staging, source))
+            if (files.Attributes(entry.ResourcePath) is not null || !IsMatchingJunction(staging, source))
                 throw new InvalidOperationException($"安装共享链接前路径发生变化，保留事务现场：{entry.ResourcePath}");
-            Directory.Move(staging, entry.ResourcePath);
+            files.MoveDirectory(staging, entry.ResourcePath);
+            logger.LogDebug("资源事务 {BackupId} 安装 junction 至 {ResourcePath}。", backup.Id, entry.ResourcePath);
             entry.Linked = true;
             SaveBackup(backup);
         }
@@ -159,16 +300,49 @@ public sealed class ResourceSharingService : IResourceSharingService
     /// <summary>读取与指定安装对应的所有事务；损坏、越界或链接清单以异常报告，原文件保持原样。</summary>
     public IReadOnlyList<ShareBackup> GetBackups(string gamePath)
     {
+        logger.LogInformation("资源清单读取开始。");
+        try
+        {
+            var backups = GetBackupsCore(gamePath);
+            logger.LogInformation("资源清单读取完成，共 {BackupCount} 个事务。", backups.Count);
+            return backups;
+        }
+        catch (Exception exception)
+        {
+            logger.LogError(exception, "资源清单读取失败，清单文件保持原样。");
+            throw;
+        }
+    }
+
+    /// <summary>读取并校验指定游戏的全部事务清单。</summary>
+    private IReadOnlyList<ShareBackup> GetBackupsCore(string gamePath)
+    {
         var game = ResourcePathValidation.Game(gamePath);
         ResourcePathValidation.State(stateDirectory, game);
-        if (!Directory.Exists(stateDirectory)) return [];
-        return Directory.EnumerateFiles(stateDirectory, "*.json", SearchOption.TopDirectoryOnly)
+        if (!files.DirectoryExists(stateDirectory)) return [];
+        return files.ManifestFiles(stateDirectory)
             .Select(ReadBackup).Where(backup => ResourcePathValidation.Equal(backup.GamePath, game))
             .OrderByDescending(backup => backup.CreatedAt).ToArray();
     }
 
     /// <summary>以目录实际状态对账恢复；只删除本事务目标一致的 junction，不删除来源或第三方目录。</summary>
     public void Restore(string backupId)
+    {
+        logger.LogInformation("资源还原开始，事务 {BackupId}。", backupId);
+        try
+        {
+            RestoreCore(backupId);
+            logger.LogInformation("资源还原完成，事务 {BackupId}。", backupId);
+        }
+        catch (Exception exception)
+        {
+            logger.LogError(exception, "资源还原失败，事务 {BackupId} 的备份及冲突现场保留。", backupId);
+            throw;
+        }
+    }
+
+    /// <summary>按持久清单和实际目录身份恢复资源，保存每一步完成状态。</summary>
+    private void RestoreCore(string backupId)
     {
         ResourcePathValidation.ValidateId(backupId);
         EnsureStopped();
@@ -186,22 +360,23 @@ public sealed class ResourceSharingService : IResourceSharingService
             EnsureStopped();
             ValidateMutationPaths(backup, entry);
             var staging = StagingPath(backup, entry);
-            var stagingAttributes = ResourcePathValidation.Attributes(staging);
-            if (stagingAttributes is not null && (stagingAttributes & FileAttributes.ReparsePoint) != 0 && IsMatchingJunction(staging, backup.SourcePath))
+            var stagingAttributes = files.Attributes(staging);
+            if (stagingAttributes is { } stagingFlags && (stagingFlags & FileAttributes.ReparsePoint) != 0 && IsMatchingJunction(staging, backup.SourcePath))
             {
                 EnsureStopped();
                 JunctionOperations.RemoveMatching(staging, backup.SourcePath);
+                logger.LogDebug("资源事务 {BackupId} 移除匹配暂存 junction {StagingPath}。", backup.Id, staging);
                 SaveBackup(backup);
             }
             // 未完成的普通暂存目录或第三方暂存链接只保留，不占用原始 0000 的回迁路径。
-            var targetAttributes = ResourcePathValidation.Attributes(entry.ResourcePath);
-            var backupAttributes = ResourcePathValidation.Attributes(entry.BackupPath);
-            if (backupAttributes is not null && ((backupAttributes & FileAttributes.ReparsePoint) != 0 || (backupAttributes & FileAttributes.Directory) == 0))
+            var targetAttributes = files.Attributes(entry.ResourcePath);
+            var backupAttributes = files.Attributes(entry.BackupPath);
+            if (backupAttributes is { } backupFlags && ((backupFlags & FileAttributes.ReparsePoint) != 0 || (backupFlags & FileAttributes.Directory) == 0))
                 throw new InvalidOperationException($"原始备份被文件或链接替换，保留现场：{entry.BackupPath}");
-            if (backupAttributes is not null) EnsureOriginalIdentity(backup, entry, entry.BackupPath);
             if (!entry.OriginalExisted && backupAttributes is not null)
                 throw new InvalidOperationException($"没有原始目录的事务出现未知备份，保留现场：{entry.BackupPath}");
-            if (targetAttributes is not null && (targetAttributes & FileAttributes.ReparsePoint) != 0)
+            if (backupAttributes is not null) EnsureOriginalIdentity(backup, entry, entry.BackupPath);
+            if (targetAttributes is { } targetFlags && (targetFlags & FileAttributes.ReparsePoint) != 0)
             {
                 if (!IsMatchingJunction(entry.ResourcePath, backup.SourcePath))
                     throw new InvalidOperationException($"目标已指向其他来源，保留现场：{entry.ResourcePath}");
@@ -210,13 +385,14 @@ public sealed class ResourceSharingService : IResourceSharingService
                 EnsureStopped();
                 ValidateMutationPaths(backup, entry);
                 JunctionOperations.RemoveMatching(entry.ResourcePath, backup.SourcePath);
+                logger.LogDebug("资源事务 {BackupId} 移除匹配共享 junction {ResourcePath}。", backup.Id, entry.ResourcePath);
                 entry.Linked = false;
                 SaveBackup(backup);
                 targetAttributes = null;
             }
-            else if (targetAttributes is not null)
+            else if (targetAttributes is { } replacementFlags)
             {
-                if ((targetAttributes & FileAttributes.Directory) == 0 || backupAttributes is not null || !entry.OriginalExisted)
+                if ((replacementFlags & FileAttributes.Directory) == 0 || backupAttributes is not null || !entry.OriginalExisted)
                     throw new InvalidOperationException($"目标已出现第三方文件或目录，保留现场：{entry.ResourcePath}");
                 EnsureOriginalIdentity(backup, entry, entry.ResourcePath);
                 // 原目录未移动，或回迁完成但状态未落盘；无需再次移动或删除。
@@ -225,9 +401,10 @@ public sealed class ResourceSharingService : IResourceSharingService
             {
                 EnsureStopped();
                 ValidateMutationPaths(backup, entry);
-                if (ResourcePathValidation.Attributes(entry.ResourcePath) is not null)
+                if (files.Attributes(entry.ResourcePath) is not null)
                     throw new InvalidOperationException($"回迁前目标被占用，保留原始备份：{entry.ResourcePath}");
-                Directory.Move(entry.BackupPath, entry.ResourcePath);
+                files.MoveDirectory(entry.BackupPath, entry.ResourcePath);
+                logger.LogDebug("资源事务 {BackupId} 移动原备份 {BackupPath} 回 {ResourcePath}。", backup.Id, entry.BackupPath, entry.ResourcePath);
                 entry.Moved = false;
                 SaveBackup(backup);
             }
@@ -238,6 +415,7 @@ public sealed class ResourceSharingService : IResourceSharingService
             entry.Linked = false;
             entry.Moved = false;
             entry.Restored = true;
+            logger.LogDebug("资源事务 {BackupId} 条目还原完成 {ResourcePath}。", backup.Id, entry.ResourcePath);
             SaveBackup(backup);
         }
         backup.Restored = backup.Entries.All(entry => entry.Restored);
@@ -245,12 +423,12 @@ public sealed class ResourceSharingService : IResourceSharingService
     }
 
     /// <summary>再次校验目录祖先和预期备份边界，防止检查后路径改变。</summary>
-    private static void ValidateMutationPaths(ShareBackup backup, ShareEntry entry)
+    private void ValidateMutationPaths(ShareBackup backup, ShareEntry entry)
     {
         ResourcePathValidation.ManifestResource(backup.GamePath, entry.ResourcePath);
         ResourcePathValidation.EnsureNoReparseAncestors(entry.BackupPath);
         var account = Path.GetDirectoryName(entry.ResourcePath)!;
-        if (!Directory.Exists(account)) throw new DirectoryNotFoundException($"账号目录已被移除：{account}");
+        if (!files.DirectoryExists(account)) throw new DirectoryNotFoundException($"账号目录已被移除：{account}");
     }
 
     /// <summary>读取并检查单份清单，不将反序列化字段直接作为可信文件路径。</summary>
@@ -259,9 +437,9 @@ public sealed class ResourceSharingService : IResourceSharingService
         try
         {
             ResourcePathValidation.EnsureNoReparseAncestors(path, false);
-            if (ResourcePathValidation.Attributes(path) is not { } attributes) throw new FileNotFoundException("备份清单不存在。", path);
+            if (files.Attributes(path) is not { } attributes) throw new FileNotFoundException("备份清单不存在。", path);
             if ((attributes & (FileAttributes.ReparsePoint | FileAttributes.Directory)) != 0) throw new InvalidDataException("备份清单应为普通文件。");
-            using var document = JsonDocument.Parse(File.ReadAllText(path));
+            using var document = JsonDocument.Parse(files.ReadText(path));
             var backup = document.RootElement.Deserialize<ShareBackup>(JsonOptions) ?? throw new InvalidDataException("备份清单内容为空。");
             if (!document.RootElement.TryGetProperty("FormatVersion", out var version) || version.ValueKind != JsonValueKind.Number || !version.TryGetInt32(out var number) || number != 1)
                 throw new InvalidDataException("资源清单格式版本错误。");
@@ -289,7 +467,7 @@ public sealed class ResourceSharingService : IResourceSharingService
                 foreach (var pair in persisted)
                 {
                     if (!backup.Entries.Any(entry => entry.OriginalExisted && string.Equals(entry.ResourcePath, pair.Key, StringComparison.OrdinalIgnoreCase)) ||
-                        pair.Value is null || pair.Value.Length != 25 || pair.Value[8] != ':' || pair.Value.Where(character => character != ':').Any(character => !Uri.IsHexDigit(character)) || !identities.TryAdd(pair.Key, pair.Value))
+                        pair.Value is null || !Regex.IsMatch(pair.Value, "\\A[0-9A-Fa-f]{8}:[0-9A-Fa-f]{16}\\z", RegexOptions.CultureInvariant) || !identities.TryAdd(pair.Key, pair.Value))
                         throw new InvalidDataException("原目录标识不符合事务范围。");
                 }
             }
@@ -314,10 +492,10 @@ public sealed class ResourceSharingService : IResourceSharingService
     private void SaveBackup(ShareBackup backup)
     {
         ResourcePathValidation.State(stateDirectory, backup.GamePath);
-        Directory.CreateDirectory(stateDirectory);
+        files.CreateDirectory(stateDirectory);
         ResourcePathValidation.EnsureNoReparseAncestors(stateDirectory);
         var path = Path.Combine(stateDirectory, backup.Id + ".json");
-        if (ResourcePathValidation.Attributes(path) is { } attributes && (attributes & (FileAttributes.ReparsePoint | FileAttributes.Directory)) != 0)
+        if (files.Attributes(path) is { } attributes && (attributes & (FileAttributes.ReparsePoint | FileAttributes.Directory)) != 0)
             throw new InvalidDataException($"清单路径被链接或目录占用：{path}");
         var temporary = path + "." + Guid.NewGuid().ToString("N") + ".tmp";
         try
@@ -325,35 +503,26 @@ public sealed class ResourceSharingService : IResourceSharingService
             var document = JsonSerializer.SerializeToNode(backup, JsonOptions)!.AsObject();
             document["FormatVersion"] = 1;
             document["StagingPaths"] = JsonSerializer.SerializeToNode(backup.Entries.ToDictionary(entry => entry.ResourcePath, entry => StagingPath(backup, entry)), JsonOptions);
-            if (originalDirectoryIdentities.TryGetValue(backup.Id, out var identities))
-                document["OriginalDirectoryIdentities"] = JsonSerializer.SerializeToNode(identities, JsonOptions);
+            document["OriginalDirectoryIdentities"] = JsonSerializer.SerializeToNode(originalDirectoryIdentities[backup.Id], JsonOptions);
             var bytes = JsonSerializer.SerializeToUtf8Bytes(document, JsonOptions);
-            using (var stream = new FileStream(temporary, FileMode.CreateNew, FileAccess.Write, FileShare.None, 4096, FileOptions.WriteThrough))
-            {
-                stream.Write(bytes);
-                stream.Flush(true);
-            }
-            if (File.Exists(path)) File.Replace(temporary, path, null);
-            else File.Move(temporary, path);
+            files.WriteDurable(temporary, bytes);
+            if (files.FileExists(path)) files.ReplaceFile(temporary, path);
+            else files.MoveFile(temporary, path);
+            logger.LogDebug("资源事务 {BackupId} 清单已原子写入 {ManifestPath}，条目 {EntryCount}，全部还原 {Restored}。", backup.Id, path, backup.Entries.Count, backup.Restored);
         }
         finally
         {
-            if (File.Exists(temporary)) File.Delete(temporary);
+            if (files.FileExists(temporary)) files.DeleteFile(temporary);
         }
     }
 
     /// <summary>核验原目录稳定身份，阻止备份缺失后误认第三方新目录。</summary>
     private void EnsureOriginalIdentity(ShareBackup backup, ShareEntry entry, string observedPath)
     {
-        if (originalDirectoryIdentities.TryGetValue(backup.Id, out var identities) && identities.TryGetValue(entry.ResourcePath, out var expected))
-        {
-            if (!string.Equals(JunctionOperations.GetDirectoryIdentity(observedPath), expected, StringComparison.Ordinal))
-                throw new InvalidOperationException($"目录已被第三方替换，保留未完成清单：{observedPath}");
-        }
-        else
-        {
-            throw new InvalidDataException($"清单缺少原目录标识，保留现场：{observedPath}");
-        }
+        // 启用前完整采集身份，读取清单时完整校验身份；此处只消费已验证的身份记录。
+        var expected = originalDirectoryIdentities[backup.Id][entry.ResourcePath];
+        if (!string.Equals(JunctionOperations.GetDirectoryIdentity(observedPath), expected, StringComparison.Ordinal))
+            throw new InvalidOperationException($"目录已被第三方替换，保留未完成清单：{observedPath}");
     }
 
     /// <summary>推导本事务唯一 junction 暂存路径，永不把未完成空壳放到实际 0000。</summary>
@@ -367,7 +536,7 @@ public sealed class ResourceSharingService : IResourceSharingService
     }
 
     /// <summary>迭代统计普通文件大小，对链接、无访问权限或被同时移除的条目直接跳过。</summary>
-    private static long MeasureRealFiles(string root)
+    private long MeasureRealFiles(string root)
     {
         var directories = new Stack<string>();
         directories.Push(root);
@@ -376,30 +545,38 @@ public sealed class ResourceSharingService : IResourceSharingService
         {
             try
             {
-                var attributes = ResourcePathValidation.Attributes(directory);
-                if (attributes is null || (attributes & FileAttributes.ReparsePoint) != 0 || (attributes & FileAttributes.Directory) == 0) continue;
+                if (files.Attributes(directory) is not { } attributes || (attributes & FileAttributes.ReparsePoint) != 0 || (attributes & FileAttributes.Directory) == 0) continue;
                 foreach (var path in SafeEntries(directory))
                 {
                     try
                     {
-                        var child = ResourcePathValidation.Attributes(path);
-                        if (child is null || (child & FileAttributes.ReparsePoint) != 0) continue;
+                        if (files.Attributes(path) is not { } child || (child & FileAttributes.ReparsePoint) != 0) continue;
                         if ((child & FileAttributes.Directory) != 0) directories.Push(path);
-                        else total = checked(total + new FileInfo(path).Length);
+                        else total = checked(total + files.FileLength(path));
                     }
-                    catch (Exception exception) when (exception is IOException or UnauthorizedAccessException) { }
+                    catch (Exception exception) when (exception is IOException or UnauthorizedAccessException)
+                    {
+                        logger.LogDebug(exception, "资源容量统计跳过不可访问条目 {ResourcePath}。", path);
+                    }
                 }
             }
-            catch (Exception exception) when (exception is IOException or UnauthorizedAccessException) { }
+            catch (Exception exception) when (exception is IOException or UnauthorizedAccessException)
+            {
+                logger.LogDebug(exception, "资源容量统计跳过不可访问目录 {ResourcePath}。", directory);
+            }
         }
         return total;
     }
 
     /// <summary>物化目录条目后返回，枚举期间遇到权限或并发移除则返回空集合。</summary>
-    private static string[] SafeEntries(string path)
+    private string[] SafeEntries(string path)
     {
-        try { return Directory.GetFileSystemEntries(path); }
-        catch (Exception exception) when (exception is IOException or UnauthorizedAccessException) { return []; }
+        try { return files.Entries(path); }
+        catch (Exception exception) when (exception is IOException or UnauthorizedAccessException)
+        {
+            logger.LogDebug(exception, "资源目录枚举失败，跳过 {ResourcePath}。", path);
+            return [];
+        }
     }
 
     /// <summary>每次资源变更前确认 Master Duel 已退出。</summary>
@@ -420,21 +597,20 @@ public sealed class ResourceSharingService : IResourceSharingService
     private static GameTransactionLock AcquireGameLock(string game) => new(game);
 
     /// <summary>同一游戏安装的跨进程资源事务互斥锁。</summary>
-    private sealed class GameTransactionLock : IDisposable
+    internal sealed class GameTransactionLock : IDisposable
     {
         /// <summary>当前拥有的 Windows 命名互斥对象。</summary>
-        private readonly Mutex mutex;
+        private readonly IResourceMutex mutex;
 
         /// <summary>等待资源事务锁，接管退出进程留下的锁后允许观察清单恢复。</summary>
-        internal GameTransactionLock(string game)
+        internal GameTransactionLock(string game, IResourceMutex? injectedMutex = null)
         {
             var key = Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(game.ToUpperInvariant())));
-            mutex = new Mutex(false, @"Local\MasterDuelSwitcher.Resources." + key);
+            mutex = injectedMutex ?? new WindowsResourceMutex(@"Local\MasterDuelSwitcher.Resources." + key);
             try
             {
-                if (!mutex.WaitOne(TimeSpan.FromSeconds(10)))
+                if (!mutex.Wait(TimeSpan.FromSeconds(10)))
                 {
-                    mutex.Dispose();
                     throw new InvalidOperationException("同一游戏的资源事务正在执行，请稍后重试。");
                 }
             }
@@ -442,12 +618,17 @@ public sealed class ResourceSharingService : IResourceSharingService
             {
                 // 退出进程遗留的锁已由当前线程获得，后续依照持久清单检查真实目录。
             }
+            catch
+            {
+                mutex.Dispose();
+                throw;
+            }
         }
 
         /// <summary>释放当前事务持有的命名锁。</summary>
         public void Dispose()
         {
-            mutex.ReleaseMutex();
+            mutex.Release();
             mutex.Dispose();
         }
     }

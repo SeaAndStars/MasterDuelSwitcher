@@ -1,6 +1,7 @@
 using MasterDuelSwitcher.Core.Models;
 using MasterDuelSwitcher.Core.Services;
 using Microsoft.Data.Sqlite;
+using Microsoft.Extensions.Logging;
 using Xunit;
 
 namespace MasterDuelSwitcher.Tests;
@@ -210,6 +211,73 @@ public sealed class SettingsStoreTests : IDisposable
         Assert.Empty(loaded.AccountNotes);
         Assert.Empty(loaded.AccountBindings);
         Assert.Empty(loaded.HiddenAccounts);
+    }
+
+    /// <summary>所有成功数据库操作应记录 Debug 开始及完成，并且不记录账号正文。</summary>
+    [Fact]
+    public void SuccessfulOperationsLogDebugPhasesWithoutAccountData()
+    {
+        var logger = new RecordingLogger();
+        var store = new SettingsStore(_directory, logger);
+        store.Load();
+        store.Save(new AppSettings { AccountNotes = new() { ["private-id"] = "private-note" }, AccountBindings = new() { ["private-id"] = "private-binding" } });
+        store.SynchronizeAccounts([new SteamAccount { SteamId = "private-id", AccountName = "private-name", PersonaName = "private-persona" }]);
+        store.GetAccounts();
+        Assert.Equal(8, logger.Entries.Count);
+        Assert.All(logger.Entries, entry => Assert.Equal(LogLevel.Debug, entry.Level));
+        foreach (var operation in new[] { "Load", "Save", "SynchronizeAccounts", "GetAccounts" })
+        {
+            Assert.Contains(logger.Entries, entry => entry.Message.Contains(operation, StringComparison.Ordinal) && entry.Message.Contains("开始", StringComparison.Ordinal));
+            Assert.Contains(logger.Entries, entry => entry.Message.Contains(operation, StringComparison.Ordinal) && entry.Message.Contains("完成", StringComparison.Ordinal));
+        }
+        var text = string.Join("\n", logger.Entries.Select(entry => entry.Message));
+        foreach (var secret in new[] { "private-id", "private-note", "private-binding", "private-name", "private-persona" }) Assert.DoesNotContain(secret, text);
+    }
+
+    /// <summary>损坏数据库应记录 Error 与原始异常栈，同时保留数据库字节。</summary>
+    [Fact]
+    public void CorruptDatabaseLogsOriginalExceptionAndKeepsOriginalFile()
+    {
+        var logger = new RecordingLogger();
+        byte[] original = [0x42, 0x41, 0x44];
+        var path = Path.Combine(_directory, "accounts.db");
+        File.WriteAllBytes(path, original);
+        var store = new SettingsStore(_directory, logger);
+        var reported = Assert.Throws<InvalidDataException>(() => store.Load());
+        Assert.Equal(2, logger.Entries.Count);
+        var error = Assert.Single(logger.Entries, entry => entry.Level == LogLevel.Error);
+        Assert.Same(reported.InnerException, error.Exception);
+        Assert.False(string.IsNullOrEmpty(error.Exception!.StackTrace));
+        Assert.Contains("Load", error.Message);
+        Assert.Equal(original, File.ReadAllBytes(path));
+    }
+
+    /// <summary>文件系统异常也应记录 Error 与异常栈，并保持原来的异常语义。</summary>
+    [Fact]
+    public void FileSystemFailureLogsExceptionWithoutChangingReportedType()
+    {
+        var logger = new RecordingLogger();
+        var occupiedPath = Path.Combine(_directory, "occupied");
+        File.WriteAllText(occupiedPath, "retained");
+        var store = new SettingsStore(occupiedPath, logger);
+        var reported = Assert.Throws<IOException>(() => store.Load());
+        var error = Assert.Single(logger.Entries, entry => entry.Level == LogLevel.Error);
+        Assert.Same(reported, error.Exception);
+        Assert.False(string.IsNullOrEmpty(error.Exception!.StackTrace));
+        Assert.Equal("retained", File.ReadAllText(occupiedPath));
+    }
+
+    /// <summary>只在测试中捕获日志内容与异常，数据库操作仍使用真实 SQLite。</summary>
+    private sealed class RecordingLogger : ILogger<SettingsStore>
+    {
+        /// <summary>已记录的级别、公开消息和原始异常。</summary>
+        public List<(LogLevel Level, string Message, Exception? Exception)> Entries { get; } = [];
+        /// <summary>测试无需创建日志作用域。</summary>
+        public IDisposable? BeginScope<TState>(TState state) where TState : notnull => null;
+        /// <summary>启用全部日志级别以验证实际调用。</summary>
+        public bool IsEnabled(LogLevel logLevel) => true;
+        /// <summary>保存由日志扩展方法格式化的公开消息和原始异常。</summary>
+        public void Log<TState>(LogLevel logLevel, EventId eventId, TState state, Exception? exception, Func<TState, Exception?, string> formatter) => Entries.Add((logLevel, formatter(state, exception), exception));
     }
 
     /// <summary>打开临时数据库供测试直接核实关系字段和制造真实事务错误。</summary>

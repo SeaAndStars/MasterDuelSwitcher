@@ -1,4 +1,6 @@
 using MasterDuelSwitcher.Core.Models;
+using Microsoft.Extensions.Logging;
+using Microsoft.Extensions.Logging.Abstractions;
 using Microsoft.Win32;
 using System.Globalization;
 using System.Security;
@@ -60,16 +62,36 @@ public sealed class SteamDiscoveryService : ISteamDiscoveryService
 
     /// <summary>读取 VDF 与安装清单文本的函数。</summary>
     private readonly Func<string, string> readText;
+    /// <summary>只记录发现阶段和计数，不记录账号昵称、登录名或 VDF 正文。</summary>
+    private readonly ILogger<SteamDiscoveryService> logger;
 
     /// <summary>使用可选只读发现环境和文本读取器；默认使用 Windows 注册表与真实文件。</summary>
-    public SteamDiscoveryService(ISteamDiscoveryEnvironment? environment = null, Func<string, string>? readText = null)
+    public SteamDiscoveryService(ISteamDiscoveryEnvironment? environment = null, Func<string, string>? readText = null, ILogger<SteamDiscoveryService>? logger = null)
     {
         this.environment = environment ?? new WindowsSteamDiscoveryEnvironment();
         this.readText = readText ?? File.ReadAllText;
+        this.logger = logger ?? NullLogger<SteamDiscoveryService>.Instance;
     }
 
     /// <summary>发现 Steam、Master Duel 与登录账号，可使用手工目录覆盖。</summary>
     public DiscoveryResult Discover(string? steamOverride = null, string? gameOverride = null)
+    {
+        logger.LogInformation("开始发现本机 Steam 与 Master Duel 安装。");
+        try
+        {
+            var result = DiscoverCore(steamOverride, gameOverride);
+            logger.LogInformation("安装发现完成，已读取 {AccountCount} 个本机记住的账号。", result.Accounts.Count);
+            return result;
+        }
+        catch (Exception exception)
+        {
+            logger.LogError(exception, "Steam 与 Master Duel 安装发现失败。");
+            throw;
+        }
+    }
+
+    /// <summary>执行自动或手工安装发现，保持原有清单回退规则。</summary>
+    private DiscoveryResult DiscoverCore(string? steamOverride, string? gameOverride)
     {
         string steam = string.IsNullOrWhiteSpace(steamOverride)
             ? FindSteamInstallation()
@@ -87,6 +109,23 @@ public sealed class SteamDiscoveryService : ISteamDiscoveryService
 
     /// <summary>读取指定 Steam 目录中的账号列表。</summary>
     public IReadOnlyList<SteamAccount> ReadAccounts(string steamPath)
+    {
+        logger.LogDebug("开始只读解析本机 Steam 账号元数据。");
+        try
+        {
+            var accounts = ReadAccountsCore(steamPath);
+            logger.LogDebug("Steam 账号元数据读取完成，共 {AccountCount} 个有效账号。", accounts.Count);
+            return accounts;
+        }
+        catch (Exception exception)
+        {
+            logger.LogWarning(exception, "Steam 账号元数据读取失败，原始配置保持原样。");
+            throw;
+        }
+    }
+
+    /// <summary>解析有效 Steam64 账号字段，不读取密码或登录令牌。</summary>
+    private IReadOnlyList<SteamAccount> ReadAccountsCore(string steamPath)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(steamPath);
         string loginFile = Path.Combine(Path.GetFullPath(steamPath), "config", "loginusers.vdf");
@@ -132,11 +171,12 @@ public sealed class SteamDiscoveryService : ISteamDiscoveryService
                 }
                 catch (Exception exception) when (exception is SecurityException or UnauthorizedAccessException or IOException)
                 {
-                    // 某个注册表视图不可读取时继续尝试其余已知安装位置。
+                    logger.LogDebug(exception, "一个只读 Steam 注册表视图暂不可读，继续检查其余安装候选。");
                 }
             }
         }
         candidates.Add(environment.FallbackSteamDirectory);
+        logger.LogDebug("Steam 安装候选读取完成，共 {CandidateCount} 项待核验。", candidates.Count);
         foreach (string candidate in candidates.Distinct(StringComparer.OrdinalIgnoreCase))
         {
             string directory = GetExecutableDirectory(candidate, "steam.exe");
@@ -173,7 +213,7 @@ public sealed class SteamDiscoveryService : ISteamDiscoveryService
             }
             catch (Exception exception) when (exception is IOException or UnauthorizedAccessException or FormatException)
             {
-                // 附加库配置暂不可读或损坏时保留原文件，仍检查已知主库。
+                logger.LogWarning(exception, "附加 Steam 库配置暂不可读或损坏，继续检查已知主库。");
             }
         }
 
@@ -196,7 +236,7 @@ public sealed class SteamDiscoveryService : ISteamDiscoveryService
             }
             catch (Exception exception) when (exception is IOException or UnauthorizedAccessException or FormatException)
             {
-                // 单个库清单暂不可读或损坏时保留原文件，继续检查后续库。
+                logger.LogWarning(exception, "一个 Steam 库的游戏清单暂不可读或损坏，继续检查后续库。");
             }
         }
         return "";

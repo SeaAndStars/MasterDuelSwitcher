@@ -1,5 +1,7 @@
 using MasterDuelSwitcher.Core.Models;
 using Microsoft.Data.Sqlite;
+using Microsoft.Extensions.Logging;
+using Microsoft.Extensions.Logging.Abstractions;
 
 namespace MasterDuelSwitcher.Core.Services;
 
@@ -33,13 +35,17 @@ public sealed class SettingsStore : ISettingsStore
     /// <summary>指向固定数据目录的连接字符串，关闭池化以便即时释放文件句柄。</summary>
     private readonly string _connectionString;
 
+    /// <summary>数据库操作日志，只记录操作名称和异常，不记录账号字段正文。</summary>
+    private readonly ILogger<SettingsStore> _logger;
+
     /// <summary>数据库和工具状态所在的规范化完整目录，与 EXE 所在位置独立。</summary>
     public string StateDirectory { get; }
 
     /// <summary>初始化数据库位置；首次实际访问时创建目录和关系表。</summary>
-    public SettingsStore(string stateDirectory)
+    public SettingsStore(string stateDirectory, ILogger<SettingsStore>? logger = null)
     {
         StateDirectory = Path.GetFullPath(stateDirectory);
+        _logger = logger ?? NullLogger<SettingsStore>.Instance;
         _connectionString = new SqliteConnectionStringBuilder
         {
             DataSource = Path.Combine(StateDirectory, "accounts.db"),
@@ -49,7 +55,7 @@ public sealed class SettingsStore : ISettingsStore
     }
 
     /// <summary>在同一事务快照中读取偏好和人工账号字段，损坏数据库报告错误。</summary>
-    public AppSettings Load() => AccessDatabase(connection =>
+    public AppSettings Load() => AccessDatabase(nameof(Load), connection =>
     {
         var settings = new AppSettings();
         using var transaction = connection.BeginTransaction();
@@ -88,7 +94,7 @@ public sealed class SettingsStore : ISettingsStore
         var notes = settings.AccountNotes ?? [];
         var bindings = settings.AccountBindings ?? [];
         var hidden = settings.HiddenAccounts ?? [];
-        AccessDatabase(connection =>
+        AccessDatabase(nameof(Save), connection =>
         {
             using var transaction = connection.BeginTransaction();
             using (var command = CreateCommand(connection, transaction, """
@@ -126,7 +132,7 @@ public sealed class SettingsStore : ISettingsStore
     public void SynchronizeAccounts(IReadOnlyList<SteamAccount> accounts)
     {
         ArgumentNullException.ThrowIfNull(accounts);
-        AccessDatabase(connection =>
+        AccessDatabase(nameof(SynchronizeAccounts), connection =>
         {
             using var transaction = connection.BeginTransaction();
             using (var command = CreateCommand(connection, transaction, "UPDATE accounts SET Present = 0"))
@@ -156,7 +162,7 @@ public sealed class SettingsStore : ISettingsStore
     }
 
     /// <summary>读取当前仍存在的账号；最近使用账号优先，同优先级按账号标识排序。</summary>
-    public IReadOnlyList<SteamAccount> GetAccounts() => AccessDatabase<IReadOnlyList<SteamAccount>>(connection =>
+    public IReadOnlyList<SteamAccount> GetAccounts() => AccessDatabase<IReadOnlyList<SteamAccount>>(nameof(GetAccounts), connection =>
     {
         var accounts = new List<SteamAccount>();
         using var command = connection.CreateCommand();
@@ -176,9 +182,10 @@ public sealed class SettingsStore : ISettingsStore
         return accounts;
     });
 
-    /// <summary>打开连接并事务初始化结构；任何 SQLite 错误均向上报告且保留原始数据库。</summary>
-    private T AccessDatabase<T>(Func<SqliteConnection, T> operation)
+    /// <summary>打开连接并事务初始化结构；记录操作阶段和异常，保留原始数据库及异常语义。</summary>
+    private T AccessDatabase<T>(string operationName, Func<SqliteConnection, T> operation)
     {
+        _logger.LogDebug("SQLite 操作开始：{Operation}", operationName);
         try
         {
             Directory.CreateDirectory(StateDirectory);
@@ -190,11 +197,19 @@ public sealed class SettingsStore : ISettingsStore
                 command.ExecuteNonQuery();
                 transaction.Commit();
             }
-            return operation(connection);
+            var result = operation(connection);
+            _logger.LogDebug("SQLite 操作完成：{Operation}", operationName);
+            return result;
         }
         catch (SqliteException exception)
         {
+            _logger.LogError(exception, "SQLite 操作失败，数据库已保留：{Operation}", operationName);
             throw new InvalidDataException("账号数据库访问失败，原始数据已保留。请检查 accounts.db。", exception);
+        }
+        catch (Exception exception)
+        {
+            _logger.LogError(exception, "SQLite 操作失败：{Operation}", operationName);
+            throw;
         }
     }
 

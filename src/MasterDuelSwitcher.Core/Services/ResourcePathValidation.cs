@@ -15,7 +15,7 @@ internal static class ResourcePathValidation
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(path);
         var full = Path.GetFullPath(path);
-        if (full.Length < 3 || !char.IsAsciiLetter(full[0]) || full[1] != ':' || full[2] != '\\' || full.AsSpan(2).Contains(':'))
+        if (full.StartsWith("\\\\", StringComparison.Ordinal) || full.AsSpan(2).Contains(':'))
             throw new ArgumentException("路径必须是本地磁盘目录。", nameof(path));
         return Path.TrimEndingDirectorySeparator(full);
     }
@@ -83,7 +83,7 @@ internal static class ResourcePathValidation
         var localData = account is null ? null : Path.GetDirectoryName(account);
         if (account is null || localData is null || !IsAccount(Path.GetFileName(account)) ||
             !string.Equals(Path.GetFileName(normalized), "0000", StringComparison.Ordinal) ||
-            !Equal(localData, Path.Combine(game, "LocalData")) || !Equal(resource, normalized))
+            !Equal(localData, Path.Combine(game, "LocalData")) || !string.Equals(resource, normalized, StringComparison.Ordinal))
             throw new InvalidDataException($"备份清单包含越界资源路径：{resource}");
         EnsureNoReparseAncestors(account);
     }
@@ -91,9 +91,10 @@ internal static class ResourcePathValidation
     /// <summary>检查状态目录祖先及其与 LocalData 的隔离关系。</summary>
     internal static void State(string state, string game)
     {
-        EnsureNoReparseAncestors(state);
-        var data = Path.Combine(game, "LocalData");
-        if (Equal(state, data) || state.StartsWith(data + Path.DirectorySeparatorChar, StringComparison.OrdinalIgnoreCase))
+        var normalized = Normalize(state);
+        EnsureNoReparseAncestors(normalized);
+        var data = Normalize(Path.Combine(game, "LocalData"));
+        if (Equal(normalized, data) || normalized.StartsWith(data + Path.DirectorySeparatorChar, StringComparison.OrdinalIgnoreCase))
             throw new InvalidOperationException("事务清单目录必须位于 LocalData 之外。");
     }
 
