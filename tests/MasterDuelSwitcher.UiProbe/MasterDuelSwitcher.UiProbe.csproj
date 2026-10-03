@@ -1,0 +1,10 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <UseWPF>true</UseWPF>
+    <StartupObject>MasterDuelSwitcher.UiProbe.Program</StartupObject>
+  </PropertyGroup>
+  <ItemGroup>
+    <ProjectReference Include="..\..\src\MasterDuelSwitcher.App\MasterDuelSwitcher.App.csproj" />
+  </ItemGroup>
+</Project>

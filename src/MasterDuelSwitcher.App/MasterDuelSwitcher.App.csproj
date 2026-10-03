@@ -9,6 +9,7 @@
   </PropertyGroup>
   <ItemGroup>
     <PackageReference Include="WPF-UI" Version="4.3.0" />
+    <PackageReference Include="Microsoft.Extensions.DependencyInjection" Version="10.0.10" />
     <ProjectReference Include="..\MasterDuelSwitcher.Core\MasterDuelSwitcher.Core.csproj" />
   </ItemGroup>
 </Project>
