@@ -938,7 +938,7 @@ public sealed class FreePackVisionTests : IDisposable
         AssertUnknown(recognizer.Recognize(ToFrame(image)));
     }
 
-    /// <summary>显式日志应记录实际状态及置信度；重复释放后再次识别须在原生访问前拒绝。</summary>
+    /// <summary>显式日志记录实际状态、置信度及标题取样原文；重复释放后再次识别须在原生访问前拒绝。</summary>
     [Fact]
     public void ExplicitDebugLoggerRecordsObservationAndDisposalIsIdempotent()
     {
@@ -951,7 +951,17 @@ public sealed class FreePackVisionTests : IDisposable
         var observation = loggedRecognizer.Recognize(frame);
         Assert.Equal(PackScreen.PackDetails, observation.Screen);
         Assert.Equal("独立卡包标题", observation.PackTitle);
-        var log = Assert.Single(provider.Events);
+        Assert.Equal(2, provider.Events.Count);
+        var titleLog = Assert.Single(provider.Events, entry => entry.Message.StartsWith("FreePackTitleRead", StringComparison.Ordinal));
+        Assert.Equal(LogLevel.Debug, titleLog.Level);
+        Assert.Equal("【独立\t卡包 标题】", Assert.IsType<string>(titleLog.Properties["RawText"]));
+        Assert.Equal(observation.PackTitle, Assert.IsType<string>(titleLog.Properties["PackTitle"]));
+        Assert.Equal(284, Assert.IsType<int>(titleLog.Properties["RegionX"]));
+        Assert.Equal(54, Assert.IsType<int>(titleLog.Properties["RegionY"]));
+        Assert.Equal(1000, Assert.IsType<int>(titleLog.Properties["RegionWidth"]));
+        Assert.Equal(90, Assert.IsType<int>(titleLog.Properties["RegionHeight"]));
+        Assert.Equal(1d, Assert.IsType<double>(titleLog.Properties["AnchorScale"]));
+        var log = Assert.Single(provider.Events, entry => entry.Properties.ContainsKey("Screen"));
         Assert.Equal(LogLevel.Debug, log.Level);
         Assert.Equal(observation.Screen, Assert.IsType<PackScreen>(log.Properties["Screen"]));
         Assert.Equal(observation.Confidence, Assert.IsType<double>(log.Properties["Confidence"]));
@@ -961,7 +971,7 @@ public sealed class FreePackVisionTests : IDisposable
         loggedRecognizer.Dispose();
         loggedRecognizer.Dispose();
         Assert.Throws<ObjectDisposedException>(() => loggedRecognizer.Recognize(frame));
-        Assert.Single(provider.Events);
+        Assert.Equal(2, provider.Events.Count);
     }
 
     /// <summary>模板已经确认免费入口或购买弹窗时，费用文字拒绝仍必须撤回购买坐标。</summary>

@@ -183,15 +183,19 @@ public sealed class OpenCvPackRecognizer : IPackRecognizer, IDisposable
             Math.Min(score, Math.Min(free.Value.Score, one.Value.Score))) { PackTitle = packTitle };
     }
 
-    /// <summary>在必需标题核心与详情导航锚点完整时读取标题上下文，顶部可选留白贴边取零，仅保留Unicode字母和数字作为精确身份。</summary>
+    /// <summary>在必需标题核心与详情导航锚点完整时读取标题，左界排除界面类别分隔线，保留完整Unicode字母数字作为精确身份。</summary>
     /// <param name="color">当前原始客户区的完整 BGRA 像素。</param>
     /// <param name="anchor">已完整匹配且通过标题图像指纹边界验证的详情菜单锚点。</param>
     /// <returns>保留全部中文、字母大小写及数字的标题；没有有效文字时为空。</returns>
     private string ReadPackTitle(Mat color, Match anchor)
     {
-        var region = new Rect((int)Math.Round(anchor.Bounds.X - 1052 * anchor.Scale),
+        // 菜单模板尺度浮动时，标题左侧留白可能包含分隔线；只收紧左界并保留原右界。
+        var suggestedLeft = (int)Math.Round(anchor.Bounds.X - 1052 * anchor.Scale);
+        var left = Math.Max(suggestedLeft, (int)Math.Ceiling(color.Width / 8d));
+        var right = suggestedLeft + (int)Math.Round(1000 * anchor.Scale);
+        var region = new Rect(left,
             Math.Max(0, (int)Math.Round(anchor.Bounds.Y - 307 * anchor.Scale) - (int)Math.Round(15 * anchor.Scale)),
-            (int)Math.Round(1000 * anchor.Scale), (int)Math.Round(90 * anchor.Scale));
+            right - left, (int)Math.Round(90 * anchor.Scale));
         using var area = new Mat(color, region);
         using var isolated = area.Clone();
         var pixels = new byte[region.Width * region.Height * 4];
@@ -200,7 +204,10 @@ public sealed class OpenCvPackRecognizer : IPackRecognizer, IDisposable
         var title = new StringBuilder(text.Length);
         foreach (var rune in text.EnumerateRunes())
             if (Rune.IsLetterOrDigit(rune)) title.Append(rune.ToString());
-        return title.ToString();
+        var normalizedTitle = title.ToString();
+        logger.LogDebug("FreePackTitleRead RegionX={RegionX} RegionY={RegionY} RegionWidth={RegionWidth} RegionHeight={RegionHeight} AnchorScale={AnchorScale} RawText={RawText} PackTitle={PackTitle}",
+            region.X, region.Y, region.Width, region.Height, anchor.Scale, text, normalizedTitle);
+        return normalizedTitle;
     }
 
     /// <summary>由同一按钮上的数量和免费文字推导费用像素矩形，仅补充字形周围的黄色背景。</summary>
