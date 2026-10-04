@@ -191,6 +191,16 @@ public sealed class FreePackAutomationService : IFreePackAutomationService
                     context.Phase = RunPhase.Opening;
                     continue;
                 }
+                // 免费入口已点击但弹窗尚未显示时，只等待仍属原包且明确免费的详情，不追加输入。
+                if (context.Phase == RunPhase.AwaitFreeConfirmation && observation.Screen == PackScreen.PackDetails &&
+                    observation.FreeOffer && SameIdentity(context.CurrentPack!, observation))
+                {
+                    logger.LogDebug("FreePackPurchaseTransitionWaiting RunId={RunId} FrameSequence={FrameSequence} PackTitle={PackTitle} PreviousPrimaryTarget={PreviousPrimaryTarget} CurrentPrimaryTarget={CurrentPrimaryTarget} PreviousNextTarget={PreviousNextTarget} CurrentNextTarget={CurrentNextTarget} PreviousAnimationSkipTarget={PreviousAnimationSkipTarget} CurrentAnimationSkipTarget={CurrentAnimationSkipTarget}",
+                        context.RunId, context.FrameSequence, observation.PackTitle, context.CurrentPack!.PrimaryTarget, observation.PrimaryTarget,
+                        context.CurrentPack.NextTarget, observation.NextTarget, context.CurrentPack.AnimationSkipTarget, observation.AnimationSkipTarget);
+                    await DelayAsync(context, cancellationToken).ConfigureAwait(false);
+                    continue;
+                }
                 if (context.Phase == RunPhase.Opening && observation.Screen == PackScreen.Opening)
                 {
                     await SkipAnimationAsync(context, observation, cancellationToken).ConfigureAwait(false);
