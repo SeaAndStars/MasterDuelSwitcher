@@ -275,7 +275,7 @@ public sealed class OpenCvPackRecognizer : IPackRecognizer, IDisposable
             anchor.Bounds.Right - separatorLeft, anchor.Bounds.Height)
             .Intersect(anchor.Bounds);
         var separator = FindWithLocalization(original, 1, separatorTemplate, separatorRegion,
-            new[] { anchor.Scale * .98, anchor.Scale, anchor.Scale * 1.02, anchor.Scale * 1.10 });
+            new[] { anchor.Scale * .96, anchor.Scale * .98, anchor.Scale, anchor.Scale * 1.02, anchor.Scale * 1.10 });
         if (separator is null)
         {
             logger.LogDebug("FreePackHeaderRejected Reason={Reason}", "MissingSeparator");
@@ -445,7 +445,8 @@ public sealed class OpenCvPackRecognizer : IPackRecognizer, IDisposable
         var template = templates[name];
         var x = anchor.Bounds.X + (template.X - anchor.Template.X) * anchor.Scale;
         var y = anchor.Bounds.Y + (template.Y - anchor.Template.Y) * anchor.Scale;
-        var margin = 14 * anchor.Scale;
+        // 下一包距详情锚点较远，文字尺度的细小误差会累积为箭头裁切；仅扩大其邻近搜索边界。
+        var margin = (name == "next-arrow" ? 28 : 14) * anchor.Scale;
         var region = new Rect((int)Math.Floor((x - margin) * factor), (int)Math.Floor((y - margin) * factor),
             (int)Math.Ceiling((template.Gray.Width * anchor.Scale + 2 * margin) * factor),
             (int)Math.Ceiling((template.Gray.Height * anchor.Scale + 2 * margin) * factor));
