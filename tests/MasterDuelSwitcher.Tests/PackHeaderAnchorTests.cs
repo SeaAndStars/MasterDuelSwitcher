@@ -1,8 +1,10 @@
 using System.Runtime.InteropServices;
 using MasterDuelSwitcher.Core.Models;
 using MasterDuelSwitcher.Core.Services;
+using Microsoft.Extensions.Logging;
 using OpenCvSharp;
 using Xunit;
+using LogLevel = Microsoft.Extensions.Logging.LogLevel;
 
 namespace MasterDuelSwitcher.Tests;
 
@@ -217,19 +219,26 @@ public sealed class PackHeaderAnchorTests
         }
     }
 
-    /// <summary>详情形态仍存在但完整类别高度仅约十一像素时，退化的分隔符不得授权OCR或动作。</summary>
-    [Fact]
-    public void TinyHeaderStopsBeforeTitleOrFeeOcr()
+    /// <summary>低于二十物理像素的类别锚点在不同采样相位下均不得授权标题或费用OCR。</summary>
+    /// <param name="scale">将真实完整类别缩小到最低支持高度以下的图像比例。</param>
+    [Theory]
+    [InlineData(.25)]
+    [InlineData(.35)]
+    [InlineData(.4)]
+    [InlineData(.45)]
+    public void TinyHeaderStopsBeforeTitleOrFeeOcr(double scale)
     {
         using var original = LoadFrame("free-details-single-row.png");
-        using var image = Resize(original, .25);
+        using var image = Resize(original, scale);
         var reader = new RecordingTitleReader("颠覆世界恶魔之力");
         var fee = new RecordingFeeVerifier();
-        using var subject = new OpenCvPackRecognizer(feeVerifier: fee, titleReader: reader);
+        var logger = new HeaderLogger();
+        using var subject = new OpenCvPackRecognizer(logger, fee, reader);
 
         AssertUnknown(subject.Recognize(ToFrame(image)));
         Assert.Empty(reader.Calls);
         Assert.Equal(0, fee.Calls);
+        if (scale > .25) Assert.Equal(new[] { "BelowMinimumSize" }, logger.Reasons);
     }
 
     /// <summary>只暗化真实标题前缀而菜单和包名仍清晰时，类别锚点的亮度门禁须阻止免费动作。</summary>
@@ -295,6 +304,24 @@ public sealed class PackHeaderAnchorTests
         AssertJointRight(region, 278, scale);
         AssertCompleteGlyphs(region, new Rect(284, 84, 298, 35), scale);
         Assert.Equal(before, frame.Pixels);
+    }
+
+    /// <summary>类别与主体缩放不一致导致完整标题区域越界时，撤回身份与动作而不裁读局部标题。</summary>
+    [Fact]
+    public void MixedHeaderScaleRejectsAnIncompleteTitleRegion()
+    {
+        using var image = LoadFrame("paid-details.png");
+        using var header = LoadTemplate("header-secret.png");
+        using var enlarged = Resize(header, 2);
+        using (var destination = new Mat(image, new Rect(120, 80, enlarged.Width, enlarged.Height)))
+            enlarged.CopyTo(destination);
+        var reader = new RecordingTitleReader("残缺标题");
+        var fee = new RecordingFeeVerifier();
+        using var subject = new OpenCvPackRecognizer(feeVerifier: fee, titleReader: reader);
+
+        AssertUnknown(subject.Recognize(ToFrame(image)));
+        Assert.Empty(reader.Calls);
+        Assert.Equal(0, fee.Calls);
     }
 
     /// <summary>普通类别原暗图仍是付费购买弹窗，加入类别模板不得将其降级为可点击详情。</summary>
@@ -372,6 +399,37 @@ public sealed class PackHeaderAnchorTests
     /// <returns>调用方负责释放的原生图像。</returns>
     private static Mat LoadFrame(string name) => LoadPng(typeof(PackHeaderAnchorTests).Assembly,
         $"MasterDuelSwitcher.Tests.Assets.PackFrames.{name}");
+
+    /// <summary>记录结构化拒绝原因，防止小字号回归在其他前置门禁提前结束而表面通过。</summary>
+    private sealed class HeaderLogger : ILogger<OpenCvPackRecognizer>
+    {
+        /// <summary>每次类别门禁拒绝时记录的实际原因。</summary>
+        public List<string> Reasons { get; } = [];
+
+        /// <summary>测试记录不创建作用域。</summary>
+        /// <param name="state">日志作用域状态。</param>
+        /// <returns>空作用域。</returns>
+        public IDisposable? BeginScope<TState>(TState state) where TState : notnull => null;
+
+        /// <summary>接收全部日志等级以保留Debug门禁证据。</summary>
+        /// <param name="logLevel">当前日志等级。</param>
+        /// <returns>始终启用日志。</returns>
+        public bool IsEnabled(LogLevel logLevel) => true;
+
+        /// <summary>从结构化日志状态中仅提取门禁的Reason字段。</summary>
+        /// <param name="logLevel">当前日志等级。</param>
+        /// <param name="eventId">当前事件标识。</param>
+        /// <param name="state">真实结构化日志状态。</param>
+        /// <param name="exception">当前异常。</param>
+        /// <param name="formatter">日志文字格式化器。</param>
+        public void Log<TState>(LogLevel logLevel, EventId eventId, TState state, Exception? exception,
+            Func<TState, Exception?, string> formatter)
+        {
+            if (state is not IEnumerable<KeyValuePair<string, object?>> properties) return;
+            foreach (var property in properties)
+                if (property.Key == "Reason" && property.Value is string reason) Reasons.Add(reason);
+        }
+    }
 
     /// <summary>读取生产程序集中的真实裁剪模板，不访问运行游戏。</summary>
     /// <param name="name">真实裁剪模板文件名。</param>

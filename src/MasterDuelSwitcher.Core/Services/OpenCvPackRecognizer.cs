@@ -21,6 +21,10 @@ public sealed class OpenCvPackRecognizer : IPackRecognizer, IDisposable
 {
     /// <summary>状态及按钮匹配必须达到的归一化相似度。</summary>
     private const double MatchThreshold = .84;
+    /// <summary>完整类别联合锚点须达到的评分，排除缺字及小字跨类别误匹配。</summary>
+    private const double HeaderMatchThreshold = .92;
+    /// <summary>类别锚点至少包含的物理像素高度，拒绝退化为少量像素的文字和分隔符。</summary>
+    private const int MinimumHeaderHeight = 20;
     /// <summary>原始截图模板对应的参考窗口宽度。</summary>
     private const double ReferenceWidth = 2050;
     /// <summary>用于低成本状态锚点搜索的标准缩放候选。</summary>
@@ -49,6 +53,8 @@ public sealed class OpenCvPackRecognizer : IPackRecognizer, IDisposable
         templates = new[]
         {
             LoadTemplate("details-label", 1336, 377), LoadTemplate("next-arrow", 1938, 551),
+            LoadTemplate("header-secret", 120, 80), LoadTemplate("header-normal", 120, 80),
+            LoadTemplate("header-separator", 268, 84),
             LoadTemplate("free-entry-text", 1608, 844), LoadTemplate("one-pack-text", 1404, 844),
             LoadTemplate("dialog-title", 485, 245), LoadTemplate("dialog-free-text", 608, 382),
             LoadTemplate("dialog-cancel", 325, 480), LoadTemplate("dialog-purchase", 713, 480),
@@ -171,7 +177,7 @@ public sealed class OpenCvPackRecognizer : IPackRecognizer, IDisposable
         if (next is null) return null;
         var fingerprint = Fingerprint(original, label.Value);
         if (fingerprint is null) return null;
-        var packTitle = ReadPackTitle(color, label.Value);
+        var packTitle = ReadPackTitle(image, original, color, factor);
         if (packTitle.Length == 0) return Unknown();
         var free = FindFreeEntry(image, factor, label.Value);
         var one = free is null ? null : FindRelative(image, factor, free.Value, "one-pack-text");
@@ -183,19 +189,52 @@ public sealed class OpenCvPackRecognizer : IPackRecognizer, IDisposable
             Math.Min(score, Math.Min(free.Value.Score, one.Value.Score))) { PackTitle = packTitle };
     }
 
-    /// <summary>在必需标题核心与详情导航锚点完整时读取标题，左界排除界面类别分隔线，保留完整Unicode字母数字作为精确身份。</summary>
+    /// <summary>匹配完整类别及其分隔符后读取右侧标题，保留完整Unicode字母数字作为精确身份。</summary>
+    /// <param name="image">用于多尺度类别锚点搜索的灰度缩略图。</param>
+    /// <param name="original">原始客户区灰度像素，用于保留细分隔符的独立核验。</param>
     /// <param name="color">当前原始客户区的完整 BGRA 像素。</param>
-    /// <param name="anchor">已完整匹配且通过标题图像指纹边界验证的详情菜单锚点。</param>
-    /// <returns>保留全部中文、字母大小写及数字的标题；没有有效文字时为空。</returns>
-    private string ReadPackTitle(Mat color, Match anchor)
+    /// <param name="factor">灰度缩略图相对于原始像素的比例。</param>
+    /// <returns>保留全部中文、字母大小写及数字的标题；联合锚点或完整区域失效时为空。</returns>
+    private string ReadPackTitle(Mat image, Mat original, Mat color, double factor)
     {
-        // 菜单模板尺度浮动时，标题左侧留白可能包含分隔线；只收紧左界并保留原右界。
-        var suggestedLeft = (int)Math.Round(anchor.Bounds.X - 1052 * anchor.Scale);
-        var left = Math.Max(suggestedLeft, (int)Math.Ceiling(color.Width / 8d));
-        var right = suggestedLeft + (int)Math.Round(1000 * anchor.Scale);
-        var region = new Rect(left,
-            Math.Max(0, (int)Math.Round(anchor.Bounds.Y - 307 * anchor.Scale) - (int)Math.Round(15 * anchor.Scale)),
-            right - left, (int)Math.Round(90 * anchor.Scale));
+        var headerRegion = new Rect(0, 0, image.Width * 2 / 5, image.Height / 6);
+        var header = FindAnchor(image, factor, "header-secret", headerRegion);
+        if (header is null || header.Value.Score < HeaderMatchThreshold)
+            header = FindAnchor(image, factor, "header-normal", headerRegion);
+        if (header is null || header.Value.Score < HeaderMatchThreshold)
+        {
+            logger.LogDebug("FreePackHeaderRejected Reason={Reason}", "MissingCompleteHeader");
+            return string.Empty;
+        }
+        var anchor = header.Value;
+        if (anchor.Bounds.Height < MinimumHeaderHeight)
+        {
+            logger.LogDebug("FreePackHeaderRejected Reason={Reason}", "BelowMinimumSize");
+            return string.Empty;
+        }
+        // 只检查联合框末端的分隔符，不向右扩张到标题；原灰度图保留细竖线实际像素。
+        var separatorTemplate = templates["header-separator"];
+        var separatorLeft = (int)Math.Floor(anchor.Bounds.X + (separatorTemplate.X - anchor.Template.X - 4) * anchor.Scale);
+        var separatorRegion = new Rect(separatorLeft, anchor.Bounds.Y,
+            anchor.Bounds.Right - separatorLeft, anchor.Bounds.Height)
+            .Intersect(anchor.Bounds);
+        var separator = Find(original, 1, separatorTemplate, separatorRegion,
+            new[] { anchor.Scale * .98, anchor.Scale, anchor.Scale * 1.02, anchor.Scale * 1.10 });
+        if (separator is null)
+        {
+            logger.LogDebug("FreePackHeaderRejected Reason={Reason}", "MissingSeparator");
+            return string.Empty;
+        }
+        var region = new Rect(anchor.Bounds.Right, Math.Max(0, anchor.Bounds.Y - (int)Math.Round(25 * anchor.Scale)),
+            (int)Math.Round(1000 * anchor.Scale), (int)Math.Round(90 * anchor.Scale));
+        if (region.Intersect(new Rect(0, 0, color.Width, color.Height)) != region)
+        {
+            logger.LogDebug("FreePackHeaderRejected Reason={Reason}", "IncompleteTitleRegion");
+            return string.Empty;
+        }
+        logger.LogDebug("FreePackHeaderMatched Category={Category} HeaderX={HeaderX} HeaderY={HeaderY} HeaderWidth={HeaderWidth} HeaderHeight={HeaderHeight} AnchorScale={AnchorScale} Confidence={Confidence} SeparatorConfidence={SeparatorConfidence}",
+            anchor.Template.Name, anchor.Bounds.X, anchor.Bounds.Y, anchor.Bounds.Width, anchor.Bounds.Height,
+            anchor.Scale, anchor.Score, separator.Value.Score);
         using var area = new Mat(color, region);
         using var isolated = area.Clone();
         var pixels = new byte[region.Width * region.Height * 4];

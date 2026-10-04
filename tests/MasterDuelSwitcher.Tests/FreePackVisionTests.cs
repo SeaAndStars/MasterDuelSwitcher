@@ -951,13 +951,19 @@ public sealed class FreePackVisionTests : IDisposable
         var observation = loggedRecognizer.Recognize(frame);
         Assert.Equal(PackScreen.PackDetails, observation.Screen);
         Assert.Equal("独立卡包标题", observation.PackTitle);
-        Assert.Equal(2, provider.Events.Count);
+        Assert.Equal(3, provider.Events.Count);
+        var headerLog = Assert.Single(provider.Events, entry => entry.Message.StartsWith("FreePackHeaderMatched", StringComparison.Ordinal));
+        Assert.Equal(LogLevel.Debug, headerLog.Level);
+        Assert.Equal("header-secret", Assert.IsType<string>(headerLog.Properties["Category"]));
+        Assert.InRange(Assert.IsType<double>(headerLog.Properties["Confidence"]), .92, 1);
+        Assert.InRange(Assert.IsType<double>(headerLog.Properties["SeparatorConfidence"]), .84, 1);
         var titleLog = Assert.Single(provider.Events, entry => entry.Message.StartsWith("FreePackTitleRead", StringComparison.Ordinal));
         Assert.Equal(LogLevel.Debug, titleLog.Level);
         Assert.Equal("【独立\t卡包 标题】", Assert.IsType<string>(titleLog.Properties["RawText"]));
         Assert.Equal(observation.PackTitle, Assert.IsType<string>(titleLog.Properties["PackTitle"]));
-        Assert.Equal(284, Assert.IsType<int>(titleLog.Properties["RegionX"]));
-        Assert.Equal(54, Assert.IsType<int>(titleLog.Properties["RegionY"]));
+        Assert.Equal(Assert.IsType<int>(headerLog.Properties["HeaderX"]) + Assert.IsType<int>(headerLog.Properties["HeaderWidth"]),
+            Assert.IsType<int>(titleLog.Properties["RegionX"]));
+        Assert.Equal(55, Assert.IsType<int>(titleLog.Properties["RegionY"]));
         Assert.Equal(1000, Assert.IsType<int>(titleLog.Properties["RegionWidth"]));
         Assert.Equal(90, Assert.IsType<int>(titleLog.Properties["RegionHeight"]));
         Assert.Equal(1d, Assert.IsType<double>(titleLog.Properties["AnchorScale"]));
@@ -971,7 +977,7 @@ public sealed class FreePackVisionTests : IDisposable
         loggedRecognizer.Dispose();
         loggedRecognizer.Dispose();
         Assert.Throws<ObjectDisposedException>(() => loggedRecognizer.Recognize(frame));
-        Assert.Equal(2, provider.Events.Count);
+        Assert.Equal(3, provider.Events.Count);
     }
 
     /// <summary>模板已经确认免费入口或购买弹窗时，费用文字拒绝仍必须撤回购买坐标。</summary>
@@ -1535,7 +1541,9 @@ public sealed class FreePackVisionTests : IDisposable
         Assert.Equal(title.Width * title.Height * 4, title.Pixels.Length);
         var tolerance = (int)Math.Ceiling(12 * scale);
         var width1000 = (int)Math.Round(1000 * scale);
-        Assert.InRange(title.Width, width1000 - tolerance, width1000 + tolerance);
+        // 类别锚点允许窗口参考尺度的±4%候选；宽度随实际联合锚点变化，完整字形仍逐像素核验。
+        var widthTolerance = (int)Math.Ceiling(42 * scale);
+        Assert.InRange(title.Width, width1000 - widthTolerance, width1000 + widthTolerance);
         Assert.InRange(title.Height, (int)Math.Round(90 * scale) - tolerance, (int)Math.Round(90 * scale) + tolerance);
         var expectedX = (int)Math.Round((includeTitlebar ? 284 : 283) * scale);
         var expectedY = (int)Math.Round((includeTitlebar ? 55 : 24) * scale);
