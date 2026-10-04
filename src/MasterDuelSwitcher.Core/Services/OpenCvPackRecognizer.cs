@@ -225,8 +225,9 @@ public sealed class OpenCvPackRecognizer : IPackRecognizer, IDisposable
             logger.LogDebug("FreePackHeaderRejected Reason={Reason}", "MissingSeparator");
             return string.Empty;
         }
+        // 保留完整字形并限制上下空白，避免原生 OCR 对宽标题区域缩放后返回空文本。
         var region = new Rect(anchor.Bounds.Right, Math.Max(0, anchor.Bounds.Y - (int)Math.Round(25 * anchor.Scale)),
-            (int)Math.Round(1000 * anchor.Scale), (int)Math.Round(90 * anchor.Scale));
+            (int)Math.Round(1000 * anchor.Scale), (int)Math.Round(80 * anchor.Scale));
         if (region.Intersect(new Rect(0, 0, color.Width, color.Height)) != region)
         {
             logger.LogDebug("FreePackHeaderRejected Reason={Reason}", "IncompleteTitleRegion");
@@ -235,6 +236,25 @@ public sealed class OpenCvPackRecognizer : IPackRecognizer, IDisposable
         logger.LogDebug("FreePackHeaderMatched Category={Category} HeaderX={HeaderX} HeaderY={HeaderY} HeaderWidth={HeaderWidth} HeaderHeight={HeaderHeight} AnchorScale={AnchorScale} Confidence={Confidence} SeparatorConfidence={SeparatorConfidence}",
             anchor.Template.Name, anchor.Bounds.X, anchor.Bounds.Y, anchor.Bounds.Width, anchor.Bounds.Height,
             anchor.Scale, anchor.Score, separator.Value.Score);
+        var title = ReadTitleRegion(color, region, anchor.Scale);
+        if (title.Length == 0)
+        {
+            // 仅空结果改变采样高度重读一次；左右边界、首末字和共享费用 OCR 均保持原样。
+            region.Height = Math.Min((int)Math.Round(90 * anchor.Scale), color.Height - region.Y);
+            logger.LogDebug("FreePackTitleRetry Reason={Reason} RegionX={RegionX} RegionY={RegionY} RegionWidth={RegionWidth} RegionHeight={RegionHeight}",
+                "EmptyNormalizedTitle", region.X, region.Y, region.Width, region.Height);
+            title = ReadTitleRegion(color, region, anchor.Scale);
+        }
+        return title;
+    }
+
+    /// <summary>读取独立原图标题区域并保留全部 Unicode 字母数字，同时记录实际采样及原生结果。</summary>
+    /// <param name="color">包含完整客户区 BGRA 像素的原图。</param>
+    /// <param name="region">已验证边界并包含完整字形的标题区域。</param>
+    /// <param name="scale">类别联合锚点相对于原模板的实际尺度。</param>
+    /// <returns>规范化后的完整标题；没有有效字母数字时为空。</returns>
+    private string ReadTitleRegion(Mat color, Rect region, double scale)
+    {
         using var area = new Mat(color, region);
         using var isolated = area.Clone();
         var pixels = new byte[region.Width * region.Height * 4];
@@ -245,7 +265,7 @@ public sealed class OpenCvPackRecognizer : IPackRecognizer, IDisposable
             if (Rune.IsLetterOrDigit(rune)) title.Append(rune.ToString());
         var normalizedTitle = title.ToString();
         logger.LogDebug("FreePackTitleRead RegionX={RegionX} RegionY={RegionY} RegionWidth={RegionWidth} RegionHeight={RegionHeight} AnchorScale={AnchorScale} RawText={RawText} PackTitle={PackTitle}",
-            region.X, region.Y, region.Width, region.Height, anchor.Scale, text, normalizedTitle);
+            region.X, region.Y, region.Width, region.Height, scale, text, normalizedTitle);
         return normalizedTitle;
     }
 

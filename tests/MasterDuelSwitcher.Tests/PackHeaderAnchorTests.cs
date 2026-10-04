@@ -14,6 +14,80 @@ public sealed class PackHeaderAnchorTests
     /// <summary>所有离线截图帧使用的固定捕获时间。</summary>
     private static readonly DateTimeOffset CapturedAt = new(2026, 10, 4, 8, 0, 0, TimeSpan.Zero);
 
+    /// <summary>枚举真实详情四档缩放，分别核验原截图及其实际客户区的原生标题和费用 OCR。</summary>
+    /// <returns>真实截图、完整标题、免费标志、缩放比例及是否移除窗口标题栏。</returns>
+    public static IEnumerable<object[]> NativeHeaderCases()
+    {
+        foreach (var item in SecretHeaderCases())
+            if ((double)item[3] != .5)
+            {
+                yield return [item[0], item[1], item[2], item[3], false];
+                if (item[0] is "paid-details.png" or "paid-details-after-opening.png"
+                    or "free-details-single-row.png" or "free-details-second-title.png")
+                    yield return [item[0], item[1], item[2], item[3], true];
+            }
+    }
+
+    /// <summary>真实 Windows OCR 完成全部详情识别，不以模拟文本替代标题及免费费用门禁。</summary>
+    /// <param name="fixture">真实详情截图资源名。</param>
+    /// <param name="title">按原图核验的完整标题。</param>
+    /// <param name="free">原图是否具有免费入口。</param>
+    /// <param name="scale">输入截图的缩放比例。</param>
+    /// <param name="removeTitlebar">原截图包含窗口边框时，仅保留真实客户区。</param>
+    [Theory]
+    [MemberData(nameof(NativeHeaderCases))]
+    public void NativeOcrReadsExistingRealTitlesAndCosts(string fixture, string title, bool free, double scale, bool removeTitlebar)
+    {
+        using var original = LoadFrame(fixture);
+        using var area = new Mat(original, removeTitlebar ? new Rect(1, 31, 2048, 1152)
+            : new Rect(0, 0, original.Width, original.Height));
+        using var image = Resize(area, scale);
+        var frame = ToFrame(image);
+        var before = frame.Pixels.ToArray();
+        using var subject = new OpenCvPackRecognizer();
+
+        var observation = subject.Recognize(frame);
+
+        Assert.Equal(PackScreen.PackDetails, observation.Screen);
+        Assert.Equal(title, observation.PackTitle);
+        Assert.Equal(free, observation.FreeOffer);
+        Assert.Equal(free, observation.PrimaryTarget.HasValue);
+        Assert.NotNull(observation.NextTarget);
+        Assert.Equal(before, frame.Pixels);
+    }
+
+    /// <summary>仅当第一遍没有有效文字时改变高度重读，保持原横向起点、完整原图像素及合法 Unicode。</summary>
+    /// <param name="firstText">第一次识别的空白或标点结果。</param>
+    [Theory]
+    [InlineData("")]
+    [InlineData(" \t\r\n")]
+    [InlineData("【】💎?!")]
+    public void EmptyTitleRetriesOnlyTheSamplingHeight(string firstText)
+    {
+        using var image = LoadFrame("free-details-single-row.png");
+        var frame = ToFrame(image);
+        var before = frame.Pixels.ToArray();
+        var reader = new RecordingTitleReader(firstText, "𠮷丨魔神Ａ２");
+        using var subject = new OpenCvPackRecognizer(feeVerifier: new RecordingFeeVerifier(), titleReader: reader);
+
+        var observation = subject.Recognize(frame);
+
+        Assert.Equal(PackScreen.PackDetails, observation.Screen);
+        Assert.Equal("𠮷丨魔神A2", observation.PackTitle);
+        Assert.True(observation.FreeOffer);
+        Assert.Equal(2, reader.Calls.Count);
+        var first = FindCopiedTitleRegion(frame, reader.Calls[0]);
+        var second = FindCopiedTitleRegion(frame, reader.Calls[1]);
+        Assert.Equal(first.Left, second.Left);
+        Assert.Equal(first.Top, second.Top);
+        Assert.Equal(first.Width, second.Width);
+        Assert.Equal(80, first.Height);
+        Assert.Equal(90, second.Height);
+        AssertCompleteGlyphs(first, new Rect(290, 85, 254, 30), 1);
+        AssertCompleteGlyphs(second, new Rect(290, 85, 254, 30), 1);
+        Assert.Equal(before, frame.Pixels);
+    }
+
     /// <summary>枚举六张真实秘密卡包详情在四种缩放下的独立字形与分隔符边界。</summary>
     /// <returns>真实截图、完整标题、免费标志、缩放比例及原图边界。</returns>
     public static IEnumerable<object[]> SecretHeaderCases()
@@ -524,7 +598,8 @@ public sealed class PackHeaderAnchorTests
 
     /// <summary>隔离系统OCR并记录真实区域，供标题边界而非伪造文字定位断言使用。</summary>
     /// <param name="text">指定的原始完整标题。</param>
-    private sealed class RecordingTitleReader(string text) : IPackTextReader
+    /// <param name="secondText">可选的第二次独立识别结果。</param>
+    private sealed class RecordingTitleReader(string text, string? secondText = null) : IPackTextReader
     {
         /// <summary>识别器实际提交的全部标题区域。</summary>
         public List<TitleCall> Calls { get; } = [];
@@ -537,7 +612,7 @@ public sealed class PackHeaderAnchorTests
         public string Read(byte[] bgraPixels, int width, int height)
         {
             Calls.Add(new(bgraPixels.ToArray(), width, height));
-            return text;
+            return Calls.Count > 1 && secondText is not null ? secondText : text;
         }
     }
 

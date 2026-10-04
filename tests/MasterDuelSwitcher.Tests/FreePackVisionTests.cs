@@ -965,7 +965,7 @@ public sealed class FreePackVisionTests : IDisposable
             Assert.IsType<int>(titleLog.Properties["RegionX"]));
         Assert.Equal(55, Assert.IsType<int>(titleLog.Properties["RegionY"]));
         Assert.Equal(1000, Assert.IsType<int>(titleLog.Properties["RegionWidth"]));
-        Assert.Equal(90, Assert.IsType<int>(titleLog.Properties["RegionHeight"]));
+        Assert.Equal(80, Assert.IsType<int>(titleLog.Properties["RegionHeight"]));
         Assert.Equal(1d, Assert.IsType<double>(titleLog.Properties["AnchorScale"]));
         var log = Assert.Single(provider.Events, entry => entry.Properties.ContainsKey("Screen"));
         Assert.Equal(LogLevel.Debug, log.Level);
@@ -1167,7 +1167,7 @@ public sealed class FreePackVisionTests : IDisposable
         using var subject = new OpenCvPackRecognizer(feeVerifier: new RecordingFeeVerifier(true), titleReader: reader);
         using var image = LoadFixture("paid-details-after-opening.png");
         AssertUnknown(subject.Recognize(ToFrame(image)));
-        Assert.Single(reader.Calls);
+        Assert.Equal(2, reader.Calls.Count);
     }
 
     /// <summary>标题须按兼容规范化保留全部 Unicode 字母及数字，移除空白标点并保留稀有中文代理对。</summary>
@@ -1544,7 +1544,7 @@ public sealed class FreePackVisionTests : IDisposable
         // 类别锚点允许窗口参考尺度的±4%候选；宽度随实际联合锚点变化，完整字形仍逐像素核验。
         var widthTolerance = (int)Math.Ceiling(42 * scale);
         Assert.InRange(title.Width, width1000 - widthTolerance, width1000 + widthTolerance);
-        Assert.InRange(title.Height, (int)Math.Round(90 * scale) - tolerance, (int)Math.Round(90 * scale) + tolerance);
+        Assert.InRange(title.Height, (int)Math.Round(80 * scale) - tolerance, (int)Math.Round(80 * scale) + tolerance);
         var expectedX = (int)Math.Round((includeTitlebar ? 284 : 283) * scale);
         var expectedY = (int)Math.Round((includeTitlebar ? 55 : 24) * scale);
         var source = ToFrame(image).Pixels;
