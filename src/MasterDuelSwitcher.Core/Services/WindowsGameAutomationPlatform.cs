@@ -352,6 +352,8 @@ public sealed class SystemWindowsGameAutomationNativeApi : IWindowsGameAutomatio
     private readonly Func<nint> getDpiContext;
     /// <summary>记录鼠标实际到达和原生输入故障。</summary>
     private readonly ILogger logger;
+    /// <summary>仅在点击边界读取鼠标按键及窗口归属的可注入诊断入口。</summary>
+    private readonly Func<MouseInputObservation> observeMouse;
     /// <summary>仅在自动化运行期间存在的 F8 消息监听器。</summary>
     private F8EmergencyStopListener? stopListener;
 
@@ -363,7 +365,8 @@ public sealed class SystemWindowsGameAutomationNativeApi : IWindowsGameAutomatio
     internal SystemWindowsGameAutomationNativeApi(Func<Process[]> findProcesses, Func<int, Process> findProcess, string gameProcessName,
         Func<NativeInput[], uint>? sendInputs = null, Action<TimeSpan>? holdMouse = null,
         Func<int, int, bool>? setCursor = null, CursorPositionReader? readCursor = null, Action<TimeSpan>? settleMouse = null,
-        Func<bool>? stopRequested = null, Func<AutomationNativeRectangle>? getDesktop = null, Func<nint>? getDpiContext = null, ILogger? logger = null)
+        Func<bool>? stopRequested = null, Func<AutomationNativeRectangle>? getDesktop = null, Func<nint>? getDpiContext = null, ILogger? logger = null,
+        Func<MouseInputObservation>? observeMouse = null)
     {
         this.findProcesses = findProcesses;
         this.findProcess = findProcess;
@@ -377,6 +380,7 @@ public sealed class SystemWindowsGameAutomationNativeApi : IWindowsGameAutomatio
         this.getDesktop = getDesktop ?? GetVirtualDesktop;
         this.getDpiContext = getDpiContext ?? NativeMethods.GetThreadDpiAwarenessContext;
         this.logger = logger ?? NullLogger.Instance;
+        this.observeMouse = observeMouse ?? ReadSystemMouseObservation;
     }
 
     /// <summary>寻找目标进程的第一个主窗口，并释放全部进程查询句柄。</summary>
@@ -473,40 +477,43 @@ public sealed class SystemWindowsGameAutomationNativeApi : IWindowsGameAutomatio
     public uint SendMouseClick(int normalizedX, int normalizedY, AutomationNativePoint? physicalTarget = null, Action? beforeButtonDown = null)
     {
         AutomationNativePoint target = physicalTarget ?? ResolvePhysicalTarget(normalizedX, normalizedY);
+        string clickId = Guid.NewGuid().ToString("N");
         bool released = false;
         bool buttonMayBeDown = false;
         try
         {
             ThrowIfStopRequested();
-            logger.LogDebug("FreePackMousePositionRequested ExpectedScreenX={ExpectedX} ExpectedScreenY={ExpectedY} NormalizedX={NormalizedX} NormalizedY={NormalizedY} ThreadDpiContext={ThreadDpiContext}",
-                target.X, target.Y, normalizedX, normalizedY, getDpiContext());
-            SetExpectedCursor(target);
-            uint moved = sendInputs([new() { Mouse = new() { X = normalizedX, Y = normalizedY, Flags = 0xC001 } }]);
+            WriteMouseLog(() => logger.LogDebug("FreePackMousePositionRequested ClickId={ClickId} ExpectedScreenX={ExpectedX} ExpectedScreenY={ExpectedY} NormalizedX={NormalizedX} NormalizedY={NormalizedY} ThreadDpiContext={ThreadDpiContext}",
+                clickId, target.X, target.Y, normalizedX, normalizedY, getDpiContext()));
+            SetExpectedCursor(target, clickId);
+            uint moved = SendMouseBatch(clickId, "MOVE", [new() { Mouse = new() { X = normalizedX, Y = normalizedY, Flags = 0xC001 } }]);
             if (moved != 1) return 0;
-            SetExpectedCursor(target);
-            settleMouse(TimeSpan.FromMilliseconds(40));
+            SetExpectedCursor(target, clickId);
+            WaitForMousePhase(clickId, "settle", TimeSpan.FromMilliseconds(40), settleMouse);
             ThrowIfStopRequested();
             if (!readCursor(out AutomationNativePoint actual))
             {
                 int error = Marshal.GetLastWin32Error();
-                logger.LogWarning("FreePackMousePositionReadFailed ExpectedScreenX={ExpectedX} ExpectedScreenY={ExpectedY} Win32Error={Win32Error}", target.X, target.Y, error);
+                WriteMouseLog(() => logger.LogWarning("FreePackMousePositionReadFailed ClickId={ClickId} ExpectedScreenX={ExpectedX} ExpectedScreenY={ExpectedY} Win32Error={Win32Error}", clickId, target.X, target.Y, error));
                 throw new Win32Exception(error, "读取鼠标实际位置失败。");
             }
-            logger.LogDebug("FreePackMousePositionObserved ExpectedScreenX={ExpectedX} ExpectedScreenY={ExpectedY} ActualScreenX={ActualX} ActualScreenY={ActualY}", target.X, target.Y, actual.X, actual.Y);
+            WriteMouseLog(() => logger.LogDebug("FreePackMousePositionObserved ClickId={ClickId} ExpectedScreenX={ExpectedX} ExpectedScreenY={ExpectedY} ActualScreenX={ActualX} ActualScreenY={ActualY}", clickId, target.X, target.Y, actual.X, actual.Y));
             if (actual.X != target.X || actual.Y != target.Y)
             {
-                logger.LogWarning("FreePackMousePositionRejected ExpectedScreenX={ExpectedX} ExpectedScreenY={ExpectedY} ActualScreenX={ActualX} ActualScreenY={ActualY}", target.X, target.Y, actual.X, actual.Y);
+                WriteMouseLog(() => logger.LogWarning("FreePackMousePositionRejected ClickId={ClickId} ExpectedScreenX={ExpectedX} ExpectedScreenY={ExpectedY} ActualScreenX={ActualX} ActualScreenY={ActualY}", clickId, target.X, target.Y, actual.X, actual.Y));
                 throw new InvalidOperationException($"鼠标未到达目标：期望 ({target.X},{target.Y})，实际 ({actual.X},{actual.Y})。");
             }
             beforeButtonDown?.Invoke();
             ThrowIfStopRequested();
+            TraceMouseObservation(clickId, "BeforeDown");
             buttonMayBeDown = true;
-            uint down = sendInputs([new() { Mouse = new() { Flags = 0x0002 } }]);
+            uint down = SendMouseBatch(clickId, "DOWN", [new() { Mouse = new() { Flags = 0x0002 } }]);
             if (down != 1) return moved;
-            holdMouse(TimeSpan.FromMilliseconds(80));
+            WaitForMousePhase(clickId, "hold", TimeSpan.FromMilliseconds(80), holdMouse);
             ThrowIfStopRequested();
-            uint up = sendInputs([new() { Mouse = new() { Flags = 0x0004 } }]);
+            uint up = SendMouseBatch(clickId, "UP", [new() { Mouse = new() { Flags = 0x0004 } }]);
             released = up == 1;
+            TraceMouseObservation(clickId, "AfterUp");
             return released ? moved + down + up : moved + down;
         }
         finally
@@ -514,21 +521,124 @@ public sealed class SystemWindowsGameAutomationNativeApi : IWindowsGameAutomatio
             if (buttonMayBeDown && !released)
             {
                 int originalError = Marshal.GetLastWin32Error();
-                try { sendInputs([new() { Mouse = new() { Flags = 0x0004 } }]); }
+                try { SendMouseBatch(clickId, "CleanupUp", [new() { Mouse = new() { Flags = 0x0004 } }]); }
                 catch (Exception) { /* 松开边界再次失败时，保留首次输入错误或取消异常。 */ }
-                Marshal.SetLastPInvokeError(originalError);
+                finally
+                {
+                    TraceMouseObservation(clickId, "AfterCleanupUp");
+                    Marshal.SetLastPInvokeError(originalError);
+                }
             }
         }
     }
 
     /// <summary>显式定位到原始物理像素，保留真实系统失败代码。</summary>
-    private void SetExpectedCursor(AutomationNativePoint target)
+    private void SetExpectedCursor(AutomationNativePoint target, string clickId)
     {
         if (setCursor(target.X, target.Y)) return;
         int error = Marshal.GetLastWin32Error();
-        logger.LogWarning("FreePackMousePositionFailed ExpectedScreenX={ExpectedX} ExpectedScreenY={ExpectedY} Win32Error={Win32Error}", target.X, target.Y, error);
+        WriteMouseLog(() => logger.LogWarning("FreePackMousePositionFailed ClickId={ClickId} ExpectedScreenX={ExpectedX} ExpectedScreenY={ExpectedY} Win32Error={Win32Error}", clickId, target.X, target.Y, error));
         throw new Win32Exception(error, "定位鼠标失败。");
     }
+
+    /// <summary>记录批次请求、实际接受计数和即时系统错误，保留原输入结果及异常。</summary>
+    private uint SendMouseBatch(string clickId, string phase, NativeInput[] inputs)
+    {
+        WriteMouseLog(() => logger.LogDebug("FreePackMouseBatchRequested ClickId={ClickId} Phase={Phase} RequestedCount={RequestedCount} MouseFlags={MouseFlags}", clickId, phase, (uint)inputs.Length, inputs[0].Mouse.Flags));
+        long started = Stopwatch.GetTimestamp();
+        uint accepted = 0;
+        bool completed = false;
+        Exception? failure = null;
+        try { accepted = sendInputs(inputs); completed = true; return accepted; }
+        catch (Exception exception) { failure = exception; throw; }
+        finally
+        {
+            int error = Marshal.GetLastWin32Error();
+            double elapsed = Stopwatch.GetElapsedTime(started).TotalMilliseconds;
+            WriteMouseLog(() => logger.LogDebug(failure, "FreePackMouseBatchResult ClickId={ClickId} Phase={Phase} RequestedCount={RequestedCount} AcceptedCount={AcceptedCount} Completed={Completed} Win32Error={Win32Error} ElapsedMs={ElapsedMs}",
+                clickId, phase, (uint)inputs.Length, accepted, completed, error, elapsed));
+            Marshal.SetLastPInvokeError(error);
+        }
+    }
+
+    /// <summary>记录就绪等待和按住的实际耗时，等待失败继续传播原异常。</summary>
+    private void WaitForMousePhase(string clickId, string phase, TimeSpan duration, Action<TimeSpan> wait)
+    {
+        WriteMouseLog(() => logger.LogDebug("FreePackMouseWaitRequested ClickId={ClickId} Phase={Phase} RequestedMs={RequestedMs}", clickId, phase, duration.TotalMilliseconds));
+        long started = Stopwatch.GetTimestamp();
+        bool completed = false;
+        Exception? failure = null;
+        try { wait(duration); completed = true; }
+        catch (Exception exception) { failure = exception; throw; }
+        finally
+        {
+            int error = Marshal.GetLastWin32Error();
+            double elapsed = Stopwatch.GetElapsedTime(started).TotalMilliseconds;
+            WriteMouseLog(() => logger.LogDebug(failure, "FreePackMouseWaitResult ClickId={ClickId} Phase={Phase} RequestedMs={RequestedMs} Completed={Completed} ElapsedMs={ElapsedMs}", clickId, phase, duration.TotalMilliseconds, completed, elapsed));
+            Marshal.SetLastPInvokeError(error);
+        }
+    }
+
+    /// <summary>只在按下前及松开后采证，诊断失败不会改变点击及原系统错误。</summary>
+    private void TraceMouseObservation(string clickId, string phase)
+    {
+        int originalError = Marshal.GetLastWin32Error();
+        try
+        {
+            MouseInputObservation observed = observeMouse();
+            WriteMouseLog(() => logger.LogDebug("FreePackMouseSnapshot ClickId={ClickId} Phase={Phase} CursorValid={CursorValid} CursorReadError={CursorReadError} CursorX={CursorX} CursorY={CursorY} LeftButtonPhysicalDown={LeftButtonPhysicalDown} PointWindow={PointWindow} PointRoot={PointRoot} PointProcessId={PointProcessId} PointThreadId={PointThreadId} ForegroundWindow={ForegroundWindow} ForegroundProcessId={ForegroundProcessId} ForegroundThreadId={ForegroundThreadId} SenderThreadId={SenderThreadId} ThreadDpiContext={ThreadDpiContext}",
+                clickId, phase, observed.CursorValid, observed.CursorReadError, observed.Cursor.X, observed.Cursor.Y, observed.LeftButtonDown, observed.PointWindow, observed.PointRoot, observed.PointProcessId, observed.PointThreadId,
+                observed.ForegroundWindow, observed.ForegroundProcessId, observed.ForegroundThreadId, observed.SenderThreadId, observed.ThreadDpiContext));
+            if (!observed.CursorValid)
+                WriteMouseLog(() => logger.LogWarning("FreePackMouseSnapshotCursorInvalid ClickId={ClickId} Phase={Phase} CursorReadError={CursorReadError}", clickId, phase, observed.CursorReadError));
+        }
+        catch (Exception exception)
+        {
+            WriteMouseLog(() => logger.LogWarning(exception, "FreePackMouseSnapshotFailed ClickId={ClickId} Phase={Phase}", clickId, phase));
+        }
+        finally { Marshal.SetLastPInvokeError(originalError); }
+    }
+
+    /// <summary>隔离日志提供程序故障，并恢复日志调用前的系统错误。</summary>
+    private static void WriteMouseLog(Action write)
+    {
+        int originalError = Marshal.GetLastWin32Error();
+        try { write(); }
+        catch (Exception) { /* 日志故障只影响诊断，不影响鼠标操作及原异常。 */ }
+        finally { Marshal.SetLastPInvokeError(originalError); }
+    }
+
+    /// <summary>读取系统点击边界状态；坐标读取失败时点位及命中字段无效。</summary>
+    private MouseInputObservation ReadSystemMouseObservation()
+    {
+        bool cursorValid = NativeMethods.GetCursorPos(out AutomationNativePoint cursor);
+        int cursorError = Marshal.GetLastWin32Error();
+        nint pointWindow = NativeMethods.WindowFromPoint(cursor);
+        nint pointRoot = NativeMethods.GetAncestor(pointWindow, 2);
+        uint pointThread = NativeMethods.GetWindowThreadProcessId(pointRoot, out uint pointProcess);
+        nint foreground = NativeMethods.GetForegroundWindow();
+        uint foregroundThread = NativeMethods.GetWindowThreadProcessId(foreground, out uint foregroundProcess);
+        return new(cursorValid, cursorError, cursor, (NativeMethods.GetAsyncKeyState(1) & 0x8000) != 0, pointWindow, pointRoot, pointProcess, pointThread,
+            foreground, foregroundProcess, foregroundThread, NativeMethods.GetCurrentThreadId(), getDpiContext());
+    }
+
+    /// <summary>保存点击边界状态；CursorValid 为假时坐标及命中窗口仅作无效诊断占位。</summary>
+    /// <param name="CursorValid">是否成功读取实际坐标。</param>
+    /// <param name="CursorReadError">坐标读取后即时系统错误，仅失败时有意义。</param>
+    /// <param name="Cursor">实际屏幕坐标。</param>
+    /// <param name="LeftButtonDown">物理左键当前高位状态。</param>
+    /// <param name="PointWindow">坐标命中的窗口。</param>
+    /// <param name="PointRoot">命中窗口的根窗口。</param>
+    /// <param name="PointProcessId">根窗口所属进程。</param>
+    /// <param name="PointThreadId">根窗口所属原生线程。</param>
+    /// <param name="ForegroundWindow">当前前台窗口。</param>
+    /// <param name="ForegroundProcessId">前台窗口所属进程。</param>
+    /// <param name="ForegroundThreadId">前台窗口所属原生线程。</param>
+    /// <param name="SenderThreadId">当前输入发送原生线程。</param>
+    /// <param name="ThreadDpiContext">当前发送线程 DPI 上下文。</param>
+    internal readonly record struct MouseInputObservation(bool CursorValid, int CursorReadError, AutomationNativePoint Cursor, bool LeftButtonDown,
+        nint PointWindow, nint PointRoot, uint PointProcessId, uint PointThreadId, nint ForegroundWindow, uint ForegroundProcessId, uint ForegroundThreadId,
+        uint SenderThreadId, nint ThreadDpiContext);
 
     /// <summary>为兼容的两参数调用把虚拟桌面归一化坐标还原为物理像素。</summary>
     private AutomationNativePoint ResolvePhysicalTarget(int normalizedX, int normalizedY)
@@ -721,6 +831,15 @@ public sealed class SystemWindowsGameAutomationNativeApi : IWindowsGameAutomatio
         /// <summary>读取当前原生输入发送线程的 DPI 上下文。</summary>
         [DllImport("user32.dll")]
         internal static extern nint GetThreadDpiAwarenessContext();
+        /// <summary>取得实际坐标处的窗口，不发送输入。</summary>
+        [DllImport("user32.dll")]
+        internal static extern nint WindowFromPoint(AutomationNativePoint point);
+        /// <summary>取得命中窗口的根窗口。</summary>
+        [DllImport("user32.dll")]
+        internal static extern nint GetAncestor(nint window, uint flags);
+        /// <summary>取得发送线程的真实 Win32 标识。</summary>
+        [DllImport("kernel32.dll")]
+        internal static extern uint GetCurrentThreadId();
         /// <summary>读取紧急停止键状态。</summary>
         [DllImport("user32.dll")]
         internal static extern short GetAsyncKeyState(int virtualKey);

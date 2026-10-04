@@ -90,6 +90,7 @@ public sealed class WindowsGameAutomationNativeTests
     [Fact]
     public void MousePressRemainsObservableAcrossAFramePollingConsumer()
     {
+        var log = new MouseLogger();
         long downAt = 0;
         long releasedAt = 0;
         bool pressed = false;
@@ -102,13 +103,15 @@ public sealed class WindowsGameAutomationNativeTests
                 if (input.Mouse.Flags == 4) { pressed = false; releasedAt = batchAt; }
             }
             return (uint)inputs.Length;
-        });
+        }, logger: log);
         Assert.Equal(3u, api.SendMouseClick(100, 200));
         Assert.False(pressed);
         TimeSpan duration = Stopwatch.GetElapsedTime(downAt, releasedAt);
         int observableFrames = (int)Math.Floor(duration.TotalSeconds * 60);
         Assert.True(observableFrames >= 1, $"按住状态持续 {duration.TotalMilliseconds:F3}ms，60Hz 轮询只可观察 {observableFrames} 帧。");
         Assert.True(duration >= TimeSpan.FromMilliseconds(70), $"鼠标按住仅 {duration.TotalMilliseconds:F3}ms，未达到开包按钮的跨帧时序。");
+        var hold = Assert.Single(log.Entries, entry => IsMouseEvent(entry.Fields, "FreePackMouseWaitResult") && Equals(entry.Fields["Phase"], "hold"));
+        Assert.True(Assert.IsType<double>(hold.Fields["ElapsedMs"]) >= 70);
     }
 
     /// <summary>验证边界接受按下后发生取消或异常时仍发送松开，并保留原异常。</summary>
@@ -463,17 +466,112 @@ public sealed class WindowsGameAutomationNativeTests
     private static bool IsMouseEvent(Dictionary<string, object?> fields, string name)
         => fields.TryGetValue("{OriginalFormat}", out object? template) && ((string)template!).StartsWith(name, StringComparison.Ordinal);
 
+    /// <summary>验证点击边界快照记录物理按键、命中根窗口和前台进程线程，而非逐帧采样。</summary>
+    [Fact]
+    public void ClickSnapshotsIdentifyButtonAndWindowStateAtBothBoundaries()
+    {
+        int reads = 0;
+        var log = new MouseLogger();
+        var api = CreateMouseApi(inputs => (uint)inputs.Length, _ => { }, logger: log, observeMouse: () =>
+            new(true, 0, new(300, 400), ++reads == 1, 101, 102, 103, 104, 201, 202, 203, 301, -4));
+        Assert.Equal(3u, api.SendMouseClick(100, 200));
+        Assert.Equal(2, reads);
+        var before = Assert.Single(log.Entries, entry => IsMouseEvent(entry.Fields, "FreePackMouseSnapshot") && Equals(entry.Fields["Phase"], "BeforeDown"));
+        var after = Assert.Single(log.Entries, entry => IsMouseEvent(entry.Fields, "FreePackMouseSnapshot") && Equals(entry.Fields["Phase"], "AfterUp"));
+        Assert.True(Assert.IsType<bool>(before.Fields["LeftButtonPhysicalDown"]));
+        Assert.False(Assert.IsType<bool>(after.Fields["LeftButtonPhysicalDown"]));
+        Assert.True(Assert.IsType<bool>(after.Fields["CursorValid"]));
+        Assert.Equal(300, after.Fields["CursorX"]);
+        Assert.Equal(400, after.Fields["CursorY"]);
+        Assert.Equal((nint)101, after.Fields["PointWindow"]);
+        Assert.Equal((nint)102, after.Fields["PointRoot"]);
+        Assert.Equal(103u, after.Fields["PointProcessId"]);
+        Assert.Equal(104u, after.Fields["PointThreadId"]);
+        Assert.Equal((nint)201, after.Fields["ForegroundWindow"]);
+        Assert.Equal(202u, after.Fields["ForegroundProcessId"]);
+        Assert.Equal(203u, after.Fields["ForegroundThreadId"]);
+        Assert.Equal(301u, after.Fields["SenderThreadId"]);
+        Assert.Equal((nint)(-4), after.Fields["ThreadDpiContext"]);
+        Assert.Equal(before.Fields["ClickId"], after.Fields["ClickId"]);
+    }
+
+    /// <summary>验证快照读取失效或抛出异常只记录警告，点击结果及即时系统错误保持。</summary>
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public void SnapshotFailureDoesNotChangeInputResultOrLastError(bool throws)
+    {
+        var log = new MouseLogger();
+        var api = CreateMouseApi(inputs => { Marshal.SetLastPInvokeError(7); return (uint)inputs.Length; }, _ => { }, logger: log,
+            observeMouse: () =>
+            {
+                Marshal.SetLastPInvokeError(999);
+                if (throws) throw new Win32Exception(87);
+                return new(false, 87, default, false, 0, 0, 0, 0, 0, 0, 0, 1, -4);
+            });
+        Assert.Equal(3u, api.SendMouseClick(100, 200));
+        Assert.Equal(7, Marshal.GetLastWin32Error());
+        Assert.Equal(2, log.Entries.Count(entry => entry.Level == LogLevel.Warning));
+        Assert.All(log.Entries, entry => Assert.True(entry.Fields.ContainsKey("ClickId")));
+    }
+
+    /// <summary>验证诊断和日志入口同时失败时仍保留原输入结果、异常实例和系统错误。</summary>
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public void DiagnosticLoggerFailureCannotMaskInputSuccessOrFailure(bool failInput)
+    {
+        var expected = new InvalidOperationException("实际输入故障。");
+        bool released = false;
+        var api = CreateMouseApi(inputs =>
+        {
+            uint flag = Assert.Single(inputs).Mouse.Flags;
+            Marshal.SetLastPInvokeError(flag == 4 ? 0 : 7);
+            if (flag == 2 && failInput) throw expected;
+            if (flag == 4) released = true;
+            return (uint)inputs.Length;
+        }, _ => { }, logger: new FailingMouseLogger(), observeMouse: () => throw new InvalidOperationException("快照故障。"));
+        if (failInput)
+        {
+            Assert.Same(expected, Record.Exception(() => api.SendMouseClick(100, 200)));
+            Assert.Equal(7, Marshal.GetLastWin32Error());
+        }
+        else
+        {
+            Assert.Equal(3u, api.SendMouseClick(100, 200));
+            Assert.Equal(0, Marshal.GetLastWin32Error());
+        }
+        Assert.True(released);
+    }
+
+    /// <summary>模拟日志提供程序故障及系统错误污染。</summary>
+    private sealed class FailingMouseLogger : ILogger
+    {
+        /// <summary>本故障夹具无需作用域。</summary>
+        public IDisposable? BeginScope<TState>(TState state) where TState : notnull => null;
+        /// <summary>日志入口参与所有级别的故障验证。</summary>
+        public bool IsEnabled(LogLevel level) => true;
+        /// <summary>污染系统错误后抛出日志故障，供生产隔离路径验证。</summary>
+        public void Log<TState>(LogLevel level, EventId eventId, TState state, Exception? exception, Func<TState, Exception?, string> formatter)
+        {
+            Marshal.SetLastPInvokeError(999);
+            throw new InvalidOperationException("日志入口故障。");
+        }
+    }
+
     /// <summary>创建所有鼠标定位和输入均可替换的边界，纯测试不会触碰桌面。</summary>
     private static SystemWindowsGameAutomationNativeApi CreateMouseApi(Func<SystemWindowsGameAutomationNativeApi.NativeInput[], uint> sendInputs,
         Action<TimeSpan>? holdMouse = null, Func<int, int, bool>? setCursor = null,
         SystemWindowsGameAutomationNativeApi.CursorPositionReader? readCursor = null, Action<TimeSpan>? settleMouse = null,
-        Func<bool>? stopRequested = null, Func<AutomationNativeRectangle>? getDesktop = null, ILogger? logger = null)
+        Func<bool>? stopRequested = null, Func<AutomationNativeRectangle>? getDesktop = null, ILogger? logger = null,
+        Func<SystemWindowsGameAutomationNativeApi.MouseInputObservation>? observeMouse = null)
     {
         AutomationNativePoint cursor = default;
         return new(() => [], Process.GetProcessById, "fixture", sendInputs, holdMouse,
             setCursor ?? ((x, y) => { cursor = new(x, y); return true; }),
             readCursor ?? ((out AutomationNativePoint point) => { point = cursor; return true; }),
-            settleMouse ?? (_ => { }), stopRequested ?? (() => false), getDesktop ?? (() => new(0, 0, 65536, 65536)), () => -4, logger);
+            settleMouse ?? (_ => { }), stopRequested ?? (() => false), getDesktop ?? (() => new(0, 0, 65536, 65536)), () => -4, logger,
+            observeMouse ?? (() => new(true, 0, cursor, false, 42, 42, 7, 11, 42, 7, 11, 12, -4)));
     }
 
     /// <summary>收集纯鼠标边界测试的结构化到达和故障日志。</summary>
@@ -568,7 +666,11 @@ public sealed class WindowsGameAutomationNativeTests
             var api = new SystemWindowsGameAutomationNativeApi(() => [], Process.GetProcessById, process.ProcessName);
             runningApi = api;
             stage = "自有窗口物理点击激活";
+            nint foregroundBeforeSetup = api.GetForegroundWindow();
             Assert.True(Native.SetWindowPos(previousForeground, -1, 0, 0, 0, 0, 0x0053));
+            nint foregroundAfterSetup = api.GetForegroundWindow();
+            Console.WriteLine($"OwnedFixtureSetup Expected={previousForeground} BeforeForeground={foregroundBeforeSetup} "
+                + $"BeforePID={api.GetWindowProcessId(foregroundBeforeSetup)} ActualForeground={foregroundAfterSetup} ActualPID={api.GetWindowProcessId(foregroundAfterSetup)}.");
             Assert.Equal((uint)Environment.ProcessId, api.GetWindowProcessId(previousForeground));
             Assert.True(api.GetClientRectangle(previousForeground, out AutomationNativeRectangle initialClient));
             var initialOrigin = new AutomationNativePoint(0, 0);
@@ -593,7 +695,7 @@ public sealed class WindowsGameAutomationNativeTests
                         && Math.Abs(actual.X - initialPoint.X) <= 1 && Math.Abs(actual.Y - initialPoint.Y) <= 1
                         && Native.GetAncestor(Native.WindowFromPoint(actual), 2) == previousForeground, TimeSpan.FromMilliseconds(250)),
                         "按下前实际鼠标没有落在自有测试窗口中。");
-                    return api.SendMouseClick(normalizedX, normalizedY);
+                    return SendOwnedFixtureActivationClick(previousForeground);
                 }
                 finally { Native.SetThreadDpiAwarenessContext(clickDpi); }
             }, shutdown.Token);
@@ -701,6 +803,38 @@ public sealed class WindowsGameAutomationNativeTests
                         GC.KeepAlive(procedure);
                     }
                 }
+            }
+        }
+    }
+
+    /// <summary>以当前鼠标下的自有窗口取得前台激活资格；准备阶段直接发送按下及松开，不依赖生产定位入口。</summary>
+    private static uint SendOwnedFixtureActivationClick(nint expectedWindow)
+    {
+        Assert.True(Native.GetCursorPos(out AutomationNativePoint actual));
+        Assert.Equal(expectedWindow, Native.GetAncestor(Native.WindowFromPoint(actual), 2));
+        bool released = false;
+        try
+        {
+            SystemWindowsGameAutomationNativeApi.NativeInput[] down = [new() { Mouse = new() { Flags = 2 } }];
+            Assert.Equal(1u, Native.SendInput(1, down, Marshal.SizeOf<SystemWindowsGameAutomationNativeApi.NativeInput>()));
+            Thread.Sleep(80);
+            SystemWindowsGameAutomationNativeApi.NativeInput[] up = [new() { Mouse = new() { Flags = 4 } }];
+            Assert.Equal(1u, Native.SendInput(1, up, Marshal.SizeOf<SystemWindowsGameAutomationNativeApi.NativeInput>()));
+            released = true;
+            return 3;
+        }
+        finally
+        {
+            if (!released)
+            {
+                int originalError = Marshal.GetLastWin32Error();
+                try
+                {
+                    SystemWindowsGameAutomationNativeApi.NativeInput[] up = [new() { Mouse = new() { Flags = 4 } }];
+                    Native.SendInput(1, up, Marshal.SizeOf<SystemWindowsGameAutomationNativeApi.NativeInput>());
+                }
+                catch (Exception) { /* 准备阶段清理保留首次断言或原生异常。 */ }
+                finally { Marshal.SetLastPInvokeError(originalError); }
             }
         }
     }
@@ -998,48 +1132,32 @@ public sealed class WindowsGameAutomationNativeTests
         catch (Exception exception) { mainFailure = exception; }
         finally
         {
-            try
+            RunOwnedFixtureCleanup(() =>
             {
-                runningApi?.EndEmergencyStop();
-                if (window != 0) Native.DestroyWindow(window);
-                Native.UnregisterClass(className, Native.GetModuleHandle(null));
-            }
-            catch (Exception cleanupFailure)
-            {
-                if (mainFailure is null) mainFailure = cleanupFailure;
-                else mainFailure.Data["WindowCleanupFailure"] = cleanupFailure.ToString();
-            }
-            finally
-            {
-                try
-                {
-                    if (savedCursor is { } cursor && runningApi is not null)
-                        RestoreOwnedFixtureCursor(cursor, runningApi);
-                }
-                catch (Exception cleanupFailure)
-                {
-                    Console.WriteLine($"OwnedFixtureCursorCleanup Error={cleanupFailure}");
-                    if (mainFailure is null) mainFailure = cleanupFailure;
-                    else mainFailure.Data["CursorCleanupFailure"] = cleanupFailure.ToString();
-                }
-                finally
-                {
-                    try
-                    {
-                        Native.SetThreadDpiAwarenessContext(previousDpi);
-                        GC.KeepAlive(procedure);
-                        if (Directory.Exists(directory)) Directory.Delete(directory, true);
-                    }
-                    catch (Exception cleanupFailure)
-                    {
-                        if (mainFailure is null) mainFailure = cleanupFailure;
-                        else mainFailure.Data["FinalCleanupFailure"] = cleanupFailure.ToString();
-                    }
-                }
-            }
+                if (savedCursor is { } cursor && runningApi is not null)
+                    RestoreOwnedFixtureCursor(cursor, runningApi);
+            }, "CursorCleanupFailure", ref mainFailure);
+            RunOwnedFixtureCleanup(() => runningApi?.EndEmergencyStop(), "StopCleanupFailure", ref mainFailure);
+            RunOwnedFixtureCleanup(() => { if (window != 0) Native.DestroyWindow(window); }, "WindowCleanupFailure", ref mainFailure);
+            RunOwnedFixtureCleanup(() => Native.UnregisterClass(className, Native.GetModuleHandle(null)), "ClassCleanupFailure", ref mainFailure);
+            RunOwnedFixtureCleanup(() => Native.SetThreadDpiAwarenessContext(previousDpi), "DpiCleanupFailure", ref mainFailure);
+            GC.KeepAlive(procedure);
+            RunOwnedFixtureCleanup(() => { if (Directory.Exists(directory)) Directory.Delete(directory, true); }, "DirectoryCleanupFailure", ref mainFailure);
         }
         if (mainFailure is null) completion.SetResult();
         else completion.SetException(mainFailure);
+    }
+
+    /// <summary>独立执行自有夹具清理并保存失败，确保原主体异常及其他清理步骤保持。</summary>
+    private static void RunOwnedFixtureCleanup(Action cleanup, string failureKey, ref Exception? mainFailure)
+    {
+        try { cleanup(); }
+        catch (Exception cleanupFailure)
+        {
+            Console.WriteLine($"OwnedFixtureCleanup Phase={failureKey} Error={cleanupFailure}");
+            if (mainFailure is null) mainFailure = cleanupFailure;
+            else mainFailure.Data[failureKey] = cleanupFailure.ToString();
+        }
     }
 
     /// <summary>从自有客户区、桌面和当前系统裁剪的交集中选择区别于原鼠标位置的真实目标。</summary>

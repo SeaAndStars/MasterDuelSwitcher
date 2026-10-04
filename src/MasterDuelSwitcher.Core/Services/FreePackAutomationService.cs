@@ -1,6 +1,7 @@
 using MasterDuelSwitcher.Core.Models;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Logging.Abstractions;
+using System.Diagnostics;
 using System.Globalization;
 using System.Numerics;
 
@@ -76,6 +77,8 @@ public sealed class FreePackAutomationService : IFreePackAutomationService
             context.WaitStartedTimestamp = timeProvider.GetTimestamp();
             ThrowIfStopped(cancellationToken);
             logger.LogInformation("开始免费卡包扫描。");
+            logger.LogDebug("FreePackRunStarted RunId={RunId} ObservationMilliseconds={ObservationMilliseconds} MaximumWaitMilliseconds={MaximumWaitMilliseconds} MaximumPacks={MaximumPacks}",
+                context.RunId, ObservationDelay.TotalMilliseconds, MaximumWait.TotalMilliseconds, MaximumPacks);
             Report(context, "正在识别卡包详情");
             return await Task.Run(async () =>
             {
@@ -100,7 +103,12 @@ public sealed class FreePackAutomationService : IFreePackAutomationService
         {
             try { platform.EndAutomation(); }
             catch (Exception exception) { logger.LogWarning(exception, "免费开包会话清理失败，保留原结束结果。"); }
-            finally { Volatile.Write(ref running, 0); }
+            finally
+            {
+                Volatile.Write(ref running, 0);
+                logger.LogDebug("FreePackRunEnded RunId={RunId} Phase={Phase} Frames={Frames} Actions={Actions} LastSuccessfulActionSequence={LastSuccessfulActionSequence} ScannedPacks={ScannedPacks} OpenedPacks={OpenedPacks}",
+                    context.RunId, context.Phase.ToString(), context.FrameSequence, context.ActionSequence, context.LastSuccessfulActionSequence, context.Visited.Count, context.OpenedPacks);
+            }
         }
     }
 
@@ -189,16 +197,23 @@ public sealed class FreePackAutomationService : IFreePackAutomationService
                     if (context.Phase == RunPhase.AwaitReturn &&
                         (context.ResultAttempts >= 10 || RepeatedActionElapsed(context) < context.ResultInterval))
                     {
+                        logger.LogDebug("FreePackResultRetryBlocked RunId={RunId} FrameSequence={FrameSequence} Phase={Phase} Attempts={Attempts} Reason={Reason} RequiredIntervalMilliseconds={RequiredIntervalMilliseconds} RequestedWaitMilliseconds={RequestedWaitMilliseconds} FrameElapsedMilliseconds={FrameElapsedMilliseconds}",
+                            context.RunId, context.FrameSequence, context.Phase.ToString(), context.ResultAttempts, context.ResultAttempts >= 10 ? "AttemptLimit" : "Backoff",
+                            context.ResultInterval.TotalMilliseconds, context.RepeatDelayElapsed.TotalMilliseconds, (context.LastFrame!.CapturedAtUtc - context.RepeatStartedFrameAt!.Value).TotalMilliseconds);
                         await DelayAsync(context, cancellationToken).ConfigureAwait(false);
                         continue;
                     }
                     if (observation.PrimaryTarget is not { } target)
                     {
+                        logger.LogDebug("FreePackResultTargetMissing RunId={RunId} FrameSequence={FrameSequence} Phase={Phase} Confidence={Confidence}",
+                            context.RunId, context.FrameSequence, context.Phase.ToString(), observation.Confidence);
                         await DelayAsync(context, cancellationToken).ConfigureAwait(false);
                         continue;
                     }
                     if (!await IsStableAsync(context, observation, cancellationToken).ConfigureAwait(false)) continue;
                     var firstConfirmation = context.Phase == RunPhase.Opening;
+                    logger.LogDebug("FreePackResultConfirmationRequested RunId={RunId} FrameSequence={FrameSequence} Phase={Phase} Attempt={Attempt} ClientX={ClientX} ClientY={ClientY} RequiredIntervalMilliseconds={RequiredIntervalMilliseconds}",
+                        context.RunId, context.FrameSequence, context.Phase.ToString(), firstConfirmation ? 1 : context.ResultAttempts + 1, target.X, target.Y, context.ResultInterval.TotalMilliseconds);
                     Click(context, observation, target, "确认卡包结果", cancellationToken, firstConfirmation);
                     context.ResultAttempts = firstConfirmation ? 1 : context.ResultAttempts + 1;
                     context.ResultInterval = firstConfirmation ? TimeSpan.FromMilliseconds(200)
@@ -247,6 +262,7 @@ public sealed class FreePackAutomationService : IFreePackAutomationService
     {
         ThrowIfStopped(cancellationToken);
         context.LastFrame = platform.Capture();
+        context.FrameSequence++;
         if (context.RecoveryStartedTimestamp is not null)
         {
             EnsureRecoveryWithinWait(context);
@@ -263,6 +279,9 @@ public sealed class FreePackAutomationService : IFreePackAutomationService
         context.RepeatStartedFrameAt ??= context.LastFrame.CapturedAtUtc - context.PreservedRepeatFrameElapsed;
         var observation = recognizer.Recognize(context.LastFrame);
         logger.LogDebug("识别界面 {Screen}，评分 {Confidence}。", observation.Screen, observation.Confidence);
+        logger.LogDebug("FreePackObservation RunId={RunId} FrameSequence={FrameSequence} Phase={Phase} Screen={Screen} Confidence={Confidence} FreeOffer={FreeOffer} PrimaryTarget={PrimaryTarget} LastSuccessfulActionSequence={LastSuccessfulActionSequence} LastActionScreen={LastActionScreen} ResultAttempts={ResultAttempts} CapturedAtUtc={CapturedAtUtc}",
+            context.RunId, context.FrameSequence, context.Phase.ToString(), observation.Screen, observation.Confidence, observation.FreeOffer, observation.PrimaryTarget,
+            context.LastSuccessfulActionSequence, context.LastAction?.Screen, context.ResultAttempts, context.LastFrame.CapturedAtUtc);
         if (observation.Screen == PackScreen.UnverifiedPurchaseDialog ||
             observation.Screen == PackScreen.FreePurchaseDialog && !observation.FreeOffer)
             throw new InvalidOperationException("购买确认未验证免费条件，已停止。");
@@ -273,12 +292,18 @@ public sealed class FreePackAutomationService : IFreePackAutomationService
     private async Task<bool> IsStableAsync(RunContext context, PackObservation first, CancellationToken cancellationToken)
     {
         var frame = context.LastFrame!;
+        var firstFrameSequence = context.FrameSequence;
         await DelayAsync(context, cancellationToken).ConfigureAwait(false);
         var second = CaptureObservation(context, cancellationToken);
         var current = context.LastFrame!;
+        logger.LogDebug("FreePackStabilityGeometry RunId={RunId} FirstFrameSequence={FirstFrameSequence} SecondFrameSequence={SecondFrameSequence} FirstWindow={FirstWindow} SecondWindow={SecondWindow} FirstWidth={FirstWidth} SecondWidth={SecondWidth} FirstHeight={FirstHeight} SecondHeight={SecondHeight} FirstX={FirstX} SecondX={SecondX} FirstY={FirstY} SecondY={SecondY}",
+            context.RunId, firstFrameSequence, context.FrameSequence, frame.WindowHandle, current.WindowHandle, frame.Width, current.Width, frame.Height, current.Height, frame.ScreenX, current.ScreenX, frame.ScreenY, current.ScreenY);
         EnsureSameGeometry(frame, current);
         EnsureWithinWait(context);
-        return SameObservation(first, second);
+        var stable = SameObservation(first, second);
+        logger.LogDebug("FreePackStabilityResult RunId={RunId} FirstFrameSequence={FirstFrameSequence} SecondFrameSequence={SecondFrameSequence} Stable={Stable} FirstScreen={FirstScreen} SecondScreen={SecondScreen} FirstTarget={FirstTarget} SecondTarget={SecondTarget} FirstFreeOffer={FirstFreeOffer} SecondFreeOffer={SecondFreeOffer}",
+            context.RunId, firstFrameSequence, context.FrameSequence, stable, first.Screen, second.Screen, first.PrimaryTarget, second.PrimaryTarget, first.FreeOffer, second.FreeOffer);
+        return stable;
     }
 
     /// <summary>动作条件一致才能视为稳定，不以评分的微小波动替代画面身份校验。</summary>
@@ -420,7 +445,24 @@ public sealed class FreePackAutomationService : IFreePackAutomationService
     private void Click(RunContext context, PackObservation observation, PixelPoint point, string stage, CancellationToken cancellationToken, bool resetWait = true)
     {
         ThrowIfStopped(cancellationToken);
-        platform.Click(context.LastFrame!, point);
+        var started = Stopwatch.GetTimestamp();
+        double? sincePreviousCompletion = context.LastDiagnosticActionTimestamp is { } previous
+            ? Stopwatch.GetElapsedTime(previous, started).TotalMilliseconds : null;
+        context.ActionSequence++;
+        logger.LogDebug("FreePackActionRequested RunId={RunId} ActionSequence={ActionSequence} FrameSequence={FrameSequence} Phase={Phase} Stage={Stage} Screen={Screen} ClientX={ClientX} ClientY={ClientY} Window={Window} FrameAgeMilliseconds={FrameAgeMilliseconds} SincePreviousCompletionMilliseconds={SincePreviousCompletionMilliseconds}",
+            context.RunId, context.ActionSequence, context.FrameSequence, context.Phase.ToString(), stage, observation.Screen, point.X, point.Y, context.LastFrame!.WindowHandle,
+            (DateTimeOffset.UtcNow - context.LastFrame.CapturedAtUtc).TotalMilliseconds, sincePreviousCompletion);
+        try { platform.Click(context.LastFrame, point); }
+        catch (Exception exception)
+        {
+            logger.LogWarning(exception, "FreePackActionFailed RunId={RunId} ActionSequence={ActionSequence} FrameSequence={FrameSequence} Phase={Phase} Stage={Stage} Screen={Screen} InputMilliseconds={InputMilliseconds}",
+                context.RunId, context.ActionSequence, context.FrameSequence, context.Phase.ToString(), stage, observation.Screen, Stopwatch.GetElapsedTime(started).TotalMilliseconds);
+            throw;
+        }
+        context.LastDiagnosticActionTimestamp = Stopwatch.GetTimestamp();
+        context.LastSuccessfulActionSequence = context.ActionSequence;
+        logger.LogDebug("FreePackActionCompleted RunId={RunId} ActionSequence={ActionSequence} FrameSequence={FrameSequence} Phase={Phase} Stage={Stage} Screen={Screen} InputMilliseconds={InputMilliseconds}",
+            context.RunId, context.ActionSequence, context.FrameSequence, context.Phase.ToString(), stage, observation.Screen, Stopwatch.GetElapsedTime(started, context.LastDiagnosticActionTimestamp.Value).TotalMilliseconds);
         context.LastAction = observation;
         var timestamp = timeProvider.GetTimestamp();
         if (resetWait)
@@ -505,6 +547,16 @@ public sealed class FreePackAutomationService : IFreePackAutomationService
     /// <summary>仅属于一次扫描的身份、动作锁与无进展计时状态。</summary>
     private sealed class RunContext
     {
+        /// <summary>关联本轮阶段、帧和动作日志的独立标识。</summary>
+        public readonly string RunId = Guid.NewGuid().ToString("N");
+        /// <summary>本轮成功捕获的截图序号，包括稳定核验的第二帧。</summary>
+        public long FrameSequence;
+        /// <summary>本轮已请求的动作序号，失败输入也保留诊断记录。</summary>
+        public long ActionSequence;
+        /// <summary>最近一次系统输入成功返回的动作序号，仅用于日志关联。</summary>
+        public long LastSuccessfulActionSequence;
+        /// <summary>最近一次输入完成的诊断时间戳，与业务等待时钟独立。</summary>
+        public long? LastDiagnosticActionTimestamp;
         /// <summary>可选界面进度接收器。</summary>
         public readonly IProgress<FreePackProgress>? Progress;
         /// <summary>本轮已检查的卡包观察，轮次仅按精确标题或兼容哈希比较。</summary>
