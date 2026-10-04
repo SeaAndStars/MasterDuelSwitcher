@@ -8,6 +8,71 @@ namespace MasterDuelSwitcher.Tests;
 /// <summary>以录制观察序列和虚构窗口输入验证免费开包，不启动或操作真实游戏。</summary>
 public sealed class FreePackAutomationTests
 {
+    /// <summary>逐次关联输入发起、完成和后续观察，验证诊断不会改变原免费流程。</summary>
+    [Fact]
+    public async Task ActionDiagnosticsCorrelateSuccessfulInputsAndFollowingFrames()
+    {
+        var fixture = new Fixture(Detail("a", true), Dialog(), Opening(true), Results(), Detail("a"), Detail("b"), Detail("a"));
+        var result = await fixture.RunAsync();
+        Assert.Equal(1, result.OpenedPacks);
+        var requested = fixture.Logger.Records.Where(record => Template(record).StartsWith("FreePackActionRequested", StringComparison.Ordinal)).ToArray();
+        var completed = fixture.Logger.Records.Where(record => Template(record).StartsWith("FreePackActionCompleted", StringComparison.Ordinal)).ToArray();
+        Assert.Equal(fixture.Platform.Clicks.Count, requested.Length);
+        Assert.Equal(requested.Length, completed.Length);
+        string runId = Assert.IsType<string>(requested[0]["RunId"]);
+        Assert.Equal(32, runId.Length);
+        for (int index = 0; index < requested.Length; index++)
+        {
+            Assert.Equal(runId, requested[index]["RunId"]);
+            Assert.Equal((long)index + 1, requested[index]["ActionSequence"]);
+            Assert.Equal(requested[index]["ActionSequence"], completed[index]["ActionSequence"]);
+            Assert.True(Assert.IsType<double>(completed[index]["InputMilliseconds"]) >= 0);
+            Assert.Equal(fixture.Platform.Clicks[index].Screen, requested[index]["Screen"]);
+        }
+        Assert.Null(requested[0]["SincePreviousCompletionMilliseconds"]);
+        Assert.True(Assert.IsType<double>(requested[1]["SincePreviousCompletionMilliseconds"]) >= 0);
+        Assert.Contains(fixture.Logger.Records, record => Template(record).StartsWith("FreePackObservation", StringComparison.Ordinal)
+            && Equals(record["Phase"], "AwaitReturn") && Equals(record["Screen"], PackScreen.PackDetails)
+            && Assert.IsType<long>(record["LastSuccessfulActionSequence"]) > 0);
+        Assert.Contains(fixture.Logger.Records, record => Template(record).StartsWith("FreePackStabilityResult", StringComparison.Ordinal) && Equals(record["Stable"], true));
+    }
+
+    /// <summary>输入边界抛出异常时保留原结束结果，并明确区分发起与成功完成。</summary>
+    [Fact]
+    public async Task ActionDiagnosticsDoNotMarkFailedInputAsCompleted()
+    {
+        var fixture = new Fixture(Detail("a", true), Dialog(), Opening(true), Results());
+        fixture.Platform.FailClickAt = 3;
+        var result = await fixture.RunAsync();
+        Assert.Contains("输入失败", result.Reason);
+        Assert.Equal(2, fixture.Platform.Clicks.Count);
+        Assert.Equal(3, fixture.Logger.Records.Count(record => Template(record).StartsWith("FreePackActionRequested", StringComparison.Ordinal)));
+        Assert.Equal(2, fixture.Logger.Records.Count(record => Template(record).StartsWith("FreePackActionCompleted", StringComparison.Ordinal)));
+        var failed = Assert.Single(fixture.Logger.Records, record => Template(record).StartsWith("FreePackActionFailed", StringComparison.Ordinal));
+        Assert.Equal(3L, failed["ActionSequence"]);
+        Assert.Equal("Opening", failed["Phase"]);
+        Assert.Equal(0, result.OpenedPacks);
+    }
+
+    /// <summary>结果页持续不变时日志解释退避和十次上限，且诊断不会增加点击。</summary>
+    [Fact]
+    public async Task ResultRetryDiagnosticsExplainBackoffAndAttemptLimit()
+    {
+        var fixture = new Fixture(Detail("a", true), Dialog(), Results());
+        fixture.Platform.UseRequestedDelay = true;
+        var result = await fixture.RunAsync();
+        Assert.Contains("60 秒", result.Reason);
+        Assert.Equal(10, fixture.Platform.Clicks.Count(click => click.Screen == PackScreen.Results));
+        var gates = fixture.Logger.Records.Where(record => Template(record).StartsWith("FreePackResultRetryBlocked", StringComparison.Ordinal)).ToArray();
+        Assert.Contains(gates, record => Equals(record["Reason"], "Backoff") && Equals(record["RequiredIntervalMilliseconds"], 200.0));
+        Assert.Contains(gates, record => Equals(record["Reason"], "AttemptLimit") && Equals(record["Attempts"], 10));
+        Assert.Equal(10, fixture.Logger.Records.Count(record => Template(record).StartsWith("FreePackResultConfirmationRequested", StringComparison.Ordinal)));
+        Assert.Equal(0, result.OpenedPacks);
+    }
+
+    /// <summary>从结构化记录读取事件模板，避免测试依赖中文数字格式。</summary>
+    private static string Template(IReadOnlyDictionary<string, object?> record) => Assert.IsType<string>(record["{OriginalFormat}"]);
+
     /// <summary>详情、免费确认、动画和结果组成一次免费开包，返回原包后才切换下一包。</summary>
     [Fact]
     public async Task FreePackCompletesBeforeAdvancingAndStopsAfterOneCycle()
@@ -1346,12 +1411,17 @@ public sealed class FreePackAutomationTests
     {
         /// <summary>各日志等级、格式化正文和实际异常。</summary>
         public List<(LogLevel Level, string Message, Exception? Exception)> Entries { get; } = [];
+        /// <summary>保存诊断关联标识和原始计数，验证事件配对与失败清理。</summary>
+        public List<IReadOnlyDictionary<string, object?>> Records { get; } = [];
         /// <summary>测试不创建日志作用域。</summary>
         public IDisposable? BeginScope<TState>(TState state) where TState : notnull => null;
         /// <summary>记录所有日志等级。</summary>
         public bool IsEnabled(LogLevel logLevel) => true;
         /// <summary>保存格式化正文和原异常。</summary>
         public void Log<TState>(LogLevel logLevel, EventId eventId, TState state, Exception? exception, Func<TState, Exception?, string> formatter)
-            => Entries.Add((logLevel, formatter(state, exception), exception));
+        {
+            Entries.Add((logLevel, formatter(state, exception), exception));
+            Records.Add(((IEnumerable<KeyValuePair<string, object?>>)(object)state!).ToDictionary(item => item.Key, item => item.Value));
+        }
     }
 }

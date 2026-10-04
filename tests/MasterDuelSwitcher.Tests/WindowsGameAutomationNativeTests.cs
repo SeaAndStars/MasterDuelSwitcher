@@ -405,6 +405,64 @@ public sealed class WindowsGameAutomationNativeTests
         Assert.False(inputSent);
     }
 
+    /// <summary>验证每次点击的批次返回、即时系统错误及等待耗时可以通过同一标识关联。</summary>
+    [Fact]
+    public void ClickDiagnosticsCorrelateBatchesErrorsAndActualWaitDurations()
+    {
+        int batches = 0;
+        var log = new MouseLogger();
+        var api = CreateMouseApi(inputs =>
+        {
+            Marshal.SetLastPInvokeError(11 + batches++);
+            return (uint)inputs.Length;
+        }, _ => { }, logger: log);
+        Assert.Equal(3u, api.SendMouseClick(100, 200, new(300, 400)));
+
+        Assert.All(log.Entries, entry => Assert.True(entry.Fields.ContainsKey("ClickId"), "鼠标边界日志缺少本次点击标识。"));
+        string clickId = Assert.IsType<string>(log.Entries[0].Fields["ClickId"]);
+        Assert.NotEmpty(clickId);
+        Assert.All(log.Entries, entry => Assert.Equal(clickId, entry.Fields["ClickId"]));
+        string[] phases = ["MOVE", "DOWN", "UP"];
+        for (int index = 0; index < phases.Length; index++)
+        {
+            var result = Assert.Single(log.Entries, entry => IsMouseEvent(entry.Fields, "FreePackMouseBatchResult") && Equals(entry.Fields["Phase"], phases[index]));
+            Assert.Equal(1u, result.Fields["RequestedCount"]);
+            Assert.Equal(1u, result.Fields["AcceptedCount"]);
+            Assert.Equal(11 + index, result.Fields["Win32Error"]);
+            Assert.True(Assert.IsType<double>(result.Fields["ElapsedMs"]) >= 0);
+        }
+        var settle = Assert.Single(log.Entries, entry => IsMouseEvent(entry.Fields, "FreePackMouseWaitResult") && Equals(entry.Fields["Phase"], "settle"));
+        var hold = Assert.Single(log.Entries, entry => IsMouseEvent(entry.Fields, "FreePackMouseWaitResult") && Equals(entry.Fields["Phase"], "hold"));
+        Assert.Equal(40d, settle.Fields["RequestedMs"]);
+        Assert.Equal(80d, hold.Fields["RequestedMs"]);
+        Assert.True(Assert.IsType<double>(settle.Fields["ElapsedMs"]) >= 0);
+        Assert.True(Assert.IsType<double>(hold.Fields["ElapsedMs"]) >= 0);
+    }
+
+    /// <summary>验证异常补发松开具有明确标记，原按下错误及原等待异常保持。</summary>
+    [Fact]
+    public void ClickDiagnosticsIdentifyCompensatingReleaseWithoutMaskingTheFailure()
+    {
+        var log = new MouseLogger();
+        var failure = new InvalidOperationException("按住入口失败。");
+        var api = CreateMouseApi(inputs =>
+        {
+            uint flag = Assert.Single(inputs).Mouse.Flags;
+            Marshal.SetLastPInvokeError(flag == 2 ? 7 : 0);
+            return 1;
+        }, _ => throw failure, logger: log);
+        Assert.Same(failure, Record.Exception(() => api.SendMouseClick(100, 200)));
+        Assert.Equal(7, Marshal.GetLastWin32Error());
+        var cleanup = Assert.Single(log.Entries, entry => IsMouseEvent(entry.Fields, "FreePackMouseBatchResult") && Equals(entry.Fields["Phase"], "CleanupUp"));
+        Assert.Equal(1u, cleanup.Fields["AcceptedCount"]);
+        Assert.Equal(0, cleanup.Fields["Win32Error"]);
+        Assert.True(cleanup.Fields.ContainsKey("ClickId"));
+    }
+
+    /// <summary>按日志原始模板识别稳定事件名，不依赖格式化消息或随机标识。</summary>
+    private static bool IsMouseEvent(Dictionary<string, object?> fields, string name)
+        => fields.TryGetValue("{OriginalFormat}", out object? template) && ((string)template!).StartsWith(name, StringComparison.Ordinal);
+
     /// <summary>创建所有鼠标定位和输入均可替换的边界，纯测试不会触碰桌面。</summary>
     private static SystemWindowsGameAutomationNativeApi CreateMouseApi(Func<SystemWindowsGameAutomationNativeApi.NativeInput[], uint> sendInputs,
         Action<TimeSpan>? holdMouse = null, Func<int, int, bool>? setCursor = null,
