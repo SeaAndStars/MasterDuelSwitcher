@@ -110,3 +110,4 @@
 - 新Native客户区RED复现43通过/1失败；受控空白回退RED三项失败。最终视觉437/437通过、零跳过，包括44真实输入和空白/标点重读；51生产文件1065声明中文注释零缺口。当前游戏只读捕获确认大蛇咒缚免费，余额4930；真实购买循环尚未开始。
 18:52连续开包实际根因是第三包非空OCR星生/星尘分歧；修补已提交4961e19，完整二维白字签名与跨包隐藏Skip，具体证据和未验收边界见docs/continuous-pack-live-verification.md。
 19:27 RunId09ae0f155b7b443ab32306563ea31b47 实机失败：免费美丽的漆黑蔷薇Results仅一帧后原详情，Opening未转返回；同精确OCR标题SHA随背景从9BB6A1变10CDEA。修补以完整OCR精确主、SHA别名补充，并保留结果证据冻结旧Skip，原详情稳定非免费补交返回、下一包前提交AwaitReturn。
+26包停止RunId e30a809d1e0a43a8839504e13cdd8493，26 scanned/24 opened：入口Action178完成，同Title闪耀的龙/SHA一致，Frame550费用免费false、收费false，AwaitFreeConfirmation过渡守卫因FreeOffer要求true而提前停止。
