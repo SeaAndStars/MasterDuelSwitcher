@@ -127,7 +127,7 @@ public sealed class FreePackAutomationService : IFreePackAutomationService
                 EnsureWithinWait(context);
                 if (observation.Screen == PackScreen.Unknown)
                 {
-                    if (context.Phase == RunPhase.Opening && context.SkipTarget is not null)
+                    if (context.Phase == RunPhase.Opening && !context.ResultsObserved && context.SkipTarget is not null)
                         await SkipAnimationAsync(context, observation, cancellationToken).ConfigureAwait(false);
                     else await DelayAsync(context, cancellationToken).ConfigureAwait(false);
                     continue;
@@ -175,6 +175,7 @@ public sealed class FreePackAutomationService : IFreePackAutomationService
                     context.Visited.Add(observation);
                     context.CurrentPack = observation;
                     context.ReturnCounted = false;
+                    context.ResultsObserved = false;
                     context.SkipClicks = 0;
                     Report(context, observation.FreeOffer ? "等待免费购买确认" : "等待下一卡包详情");
                     continue;
@@ -200,7 +201,9 @@ public sealed class FreePackAutomationService : IFreePackAutomationService
                 }
                 if (context.Phase == RunPhase.Opening && observation.Screen == PackScreen.Opening)
                 {
-                    await SkipAnimationAsync(context, observation, cancellationToken).ConfigureAwait(false);
+                    // 任一复核帧已进入结果后冻结旧Skip，等待稳定结果或原包返回，避免坐标落在确认按钮上。
+                    if (context.ResultsObserved) await DelayAsync(context, cancellationToken).ConfigureAwait(false);
+                    else await SkipAnimationAsync(context, observation, cancellationToken).ConfigureAwait(false);
                     continue;
                 }
                 if (observation.Screen == PackScreen.Results && context.Phase is RunPhase.Opening or RunPhase.AwaitReturn)
@@ -233,11 +236,17 @@ public sealed class FreePackAutomationService : IFreePackAutomationService
                     Report(context, "等待返回原卡包详情");
                     continue;
                 }
-                if (observation.Screen == PackScreen.PackDetails && context.Phase == RunPhase.AwaitReturn)
+                if (observation.Screen == PackScreen.PackDetails && (context.Phase == RunPhase.AwaitReturn ||
+                    context.Phase == RunPhase.Opening && context.ResultsObserved && !observation.FreeOffer))
                 {
                     if (!await IsStableAsync(context, observation, cancellationToken).ConfigureAwait(false)) continue;
                     if (!SameIdentity(context.CurrentPack!, observation))
                         return Finish(context, "结果页未返回原卡包详情，已停止。", true);
+                    logger.LogDebug("FreePackReturnedDetailsValidated RunId={RunId} PreviousPhase={PreviousPhase} ResultsObserved={ResultsObserved} ConfirmationAttempts={ConfirmationAttempts} OriginalTitle={OriginalTitle} CurrentTitle={CurrentTitle} OriginalSignature={OriginalSignature} CurrentSignature={CurrentSignature}",
+                        context.RunId, context.Phase.ToString(), context.ResultsObserved, context.ResultAttempts,
+                        context.CurrentPack!.PackTitle, observation.PackTitle, context.CurrentPack.TitleVisualSignature, observation.TitleVisualSignature);
+                    // 先提交已返回阶段；下一包输入暂失焦时保留计数，未知画面也不再重放动画Skip。
+                    context.Phase = RunPhase.AwaitReturn;
                     if (!context.ReturnCounted)
                     {
                         context.OpenedPacks++;
@@ -296,6 +305,8 @@ public sealed class FreePackAutomationService : IFreePackAutomationService
         if (observation.Screen == PackScreen.UnverifiedPurchaseDialog ||
             observation.Screen == PackScreen.FreePurchaseDialog && !observation.FreeOffer)
             throw new InvalidOperationException("购买确认未验证免费条件，已停止。");
+        if (observation.Screen == PackScreen.Results && context.Phase == RunPhase.Opening)
+            context.ResultsObserved = true;
         return observation;
     }
 
@@ -324,21 +335,24 @@ public sealed class FreePackAutomationService : IFreePackAutomationService
            SameStableIdentity(first, second) && first.PrimaryTarget == second.PrimaryTarget &&
            first.NextTarget == second.NextTarget && first.AnimationSkipTarget == second.AnimationSkipTarget;
 
-    /// <summary>完整二维标题字形优先核验，兼容观察仍精确比较标题或允许双帧卡图轻微抖动。</summary>
+    /// <summary>完整标题优先精确核验，真实字形仅补充不同OCR别名，兼容帧允许卡图轻微抖动。</summary>
     private static bool SameStableIdentity(PackObservation first, PackObservation second)
-        => first.TitleVisualSignature.Length != 0 || second.TitleVisualSignature.Length != 0
-            ? string.Equals(first.TitleVisualSignature, second.TitleVisualSignature, StringComparison.Ordinal)
-            : first.PackTitle.Length != 0 || second.PackTitle.Length != 0
-            ? string.Equals(first.PackTitle, second.PackTitle, StringComparison.Ordinal)
-            : SameFingerprint(first.Fingerprint, second.Fingerprint);
+        => CompareTitleEvidence(first, second) ?? SameFingerprint(first.Fingerprint, second.Fingerprint);
 
-    /// <summary>轮次与当前包优先精确比较完整标题字形，兼容观察保留原有精确标题及卡图比较。</summary>
+    /// <summary>轮次与当前包精确核验标题或同字形OCR别名，只有兼容无标题观察才比较旧卡图。</summary>
     private static bool SameIdentity(PackObservation first, PackObservation second)
-        => first.TitleVisualSignature.Length != 0 || second.TitleVisualSignature.Length != 0
-            ? string.Equals(first.TitleVisualSignature, second.TitleVisualSignature, StringComparison.Ordinal)
-            : first.PackTitle.Length != 0 || second.PackTitle.Length != 0
-            ? string.Equals(first.PackTitle, second.PackTitle, StringComparison.Ordinal)
-            : string.Equals(first.Fingerprint, second.Fingerprint, StringComparison.Ordinal);
+        => CompareTitleEvidence(first, second) ?? string.Equals(first.Fingerprint, second.Fingerprint, StringComparison.Ordinal);
+
+    /// <summary>双方非空标题精确相同即接受；不同标题仅以完整非空字形签名验证别名，单侧空标题拒绝。</summary>
+    /// <returns>有文字身份时返回核验结果；双方无标题时返回空，由原兼容卡图路径处理。</returns>
+    private static bool? CompareTitleEvidence(PackObservation first, PackObservation second)
+    {
+        if (first.PackTitle.Length == 0 && second.PackTitle.Length == 0) return null;
+        if (first.PackTitle.Length == 0 || second.PackTitle.Length == 0) return false;
+        return string.Equals(first.PackTitle, second.PackTitle, StringComparison.Ordinal) ||
+            first.TitleVisualSignature.Length != 0 && second.TitleVisualSignature.Length != 0 &&
+            string.Equals(first.TitleVisualSignature, second.TitleVisualSignature, StringComparison.Ordinal);
+    }
 
     /// <summary>保证新双帧与本轮已验证Skip坐标仍属于相同窗口和客户区几何。</summary>
     private static void EnsureSameGeometry(GameFrame first, GameFrame second)
@@ -619,6 +633,8 @@ public sealed class FreePackAutomationService : IFreePackAutomationService
         public TimeSpan ResultInterval;
         /// <summary>当前包已双帧返回原详情并计数，下一包输入暂时失败也不重复累加。</summary>
         public bool ReturnCounted;
+        /// <summary>成功免费购买后已捕获合法结果界面，即使结果被快速确认而未发送专用确认输入仍保留证据。</summary>
+        public bool ResultsObserved;
         /// <summary>本次连续失焦的起始单调时间，只有原窗口新双帧捕获后清除。</summary>
         public long? RecoveryStartedTimestamp;
         /// <summary>连续恢复期间累计请求的延迟，冻结时钟也保持六十秒上限。</summary>

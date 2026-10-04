@@ -1347,7 +1347,7 @@ public sealed class FreePackAutomationTests
     public async Task VisualEvidenceControlsTheStablePair(string firstSignature, string secondSignature, bool accepted)
     {
         var first = TitledDetail("星生", "same", true) with { TitleVisualSignature = firstSignature };
-        var second = first with { PackTitle = accepted ? "星尘" : "星生", TitleVisualSignature = secondSignature };
+        var second = first with { PackTitle = "星尘", TitleVisualSignature = secondSignature };
         var fixture = new Fixture(first);
         fixture.Platform.Observations = [first, second];
         fixture.Platform.StopAfterCaptures = 3;
@@ -1355,11 +1355,11 @@ public sealed class FreePackAutomationTests
         Assert.Equal(accepted ? 1 : 0, fixture.Platform.Clicks.Count);
     }
 
-    /// <summary>即使OCR标题和旧卡图哈希碰撞，完整二维标题字形不同仍视作下一包。</summary>
+    /// <summary>完整标题与字形不同、旧卡图哈希碰撞时仍逐包扫描，精确文字身份不受旧哈希干扰。</summary>
     [Fact]
-    public async Task DifferentVisualTitlesCannotMergeEvenWhenOcrAndOldHashesCollide()
+    public async Task DifferentExactTitlesCannotMergeWhenOldHashesCollide()
     {
-        var packs = Enumerable.Range(0, 20).Select(index => TitledDetail("相同误读", "same")
+        var packs = Enumerable.Range(0, 20).Select(index => TitledDetail("不同卡包" + index, "same")
             with { TitleVisualSignature = "actual-glyph-" + index }).ToArray();
         var fixture = new Fixture(packs.Concat([packs[0]]).ToArray());
         var result = await fixture.RunAsync();
@@ -1382,6 +1382,157 @@ public sealed class FreePackAutomationTests
         var result = await fixture.RunAsync();
         Assert.True(result.IsCancelled);
         Assert.DoesNotContain(fixture.Platform.Clicks, click => click.Point == changed.PrimaryTarget || click.Point == changed.AnimationSkipTarget);
+    }
+
+    /// <summary>真实美丽的漆黑蔷薇标题保持精确一致时，背景引起的SHA变动不影响双帧或原包返回。</summary>
+    [Fact]
+    public async Task ExactOcrTitleRemainsStableWhenTheWhiteMaskChanges()
+    {
+        var detail = TitledDetail("美丽的漆黑蔷薇", "33a9998c00000000", true) with { TitleVisualSignature = "9BB6A1" };
+        var changed = detail with { TitleVisualSignature = "10CDEA" };
+        var fixture = new Fixture(detail);
+        fixture.Platform.Observations = [detail, changed, Dialog(), Dialog(), Results(), Results(),
+            detail with { FreeOffer = false }, changed with { FreeOffer = false },
+            TitledDetail("其他卡包", "same"), TitledDetail("其他卡包", "same"), detail, changed];
+        var result = await fixture.RunAsync();
+        Assert.Equal(1, result.OpenedPacks);
+        Assert.Equal(2, result.ScannedPacks);
+        Assert.Contains("一轮", result.Reason);
+    }
+
+    /// <summary>结果只出现一帧即被快速点击确认，返回原包双帧后仍计数并切换下一包。</summary>
+    [Fact]
+    public async Task ABriefObservedResultCanReturnWithoutASeparateConfirmationClick()
+    {
+        var detail = TitledDetail("美丽的漆黑蔷薇", "same", true) with { TitleVisualSignature = "9BB6A1" };
+        var returned = detail with { FreeOffer = false, TitleVisualSignature = "10CDEA" };
+        var fixture = new Fixture(detail);
+        fixture.Platform.Observations = [detail, detail, Dialog(), Dialog(), Results(), Unknown(), returned, returned,
+            TitledDetail("其他卡包", "other"), TitledDetail("其他卡包", "other"), returned, returned];
+        var result = await fixture.RunAsync();
+        Assert.Equal(1, result.OpenedPacks);
+        Assert.Equal(2, result.ScannedPacks);
+        Assert.Contains("一轮", result.Reason);
+        Assert.DoesNotContain(fixture.Platform.Clicks, click => click.Screen == PackScreen.Results);
+        Assert.Equal(2, fixture.Platform.Clicks.Count(click => click.Point == detail.NextTarget));
+    }
+
+    /// <summary>结果可在主观察或Skip复核帧闪现，之后任何未知或动画过渡都停止重放旧Skip。</summary>
+    [Theory]
+    [InlineData(false, false)]
+    [InlineData(false, true)]
+    [InlineData(true, false)]
+    [InlineData(true, true)]
+    public async Task AnObservedResultFreezesCachedAnimationClicks(bool resultDuringSkipValidation, bool openingTransition)
+    {
+        var detail = TitledDetail("原卡包", "same", true);
+        var returned = detail with { FreeOffer = false };
+        var opening = Opening(true) with { AnimationSkipTarget = new PixelPoint(80, 80) };
+        var transition = openingTransition ? opening : Unknown();
+        var frames = new List<PackObservation> { detail, detail, Dialog(), Dialog(), opening, opening };
+        if (resultDuringSkipValidation) frames.Add(Unknown());
+        frames.AddRange([Results(), Unknown(), transition, transition, returned, returned,
+            TitledDetail("下一卡包", "other"), TitledDetail("下一卡包", "other"), returned, returned]);
+        var fixture = new Fixture(detail);
+        fixture.Platform.Observations = frames.ToArray();
+        var result = await fixture.RunAsync();
+        Assert.Equal(1, result.OpenedPacks);
+        Assert.Equal(2, result.ScannedPacks);
+        Assert.Single(fixture.Platform.Clicks, click => click.Point == new PixelPoint(80, 80));
+        Assert.DoesNotContain(fixture.Platform.Clicks, click => click.Screen == PackScreen.Unknown);
+    }
+
+    /// <summary>购买后费用读不到而没有任何结果证据时只等待，不把未知或仍免费的详情计为完成。</summary>
+    [Theory]
+    [InlineData(true, false)]
+    [InlineData(false, false)]
+    [InlineData(true, true)]
+    public async Task AReturnNeedsAnObservedResultAndAConsumedFreeOffer(bool stillFree, bool seenResult)
+    {
+        var detail = TitledDetail("原卡包", "same", true);
+        var fixture = new Fixture(detail);
+        var frames = new List<PackObservation> { detail, detail, Dialog(), Dialog() };
+        if (seenResult) frames.AddRange([Results(), Unknown()]);
+        frames.AddRange([detail with { FreeOffer = stillFree }, detail with { FreeOffer = stillFree }]);
+        fixture.Platform.Observations = frames.ToArray();
+        fixture.Platform.StopAfterCaptures = 20;
+        var result = await fixture.RunAsync();
+        Assert.True(result.IsCancelled);
+        Assert.Equal(0, result.OpenedPacks);
+        Assert.DoesNotContain(fixture.Platform.Clicks, click => click.Point == detail.NextTarget);
+    }
+
+    /// <summary>快速确认后导航暂失焦，已返回阶段保持完成计数，恢复期间不向未知详情发送旧Skip。</summary>
+    [Fact]
+    public async Task RecoveredNavigationAfterAnImplicitResultNeverReplaysTheOldSkip()
+    {
+        var detail = TitledDetail("原卡包", "same", true);
+        var skip = Opening(true) with { AnimationSkipTarget = new PixelPoint(80, 80) };
+        var fixture = new Fixture(detail);
+        fixture.Platform.Observations = [detail, detail, Dialog(), Dialog(), skip, skip, Results(), Unknown(),
+            detail with { FreeOffer = false }, detail with { FreeOffer = false }, Unknown(), Unknown(),
+            detail with { FreeOffer = false }, detail with { FreeOffer = false },
+            TitledDetail("下一卡包", "other"), TitledDetail("下一卡包", "other"), detail, detail];
+        fixture.Platform.TemporaryClickAt = 4;
+        var result = await fixture.RunAsync();
+        Assert.Equal(1, result.OpenedPacks);
+        Assert.Equal(2, result.ScannedPacks);
+        Assert.Equal(1, fixture.Platform.RecoverCalls);
+        Assert.DoesNotContain(fixture.Platform.Clicks, click => click.Screen == PackScreen.Unknown);
+        Assert.Single(fixture.Platform.Clicks, click => click.Point == new PixelPoint(80, 80));
+    }
+
+    /// <summary>单侧OCR标题缺失时，相同完整字形与旧哈希均不得替代缺失的免费入口身份。</summary>
+    /// <param name="missingFirst">首帧缺少标题；否则第二帧缺少标题。</param>
+    [Theory]
+    [InlineData(true)]
+    [InlineData(false)]
+    public async Task ASingleMissingOcrTitleCannotUseAnIdenticalVisualSignature(bool missingFirst)
+    {
+        var detail = TitledDetail("原卡包", "same", true) with { TitleVisualSignature = new string('A', 64) };
+        var first = detail with { PackTitle = missingFirst ? "" : detail.PackTitle };
+        var second = detail with { PackTitle = missingFirst ? detail.PackTitle : "" };
+        var fixture = new Fixture(detail);
+        fixture.Platform.Observations = [first, second];
+        fixture.Platform.StopAfterCaptures = 3;
+
+        var result = await fixture.RunAsync();
+
+        Assert.True(result.IsCancelled);
+        Assert.Equal(0, result.ScannedPacks);
+        Assert.Equal(0, result.OpenedPacks);
+        Assert.Empty(fixture.Platform.Clicks);
+    }
+
+    /// <summary>快速结果后的原包收费详情只有一帧时，免费重现、未知或其他卡包均不得完成返回或导航。</summary>
+    /// <param name="secondFrame">第二帧变为仍免费、未知或不同卡包详情。</param>
+    [Theory]
+    [InlineData("free")]
+    [InlineData("unknown")]
+    [InlineData("other")]
+    public async Task AnImplicitReturnRequiresTwoConsistentOriginalPaidDetails(string secondFrame)
+    {
+        var detail = TitledDetail("原卡包", "same", true) with { TitleVisualSignature = new string('A', 64) };
+        var returned = detail with { FreeOffer = false, TitleVisualSignature = new string('B', 64) };
+        var second = secondFrame switch
+        {
+            "free" => detail,
+            "unknown" => Unknown(),
+            _ => returned with { PackTitle = "其他卡包", TitleVisualSignature = new string('C', 64) }
+        };
+        var fixture = new Fixture(detail);
+        fixture.Platform.Observations = [detail, detail, Dialog(), Dialog(), Results(), Unknown(), returned, second];
+        fixture.Platform.StopAfterCaptures = 9;
+
+        var result = await fixture.RunAsync();
+
+        Assert.True(result.IsCancelled);
+        Assert.Equal(1, result.ScannedPacks);
+        Assert.Equal(0, result.OpenedPacks);
+        Assert.Equal(2, fixture.Platform.Clicks.Count);
+        Assert.DoesNotContain(fixture.Platform.Clicks, click => click.Point == detail.NextTarget);
+        Assert.Single(fixture.Platform.Clicks, click => click.Screen == PackScreen.FreePurchaseDialog);
+        Assert.All(fixture.Progress.Values, progress => Assert.Equal(0, progress.OpenedPacks));
     }
 
     /// <summary>构造具有真实OCR标题的已识别卡包详情。</summary>
