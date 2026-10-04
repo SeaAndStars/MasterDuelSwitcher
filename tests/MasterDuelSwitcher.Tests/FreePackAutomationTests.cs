@@ -90,6 +90,76 @@ public sealed class FreePackAutomationTests
         Assert.Empty(fixture.Platform.Diagnostics);
     }
 
+    /// <summary>免费入口成功后原包详情持续多帧且导航目标抖动时等待弹窗，只购买一次并正常完成计数。</summary>
+    [Fact]
+    public async Task SamePackDetailsAfterFreeEntryWaitsForDialogAndCompletesOnce()
+    {
+        var detail = TitledDetail("猛火魔兽", "a", true);
+        var transition = detail with { NextTarget = new PixelPoint(91, 50) };
+        var fixture = new Fixture(detail, transition, transition, transition, Dialog(), Opening(true), Results(),
+            detail with { FreeOffer = false }, TitledDetail("其他卡包", "b"), detail);
+        var result = await fixture.RunAsync();
+        Assert.Equal(2, result.ScannedPacks);
+        Assert.Equal(1, result.OpenedPacks);
+        Assert.Contains("一轮", result.Reason);
+        Assert.False(result.IsCancelled);
+        Assert.Equal(new[] { PackScreen.PackDetails, PackScreen.FreePurchaseDialog, PackScreen.Opening,
+            PackScreen.Results, PackScreen.PackDetails, PackScreen.PackDetails }, fixture.Platform.Clicks.Select(click => click.Screen));
+        Assert.DoesNotContain(fixture.Platform.Clicks, click => click.Point == transition.NextTarget);
+        Assert.Single(fixture.Platform.Clicks, click => click.Screen == PackScreen.FreePurchaseDialog);
+        Assert.Single(fixture.Platform.Clicks, click => click.Screen == PackScreen.Results);
+        Assert.Empty(fixture.Platform.Diagnostics);
+    }
+
+    /// <summary>免费入口后原包详情持续未弹出确认框时遵守六十秒期限，不重复入口或提前计数。</summary>
+    [Fact]
+    public async Task SamePackDetailsAfterFreeEntryRetainsSixtySecondDeadline()
+    {
+        var detail = TitledDetail("猛火魔兽", "a", true);
+        var fixture = new Fixture(detail, detail with { NextTarget = new PixelPoint(91, 50) });
+        fixture.Platform.UseRequestedDelay = true;
+        var result = await fixture.RunAsync();
+        Assert.Contains("60", result.Reason);
+        Assert.False(result.IsCancelled);
+        Assert.Equal(0, result.OpenedPacks);
+        Assert.Single(fixture.Platform.Clicks);
+        Assert.InRange(fixture.Platform.Elapsed.TotalSeconds, 60, 60.2);
+        Assert.Single(fixture.Platform.Diagnostics);
+    }
+
+    /// <summary>免费入口的同包详情过渡后出现付费购买框时停止，诊断确实停在付费框且不购买。</summary>
+    [Fact]
+    public async Task PaidDialogAfterFreeEntryTransitionStopsBeforePurchase()
+    {
+        var detail = TitledDetail("猛火魔兽", "a", true);
+        var paid = new PackObservation(PackScreen.UnverifiedPurchaseDialog, new PixelPoint(50, 60), null, false, "", .99);
+        var transition = detail with { NextTarget = new PixelPoint(91, 50) };
+        var fixture = new Fixture(detail, transition, transition, paid);
+        var result = await fixture.RunAsync();
+        Assert.Contains("停止", result.Reason);
+        Assert.Equal(0, result.OpenedPacks);
+        Assert.Single(fixture.Platform.Clicks);
+        var diagnostic = Assert.Single(fixture.Platform.Diagnostics);
+        Assert.Equal(PackScreen.UnverifiedPurchaseDialog, fixture.Recognizer.Recognize(diagnostic.Frame).Screen);
+    }
+
+    /// <summary>免费入口的原包过渡后标题变为其他卡包时停止，同哈希也不允许继续等待或购买。</summary>
+    [Fact]
+    public async Task DifferentPackAfterFreeEntryTransitionStopsBeforePurchase()
+    {
+        var detail = TitledDetail("猛火魔兽", "a", true);
+        var changed = detail with { PackTitle = "其他卡包", NextTarget = new PixelPoint(91, 50) };
+        var transition = detail with { NextTarget = new PixelPoint(91, 50) };
+        var fixture = new Fixture(detail, transition, transition, changed, Dialog(), Results());
+        var result = await fixture.RunAsync();
+        Assert.Contains("停止", result.Reason);
+        Assert.Equal(1, result.ScannedPacks);
+        Assert.Equal(0, result.OpenedPacks);
+        Assert.Single(fixture.Platform.Clicks);
+        var diagnostic = Assert.Single(fixture.Platform.Diagnostics);
+        Assert.Equal(changed.PackTitle, fixture.Recognizer.Recognize(diagnostic.Frame).PackTitle);
+    }
+
     /// <summary>购买弹窗消退后短暂显示同包详情时，只等待开包页面，不重复购买或切换下一包。</summary>
     [Theory]
     [InlineData(true)]
