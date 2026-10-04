@@ -56,6 +56,10 @@ public sealed class FreePackAutomationService : IFreePackAutomationService
     private static readonly TimeSpan RecoveryPause = TimeSpan.FromSeconds(3);
     /// <summary>单轮允许首次检查的最多卡包数量。</summary>
     private const int MaximumPacks = 200;
+    /// <summary>单个结果页允许成功发送的独立确认次数，包含首次确认。</summary>
+    private const int MaximumResultAttempts = 30;
+    /// <summary>结果确认的递增间隔上限，避免动画未响应后长时间等待下一次点击。</summary>
+    private const int MaximumResultIntervalMilliseconds = 600;
 
     /// <summary>创建依赖截图识别与已核验游戏窗口边界的免费开包服务。</summary>
     public FreePackAutomationService(IPackRecognizer recognizer, IGameAutomationPlatform platform, ILogger<FreePackAutomationService>? logger = null, TimeProvider? timeProvider = null)
@@ -195,10 +199,10 @@ public sealed class FreePackAutomationService : IFreePackAutomationService
                 if (observation.Screen == PackScreen.Results && context.Phase is RunPhase.Opening or RunPhase.AwaitReturn)
                 {
                     if (context.Phase == RunPhase.AwaitReturn &&
-                        (context.ResultAttempts >= 10 || RepeatedActionElapsed(context) < context.ResultInterval))
+                        (context.ResultAttempts >= MaximumResultAttempts || RepeatedActionElapsed(context) < context.ResultInterval))
                     {
                         logger.LogDebug("FreePackResultRetryBlocked RunId={RunId} FrameSequence={FrameSequence} Phase={Phase} Attempts={Attempts} Reason={Reason} RequiredIntervalMilliseconds={RequiredIntervalMilliseconds} RequestedWaitMilliseconds={RequestedWaitMilliseconds} FrameElapsedMilliseconds={FrameElapsedMilliseconds}",
-                            context.RunId, context.FrameSequence, context.Phase.ToString(), context.ResultAttempts, context.ResultAttempts >= 10 ? "AttemptLimit" : "Backoff",
+                            context.RunId, context.FrameSequence, context.Phase.ToString(), context.ResultAttempts, context.ResultAttempts >= MaximumResultAttempts ? "AttemptLimit" : "Backoff",
                             context.ResultInterval.TotalMilliseconds, context.RepeatDelayElapsed.TotalMilliseconds, (context.LastFrame!.CapturedAtUtc - context.RepeatStartedFrameAt!.Value).TotalMilliseconds);
                         await DelayAsync(context, cancellationToken).ConfigureAwait(false);
                         continue;
@@ -217,7 +221,7 @@ public sealed class FreePackAutomationService : IFreePackAutomationService
                     Click(context, observation, target, "确认卡包结果", cancellationToken, firstConfirmation);
                     context.ResultAttempts = firstConfirmation ? 1 : context.ResultAttempts + 1;
                     context.ResultInterval = firstConfirmation ? TimeSpan.FromMilliseconds(200)
-                        : TimeSpan.FromMilliseconds(Math.Min(context.ResultInterval.TotalMilliseconds * 2, 5000));
+                        : TimeSpan.FromMilliseconds(Math.Min(context.ResultInterval.TotalMilliseconds * 2, MaximumResultIntervalMilliseconds));
                     context.Phase = RunPhase.AwaitReturn;
                     Report(context, "等待返回原卡包详情");
                     continue;
@@ -595,9 +599,9 @@ public sealed class FreePackAutomationService : IFreePackAutomationService
         public int SkipClicks;
         /// <summary>下一次Skip允许发送前的等待间隔，最高八百毫秒。</summary>
         public TimeSpan SkipInterval = TimeSpan.FromMilliseconds(160);
-        /// <summary>当前结果页面成功发送确认的次数，最多十次。</summary>
+        /// <summary>当前结果页面成功发送确认的次数，最多三十次，每次均独立按下并松开。</summary>
         public int ResultAttempts;
-        /// <summary>下一次结果确认前的退避间隔，最高五秒。</summary>
+        /// <summary>下一次结果确认前的递增间隔，最高六百毫秒，期间仍逐帧观察。</summary>
         public TimeSpan ResultInterval;
         /// <summary>当前包已双帧返回原详情并计数，下一包输入暂时失败也不重复累加。</summary>
         public bool ReturnCounted;
