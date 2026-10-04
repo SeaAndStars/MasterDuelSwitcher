@@ -1163,6 +1163,7 @@ public sealed class FreePackVisionTests : IDisposable
     [InlineData("【𠮷 𠀀】魔・神＋２０２６", "𠮷𠀀魔神2026")]
     [InlineData("Pack Ａ-2（免费?）", "PackA2免费")]
     [InlineData("Ｃafé・卡包１２", "Café卡包12")]
+    [InlineData("丨魔神", "丨魔神")]
     public void DetailsNormalizeCompleteUnicodeTitleExactly(string rawTitle, string expectedTitle)
     {
         var reader = new RecordingTitleReader(rawTitle);
@@ -1188,6 +1189,7 @@ public sealed class FreePackVisionTests : IDisposable
     [InlineData("PackA2", "PackA3")]
     [InlineData("PackA2", "Packa2")]
     [InlineData("𠮷魔神", "𠀀魔神")]
+    [InlineData("丨魔神", "魔神")]
     public void SimilarTitlesRemainDistinctDespiteIdenticalRealImageHash(string firstTitle, string secondTitle)
     {
         using var firstSubject = new OpenCvPackRecognizer(feeVerifier: new RecordingFeeVerifier(true),
@@ -1236,6 +1238,54 @@ public sealed class FreePackVisionTests : IDisposable
         Assert.Equal(PackScreen.PackDetails, observation.Screen);
         Assert.Equal("颠覆世界恶魔之力", observation.PackTitle);
         AssertCopiedTitleRegion(image, Assert.Single(reader.Calls), includeTitlebar, scale);
+        Assert.Equal(before, frame.Pixels);
+    }
+
+    /// <summary>现场开包返回帧在各缩放下须精确读取猛火魔兽，左侧界面分隔线不成为标题文字。</summary>
+    /// <param name="scale">客户区现场截图的缩放比例。</param>
+    [Theory]
+    [InlineData(0.65)]
+    [InlineData(0.85)]
+    [InlineData(1.0)]
+    [InlineData(1.25)]
+    public void DefaultTitleOcrExcludesSeparatorFromRealFireBeastDetails(double scale)
+    {
+        using var subject = new OpenCvPackRecognizer();
+        using var original = LoadFixture("paid-details-fire-beast-after-opening.png");
+        using var image = Resize(original, scale);
+        var frame = ToFrame(image);
+        var before = frame.Pixels.ToArray();
+        var observation = subject.Recognize(frame);
+        Assert.Equal(PackScreen.PackDetails, observation.Screen);
+        Assert.Equal("猛火魔兽", observation.PackTitle);
+        Assert.False(observation.FreeOffer);
+        Assert.Null(observation.PrimaryTarget);
+        Assert.NotNull(observation.NextTarget);
+        Assert.Null(observation.AnimationSkipTarget);
+        AssertFingerprint(observation.Fingerprint);
+        Assert.InRange(observation.Confidence, .84, 1);
+        Assert.Equal(before, frame.Pixels);
+    }
+
+    /// <summary>现场标题传给OCR的真实像素排除左分隔线，完整包含首末字且不改动输入帧。</summary>
+    /// <param name="scale">客户区现场截图的缩放比例。</param>
+    [Theory]
+    [InlineData(0.65)]
+    [InlineData(0.85)]
+    [InlineData(1.0)]
+    [InlineData(1.25)]
+    public void FireBeastTitlePixelsExcludeSeparatorAndKeepCompleteGlyphs(double scale)
+    {
+        var reader = new RecordingTitleReader("猛火魔兽");
+        using var subject = new OpenCvPackRecognizer(feeVerifier: new RecordingFeeVerifier(true), titleReader: reader);
+        using var original = LoadFixture("paid-details-fire-beast-after-opening.png");
+        using var image = Resize(original, scale);
+        var frame = ToFrame(image);
+        var before = frame.Pixels.ToArray();
+        var observation = subject.Recognize(frame);
+        Assert.Equal(PackScreen.PackDetails, observation.Screen);
+        Assert.Equal("猛火魔兽", observation.PackTitle);
+        AssertCopiedFireBeastTitleRegion(frame, Assert.Single(reader.Calls), scale);
         Assert.Equal(before, frame.Pixels);
     }
 
@@ -1501,6 +1551,36 @@ public sealed class FreePackVisionTests : IDisposable
         var glyphs = includeTitlebar ? new Rect(290, 85, 254, 30) : new Rect(289, 54, 254, 30);
         Assert.True(region.Contains(new Point((int)Math.Floor(glyphs.Left * scale), (int)Math.Floor(glyphs.Top * scale))));
         Assert.True(region.Contains(new Point((int)Math.Ceiling(glyphs.Right * scale) - 1, (int)Math.Ceiling(glyphs.Bottom * scale) - 1)));
+    }
+
+    /// <summary>逐行定位现场标题的真实复制区域，核验分隔线排除与所有标题字形的完整边界。</summary>
+    /// <param name="frame">持有现场缩放图像完整BGRA像素的输入帧。</param>
+    /// <param name="title">标题识别器实际收到的独立像素区域。</param>
+    /// <param name="scale">现场图像的缩放比例。</param>
+    private static void AssertCopiedFireBeastTitleRegion(GameFrame frame, TitleCall title, double scale)
+    {
+        Assert.Equal(title.Width * title.Height * 4, title.Pixels.Length);
+        Rect? actualRegion = null;
+        for (int y = 0; y <= Math.Min(frame.Height - title.Height, (int)Math.Ceiling(30 * scale)) && actualRegion is null; y++)
+        {
+            for (int x = (int)Math.Floor(200 * scale); x <= Math.Min(frame.Width - title.Width, (int)Math.Ceiling(300 * scale)); x++)
+            {
+                var allRowsMatch = true;
+                for (int row = 0; row < title.Height && allRowsMatch; row++)
+                    allRowsMatch = frame.Pixels.AsSpan(((y + row) * frame.Width + x) * 4, title.Width * 4)
+                        .SequenceEqual(title.Pixels.AsSpan(row * title.Width * 4, title.Width * 4));
+                if (!allRowsMatch) continue;
+                actualRegion = new Rect(x, y, title.Width, title.Height);
+                break;
+            }
+        }
+        Assert.True(actualRegion.HasValue, "标题像素必须逐行来自现场截图的真实独立区域。");
+        var region = actualRegion.GetValueOrDefault();
+        Assert.True(region.Left >= (int)Math.Ceiling(248 * scale), "OCR区域必须排除现场左侧界面分隔线。");
+        Assert.True(region.Contains(new Point((int)Math.Floor(267 * scale), (int)Math.Floor(48 * scale))),
+            "标题区域必须完整保留首字及标题顶部。");
+        Assert.True(region.Contains(new Point((int)Math.Ceiling(391 * scale) - 1, (int)Math.Ceiling(78 * scale) - 1)),
+            "标题区域必须完整保留末字及标题底部。");
     }
 
     /// <summary>核验费用像素是指定原图局部逐行复制，尺寸和坐标容差只允许模板缩放插值的像素取整。</summary>
