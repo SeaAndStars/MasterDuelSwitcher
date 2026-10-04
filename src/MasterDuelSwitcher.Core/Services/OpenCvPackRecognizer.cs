@@ -1,4 +1,6 @@
+using System.Buffers.Binary;
 using System.Runtime.InteropServices;
+using System.Security.Cryptography;
 using System.Text;
 using MasterDuelSwitcher.Core.Models;
 using Microsoft.Extensions.Logging;
@@ -25,6 +27,10 @@ public sealed class OpenCvPackRecognizer : IPackRecognizer, IDisposable
     private const double HeaderMatchThreshold = .92;
     /// <summary>类别锚点至少包含的物理像素高度，拒绝退化为少量像素的文字和分隔符。</summary>
     private const int MinimumHeaderHeight = 20;
+    /// <summary>完整标题字形签名只接受三个颜色通道均达到此值的强白前景。</summary>
+    private const byte MinimumTitleWhiteValue = 210;
+    /// <summary>中性白字允许的最大通道色差，排除蓝色背景和有色动画粒子。</summary>
+    private const byte MaximumTitleWhiteColorDifference = 8;
     /// <summary>原始截图模板对应的参考窗口宽度。</summary>
     private const double ReferenceWidth = 2050;
     /// <summary>用于低成本状态锚点搜索的标准缩放候选。</summary>
@@ -177,16 +183,24 @@ public sealed class OpenCvPackRecognizer : IPackRecognizer, IDisposable
         if (next is null) return null;
         var fingerprint = Fingerprint(original, label.Value);
         if (fingerprint is null) return null;
-        var packTitle = ReadPackTitle(image, original, color, factor);
+        var packTitle = ReadPackTitle(image, original, color, factor, out var titleVisualSignature);
         if (packTitle.Length == 0) return Unknown();
         var free = FindFreeEntry(image, factor, label.Value);
         var one = free is null ? null : FindRelative(image, factor, free.Value, "one-pack-text");
         var score = Math.Min(label.Value.Score, next.Value.Score);
         if (free is null || one is null || !OnSameYellowButton(color, one.Value, free.Value)
             || !VerifyFreeFee(color, FeeButtonBounds(one.Value, free.Value), false))
-            return new(PackScreen.PackDetails, null, next.Value.Center, false, fingerprint, score) { PackTitle = packTitle };
+            return new(PackScreen.PackDetails, null, next.Value.Center, false, fingerprint, score)
+            {
+                PackTitle = packTitle,
+                TitleVisualSignature = titleVisualSignature
+            };
         return new(PackScreen.PackDetails, free.Value.Center, next.Value.Center, true, fingerprint,
-            Math.Min(score, Math.Min(free.Value.Score, one.Value.Score))) { PackTitle = packTitle };
+            Math.Min(score, Math.Min(free.Value.Score, one.Value.Score)))
+        {
+            PackTitle = packTitle,
+            TitleVisualSignature = titleVisualSignature
+        };
     }
 
     /// <summary>匹配完整类别及其分隔符后读取右侧标题，保留完整Unicode字母数字作为精确身份。</summary>
@@ -194,9 +208,11 @@ public sealed class OpenCvPackRecognizer : IPackRecognizer, IDisposable
     /// <param name="original">原始客户区灰度像素，用于保留细分隔符的独立核验。</param>
     /// <param name="color">当前原始客户区的完整 BGRA 像素。</param>
     /// <param name="factor">灰度缩略图相对于原始像素的比例。</param>
+    /// <param name="titleVisualSignature">独立于OCR文字的完整标题二维字形精确签名；联合锚点失效时为空。</param>
     /// <returns>保留全部中文、字母大小写及数字的标题；联合锚点或完整区域失效时为空。</returns>
-    private string ReadPackTitle(Mat image, Mat original, Mat color, double factor)
+    private string ReadPackTitle(Mat image, Mat original, Mat color, double factor, out string titleVisualSignature)
     {
+        titleVisualSignature = string.Empty;
         var headerRegion = new Rect(0, 0, image.Width * 2 / 5, image.Height / 6);
         var header = FindAnchor(image, factor, "header-secret", headerRegion);
         if (header is null || header.Value.Score < HeaderMatchThreshold)
@@ -236,6 +252,12 @@ public sealed class OpenCvPackRecognizer : IPackRecognizer, IDisposable
         logger.LogDebug("FreePackHeaderMatched Category={Category} HeaderX={HeaderX} HeaderY={HeaderY} HeaderWidth={HeaderWidth} HeaderHeight={HeaderHeight} AnchorScale={AnchorScale} Confidence={Confidence} SeparatorConfidence={SeparatorConfidence}",
             anchor.Template.Name, anchor.Bounds.X, anchor.Bounds.Y, anchor.Bounds.Width, anchor.Bounds.Height,
             anchor.Scale, anchor.Score, separator.Value.Score);
+        // 字形签名读取原始像素，保留完整水平边界，并限定在类别标题对应的文字行内。
+        var glyphRegion = new Rect(region.X, Math.Max(0, anchor.Bounds.Y - (int)Math.Round(4 * anchor.Scale)),
+            region.Width, (int)Math.Round(50 * anchor.Scale));
+        titleVisualSignature = CreateTitleVisualSignature(color, glyphRegion);
+        logger.LogDebug("FreePackTitleVisualSignature RegionX={RegionX} RegionY={RegionY} RegionWidth={RegionWidth} RegionHeight={RegionHeight} Signature={Signature}",
+            glyphRegion.X, glyphRegion.Y, glyphRegion.Width, glyphRegion.Height, titleVisualSignature);
         var title = ReadTitleRegion(color, region, anchor.Scale);
         if (title.Length == 0)
         {
@@ -246,6 +268,46 @@ public sealed class OpenCvPackRecognizer : IPackRecognizer, IDisposable
             title = ReadTitleRegion(color, region, anchor.Scale);
         }
         return title;
+    }
+
+    /// <summary>保留全部中性强白字的二维排列和包围宽高，建立与OCR误字及蓝色背景无关的精确身份。</summary>
+    /// <param name="color">拥有完整类别及标题行的原始客户区BGRA像素。</param>
+    /// <param name="region">已验证标题水平边界中的完整文字行，不包含钱包或说明。</param>
+    /// <returns>完整二维字形和宽高的SHA256十六进制签名；没有有效强白前景时为空。</returns>
+    private static string CreateTitleVisualSignature(Mat color, Rect region)
+    {
+        using var area = new Mat(color, region);
+        using var isolated = area.Clone();
+        var pixels = new byte[region.Width * region.Height * 4];
+        Marshal.Copy(isolated.Data, pixels, 0, pixels.Length);
+        var mask = new byte[region.Width * region.Height];
+        var left = region.Width;
+        var top = region.Height;
+        var right = -1;
+        var bottom = -1;
+        for (var index = 0; index < mask.Length; index++)
+        {
+            var offset = index * 4;
+            var minimum = Math.Min(pixels[offset], Math.Min(pixels[offset + 1], pixels[offset + 2]));
+            var maximum = Math.Max(pixels[offset], Math.Max(pixels[offset + 1], pixels[offset + 2]));
+            if (minimum < MinimumTitleWhiteValue || maximum - minimum > MaximumTitleWhiteColorDifference) continue;
+            mask[index] = 1;
+            var x = index % region.Width;
+            var y = index / region.Width;
+            left = Math.Min(left, x);
+            top = Math.Min(top, y);
+            right = Math.Max(right, x);
+            bottom = Math.Max(bottom, y);
+        }
+        if (right < 0) return string.Empty;
+        var width = right - left + 1;
+        var height = bottom - top + 1;
+        var content = new byte[8 + width * height];
+        BinaryPrimitives.WriteInt32LittleEndian(content.AsSpan(0, 4), width);
+        BinaryPrimitives.WriteInt32LittleEndian(content.AsSpan(4, 4), height);
+        for (var y = 0; y < height; y++)
+            mask.AsSpan((top + y) * region.Width + left, width).CopyTo(content.AsSpan(8 + y * width, width));
+        return Convert.ToHexString(SHA256.HashData(content));
     }
 
     /// <summary>读取独立原图标题区域并保留全部 Unicode 字母数字，同时记录实际采样及原生结果。</summary>

@@ -46,6 +46,9 @@ public sealed record PackObservation(PackScreen Screen, PixelPoint? PrimaryTarge
     /// <summary>仅详情页提供的规范化完整卡包标题；空值表示文字身份尚未建立。</summary>
     public string PackTitle { get; init; } = string.Empty;
 
+    /// <summary>仅详情页提供的完整标题中性白字二维字形及宽高的精确 SHA256 签名；未建立时为空。</summary>
+    public string TitleVisualSignature { get; init; } = string.Empty;
+
     /// <summary>仅已验证开包界面提供的动画跳过坐标；其他界面始终为空。</summary>
     public PixelPoint? AnimationSkipTarget { get; init; }
 }

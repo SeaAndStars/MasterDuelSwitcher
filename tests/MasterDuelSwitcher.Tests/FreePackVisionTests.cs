@@ -951,7 +951,9 @@ public sealed class FreePackVisionTests : IDisposable
         var observation = loggedRecognizer.Recognize(frame);
         Assert.Equal(PackScreen.PackDetails, observation.Screen);
         Assert.Equal("独立卡包标题", observation.PackTitle);
-        Assert.Equal(3, provider.Events.Count);
+        Assert.Equal(4, provider.Events.Count);
+        var visualLog = Assert.Single(provider.Events, entry => entry.Message.StartsWith("FreePackTitleVisualSignature", StringComparison.Ordinal));
+        Assert.Equal(observation.TitleVisualSignature, Assert.IsType<string>(visualLog.Properties["Signature"]));
         var headerLog = Assert.Single(provider.Events, entry => entry.Message.StartsWith("FreePackHeaderMatched", StringComparison.Ordinal));
         Assert.Equal(LogLevel.Debug, headerLog.Level);
         Assert.Equal("header-secret", Assert.IsType<string>(headerLog.Properties["Category"]));
@@ -977,7 +979,7 @@ public sealed class FreePackVisionTests : IDisposable
         loggedRecognizer.Dispose();
         loggedRecognizer.Dispose();
         Assert.Throws<ObjectDisposedException>(() => loggedRecognizer.Recognize(frame));
-        Assert.Equal(3, provider.Events.Count);
+        Assert.Equal(4, provider.Events.Count);
     }
 
     /// <summary>模板已经确认免费入口或购买弹窗时，费用文字拒绝仍必须撤回购买坐标。</summary>

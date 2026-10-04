@@ -1044,7 +1044,7 @@ public sealed class FreePackAutomationTests
         var times = fixture.Platform.ClickTimes.Where((_, index) => fixture.Platform.Clicks[index].Point == new PixelPoint(80, 80)).ToArray();
         Assert.True(times.Length > 2);
         Assert.All(times.Zip(times.Skip(1)), pair => Assert.True(pair.Second - pair.First >= TimeSpan.FromMilliseconds(160)));
-        Assert.True(times.Length < 100);
+        Assert.True(times.Length < 400);
     }
 
     /// <summary>已点击Open仍暂时显示原按钮时，使用本包已验证Skip目标而不持续等待原动作锁。</summary>
@@ -1175,7 +1175,7 @@ public sealed class FreePackAutomationTests
         Assert.Contains("60", result.Reason);
         Assert.InRange(fixture.Platform.Elapsed.TotalSeconds, 60, 61);
         Assert.Equal(0, result.OpenedPacks);
-        Assert.True(fixture.Platform.Clicks.Count < 100);
+        Assert.True(fixture.Platform.Clicks.Count < 400);
     }
 
     /// <summary>购买确认或返回详情的第二帧目标变动时不提交原动作，已确认结果也不提前计数。</summary>
@@ -1272,7 +1272,116 @@ public sealed class FreePackAutomationTests
         Assert.Contains("60", result.Reason);
         Assert.InRange(fixture.Platform.Elapsed.TotalSeconds, 60, 61);
         Assert.Equal(0, result.OpenedPacks);
-        Assert.True(fixture.Platform.Clicks.Count < 100);
+        Assert.True(fixture.Platform.Clicks.Count < 400);
+    }
+
+    /// <summary>上一包已验证的Skip在下一次免费购买后立即复用，按钮尚未出现也持续独立点击。</summary>
+    [Fact]
+    public async Task LastVerifiedSkipIsReusedDuringTheNextPurchasedAnimation()
+    {
+        var skip = Opening(true) with { AnimationSkipTarget = new PixelPoint(80, 80) };
+        var fixture = new Fixture(Detail("a", true), Dialog(), skip, Results(), Detail("a"),
+            Detail("b", true), Dialog(), Unknown(), Unknown(), Results(), Detail("b"), Detail("a"));
+        fixture.Platform.UseRequestedDelay = true;
+        var result = await fixture.RunAsync();
+        Assert.Equal(2, result.OpenedPacks);
+        Assert.Contains("一轮", result.Reason);
+        Assert.Contains(fixture.Platform.Clicks, click => click.Screen == PackScreen.Unknown && click.Point == new PixelPoint(80, 80));
+        Assert.Equal(2, fixture.Platform.Clicks.Count(click => click.Screen == PackScreen.FreePurchaseDialog));
+    }
+
+    /// <summary>隐藏Skip连续点击保持固定最小间隔，不因多次无响应退避到八百毫秒。</summary>
+    [Fact]
+    public async Task HiddenSkipKeepsAConstantIntervalUntilTheResultsAppear()
+    {
+        var skip = Opening(true) with { AnimationSkipTarget = new PixelPoint(80, 80) };
+        var fixture = new Fixture(Detail("a", true), Dialog(), skip, Unknown());
+        fixture.Platform.UseRequestedDelay = true;
+        fixture.Platform.StopAfterCaptures = 80;
+        await fixture.RunAsync();
+        var times = fixture.Platform.ClickTimes.Where((_, index) => fixture.Platform.Clicks[index].Point == new PixelPoint(80, 80)).ToArray();
+        Assert.True(times.Length >= 12);
+        Assert.All(times.Zip(times.Skip(1)).Skip(2), pair => Assert.InRange((pair.Second - pair.First).TotalMilliseconds, 160, 240));
+    }
+
+    /// <summary>动画已验证Skip后打开文字闪隐不延迟跳过，双帧结果转换仍禁止沿用动画坐标。</summary>
+    [Theory]
+    [InlineData(PackScreen.Unknown)]
+    [InlineData(PackScreen.Results)]
+    public async Task CachedSkipAcceptsAnimationFlickerButStopsOnResults(PackScreen next)
+    {
+        var detail = Detail("a", true);
+        var skip = Opening(true) with { AnimationSkipTarget = new PixelPoint(80, 80) };
+        var fixture = new Fixture(detail);
+        fixture.Platform.Observations = [detail, detail, Dialog(), Dialog(), skip, skip, skip,
+            next == PackScreen.Unknown ? Unknown() : Results()];
+        fixture.Platform.ChangeFrame = (count, frame) => frame with { CapturedAtUtc = frame.CapturedAtUtc.AddMilliseconds(count * 160) };
+        fixture.Platform.StopAfterCaptures = 9;
+        var result = await fixture.RunAsync();
+        Assert.True(result.IsCancelled);
+        Assert.Equal(next == PackScreen.Unknown ? 2 : 1,
+            fixture.Platform.Clicks.Count(click => click.Point == new PixelPoint(80, 80)));
+    }
+
+    /// <summary>完整字形签名一致时，真实星生/星尘OCR采样差异仍属于原包，继续下一包并完成轮次。</summary>
+    [Fact]
+    public async Task ExactVisualTitleSurvivesTheObservedStardustOcrAlias()
+    {
+        var initial = TitledDetail("编织羁绊的星生", "1aa8999c00000000", true) with { TitleVisualSignature = "stardust" };
+        var returned = initial with { PackTitle = "编织羁绊的星尘", FreeOffer = false };
+        var fixture = new Fixture(initial, Dialog(), Results(), returned,
+            TitledDetail("另一卡包", "1aa8999c00000000") with { TitleVisualSignature = "other" }, returned);
+        var result = await fixture.RunAsync();
+        Assert.Equal(2, result.ScannedPacks);
+        Assert.Equal(1, result.OpenedPacks);
+        Assert.Contains("一轮", result.Reason);
+        Assert.Empty(fixture.Platform.Diagnostics);
+    }
+
+    /// <summary>两帧OCR文字不同而完整字形相同时允许稳定核验，单侧签名缺失或字形不同则等待。</summary>
+    [Theory]
+    [InlineData("stardust", "stardust", true)]
+    [InlineData("stardust", "other", false)]
+    [InlineData("stardust", "", false)]
+    [InlineData("", "stardust", false)]
+    public async Task VisualEvidenceControlsTheStablePair(string firstSignature, string secondSignature, bool accepted)
+    {
+        var first = TitledDetail("星生", "same", true) with { TitleVisualSignature = firstSignature };
+        var second = first with { PackTitle = accepted ? "星尘" : "星生", TitleVisualSignature = secondSignature };
+        var fixture = new Fixture(first);
+        fixture.Platform.Observations = [first, second];
+        fixture.Platform.StopAfterCaptures = 3;
+        await fixture.RunAsync();
+        Assert.Equal(accepted ? 1 : 0, fixture.Platform.Clicks.Count);
+    }
+
+    /// <summary>即使OCR标题和旧卡图哈希碰撞，完整二维标题字形不同仍视作下一包。</summary>
+    [Fact]
+    public async Task DifferentVisualTitlesCannotMergeEvenWhenOcrAndOldHashesCollide()
+    {
+        var packs = Enumerable.Range(0, 20).Select(index => TitledDetail("相同误读", "same")
+            with { TitleVisualSignature = "actual-glyph-" + index }).ToArray();
+        var fixture = new Fixture(packs.Concat([packs[0]]).ToArray());
+        var result = await fixture.RunAsync();
+        Assert.Equal(20, result.ScannedPacks);
+        Assert.Contains("一轮", result.Reason);
+        Assert.Equal(20, fixture.Platform.Clicks.Count);
+    }
+
+    /// <summary>跨包隐藏Skip例外仅复用旧坐标，新Open或新Skip只出现一帧时禁止点击和学习。</summary>
+    [Theory]
+    [InlineData(true)]
+    [InlineData(false)]
+    public async Task APreviouslyCachedSkipNeverAuthorizesASingleFrameNewTarget(bool open)
+    {
+        var skip = Opening(true) with { AnimationSkipTarget = new PixelPoint(80, 80) };
+        var fixture = new Fixture(Detail("a", true), Dialog(), skip, Results(), Detail("a"), Detail("b", true), Dialog());
+        var changed = skip with { PrimaryTarget = open ? new PixelPoint(50, 90) : new PixelPoint(81, 80), AnimationSkipTarget = new PixelPoint(81, 80) };
+        fixture.Platform.Observations = fixture.Platform.Observations.Concat([changed, Unknown()]).ToArray();
+        fixture.Platform.StopAfterCaptures = fixture.Platform.Observations.Length + 1;
+        var result = await fixture.RunAsync();
+        Assert.True(result.IsCancelled);
+        Assert.DoesNotContain(fixture.Platform.Clicks, click => click.Point == changed.PrimaryTarget || click.Point == changed.AnimationSkipTarget);
     }
 
     /// <summary>构造具有真实OCR标题的已识别卡包详情。</summary>

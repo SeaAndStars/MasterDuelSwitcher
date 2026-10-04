@@ -175,10 +175,7 @@ public sealed class FreePackAutomationService : IFreePackAutomationService
                     context.Visited.Add(observation);
                     context.CurrentPack = observation;
                     context.ReturnCounted = false;
-                    context.SkipTarget = null;
-                    context.SkipFrame = null;
                     context.SkipClicks = 0;
-                    context.SkipInterval = TimeSpan.FromMilliseconds(160);
                     Report(context, observation.FreeOffer ? "等待免费购买确认" : "等待下一卡包详情");
                     continue;
                 }
@@ -238,9 +235,9 @@ public sealed class FreePackAutomationService : IFreePackAutomationService
                 }
                 if (observation.Screen == PackScreen.PackDetails && context.Phase == RunPhase.AwaitReturn)
                 {
+                    if (!await IsStableAsync(context, observation, cancellationToken).ConfigureAwait(false)) continue;
                     if (!SameIdentity(context.CurrentPack!, observation))
                         return Finish(context, "结果页未返回原卡包详情，已停止。", true);
-                    if (!await IsStableAsync(context, observation, cancellationToken).ConfigureAwait(false)) continue;
                     if (!context.ReturnCounted)
                     {
                         context.OpenedPacks++;
@@ -303,7 +300,7 @@ public sealed class FreePackAutomationService : IFreePackAutomationService
     }
 
     /// <summary>使用第二帧核验窗口几何和全部动作条件，任何不同均放弃本次点击。</summary>
-    private async Task<bool> IsStableAsync(RunContext context, PackObservation first, CancellationToken cancellationToken)
+    private async Task<bool> IsStableAsync(RunContext context, PackObservation first, CancellationToken cancellationToken, bool allowHiddenSkip = false)
     {
         var frame = context.LastFrame!;
         var firstFrameSequence = context.FrameSequence;
@@ -314,7 +311,8 @@ public sealed class FreePackAutomationService : IFreePackAutomationService
             context.RunId, firstFrameSequence, context.FrameSequence, frame.WindowHandle, current.WindowHandle, frame.Width, current.Width, frame.Height, current.Height, frame.ScreenX, current.ScreenX, frame.ScreenY, current.ScreenY);
         EnsureSameGeometry(frame, current);
         EnsureWithinWait(context);
-        var stable = SameObservation(first, second);
+        // 隐藏Skip例外的调用方已限定首帧为动画阶段，只允许第二帧仍是动画或未识别过渡帧。
+        var stable = SameObservation(first, second) || allowHiddenSkip && second.Screen is PackScreen.Opening or PackScreen.Unknown;
         logger.LogDebug("FreePackStabilityResult RunId={RunId} FirstFrameSequence={FirstFrameSequence} SecondFrameSequence={SecondFrameSequence} Stable={Stable} FirstScreen={FirstScreen} SecondScreen={SecondScreen} FirstTarget={FirstTarget} SecondTarget={SecondTarget} FirstFreeOffer={FirstFreeOffer} SecondFreeOffer={SecondFreeOffer}",
             context.RunId, firstFrameSequence, context.FrameSequence, stable, first.Screen, second.Screen, first.PrimaryTarget, second.PrimaryTarget, first.FreeOffer, second.FreeOffer);
         return stable;
@@ -326,15 +324,19 @@ public sealed class FreePackAutomationService : IFreePackAutomationService
            SameStableIdentity(first, second) && first.PrimaryTarget == second.PrimaryTarget &&
            first.NextTarget == second.NextTarget && first.AnimationSkipTarget == second.AnimationSkipTarget;
 
-    /// <summary>有真实标题时精确校验标题，没有标题的兼容截图仍允许双帧图像轻微抖动。</summary>
+    /// <summary>完整二维标题字形优先核验，兼容观察仍精确比较标题或允许双帧卡图轻微抖动。</summary>
     private static bool SameStableIdentity(PackObservation first, PackObservation second)
-        => first.PackTitle.Length != 0 || second.PackTitle.Length != 0
+        => first.TitleVisualSignature.Length != 0 || second.TitleVisualSignature.Length != 0
+            ? string.Equals(first.TitleVisualSignature, second.TitleVisualSignature, StringComparison.Ordinal)
+            : first.PackTitle.Length != 0 || second.PackTitle.Length != 0
             ? string.Equals(first.PackTitle, second.PackTitle, StringComparison.Ordinal)
             : SameFingerprint(first.Fingerprint, second.Fingerprint);
 
-    /// <summary>轮次与当前包使用精确标题；旧测试截图缺标题时精确比较哈希，避免相似卡图被合并。</summary>
+    /// <summary>轮次与当前包优先精确比较完整标题字形，兼容观察保留原有精确标题及卡图比较。</summary>
     private static bool SameIdentity(PackObservation first, PackObservation second)
-        => first.PackTitle.Length != 0 || second.PackTitle.Length != 0
+        => first.TitleVisualSignature.Length != 0 || second.TitleVisualSignature.Length != 0
+            ? string.Equals(first.TitleVisualSignature, second.TitleVisualSignature, StringComparison.Ordinal)
+            : first.PackTitle.Length != 0 || second.PackTitle.Length != 0
             ? string.Equals(first.PackTitle, second.PackTitle, StringComparison.Ordinal)
             : string.Equals(first.Fingerprint, second.Fingerprint, StringComparison.Ordinal);
 
@@ -346,7 +348,7 @@ public sealed class FreePackAutomationService : IFreePackAutomationService
             throw new InvalidOperationException("游戏窗口在双帧核验间发生变化。");
     }
 
-    /// <summary>购买后只复用本包双帧验证的Skip坐标，隐藏按钮点击按递增间隔节流且不续期。</summary>
+    /// <summary>成功免费购买后复用本轮双帧验证的Skip坐标，隐藏按钮持续独立点击且不续期。</summary>
     private async Task SkipAnimationAsync(RunContext context, PackObservation observation, CancellationToken cancellationToken)
     {
         var candidate = observation.PrimaryTarget ?? observation.AnimationSkipTarget ?? context.SkipTarget;
@@ -366,9 +368,10 @@ public sealed class FreePackAutomationService : IFreePackAutomationService
             await DelayAsync(context, cancellationToken).ConfigureAwait(false);
             return;
         }
-        if (!await IsStableAsync(context, observation, cancellationToken).ConfigureAwait(false)) return;
+        var reuseVerifiedTarget = context.SkipTarget is { } priorTarget && target == priorTarget;
+        if (!await IsStableAsync(context, observation, cancellationToken, reuseVerifiedTarget).ConfigureAwait(false)) return;
         if (context.SkipFrame is { } verified) EnsureSameGeometry(verified, context.LastFrame!);
-        if (observation.AnimationSkipTarget is { } skip)
+        if (observation.AnimationSkipTarget is { } skip && (!reuseVerifiedTarget || skip == target))
         {
             context.SkipTarget = skip;
             context.SkipFrame = context.LastFrame;
@@ -378,7 +381,8 @@ public sealed class FreePackAutomationService : IFreePackAutomationService
         if (isSkip)
         {
             context.SkipClicks++;
-            if (context.SkipClicks > 1) context.SkipInterval = TimeSpan.FromMilliseconds(Math.Min(context.SkipInterval.TotalMilliseconds * 2, 800));
+            logger.LogDebug("FreePackAnimationSkipRepeated RunId={RunId} Clicks={Clicks} ClientX={ClientX} ClientY={ClientY} Screen={Screen} MinimumIntervalMilliseconds={MinimumIntervalMilliseconds}",
+                context.RunId, context.SkipClicks, target.X, target.Y, observation.Screen, context.SkipInterval.TotalMilliseconds);
         }
     }
 
@@ -601,14 +605,14 @@ public sealed class FreePackAutomationService : IFreePackAutomationService
         public TimeSpan RepeatDelayElapsed;
         /// <summary>恢复之前最近成功输入后已消耗的截图时间。</summary>
         public TimeSpan PreservedRepeatFrameElapsed;
-        /// <summary>本包免费购买后经双帧验证的Skip位置，跨包即清除。</summary>
+        /// <summary>本轮经双帧验证的Skip位置，仅在成功免费购买后的动画阶段复用。</summary>
         public PixelPoint? SkipTarget;
-        /// <summary>验证本包Skip时的窗口几何，仅用于复验隐藏按钮的位置。</summary>
+        /// <summary>最近验证Skip时的窗口几何，跨包复用前仍核验原窗口、客户区和位置。</summary>
         public GameFrame? SkipFrame;
-        /// <summary>当前包成功发送Skip的次数，用于确定节流间隔。</summary>
+        /// <summary>当前包成功发送Skip的次数，用于诊断重复点击及首次进展预算。</summary>
         public int SkipClicks;
-        /// <summary>下一次Skip允许发送前的等待间隔，最高八百毫秒。</summary>
-        public TimeSpan SkipInterval = TimeSpan.FromMilliseconds(160);
+        /// <summary>每次独立Skip输入前固定等待至少一百六十毫秒，保持原六十秒无进展期限。</summary>
+        public readonly TimeSpan SkipInterval = TimeSpan.FromMilliseconds(160);
         /// <summary>当前结果页面成功发送确认的次数，最多三十次，每次均独立按下并松开。</summary>
         public int ResultAttempts;
         /// <summary>下一次结果确认前的递增间隔，最高六百毫秒，期间仍逐帧观察。</summary>
