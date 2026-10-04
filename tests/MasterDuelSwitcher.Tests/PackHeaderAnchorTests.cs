@@ -20,14 +20,14 @@ public sealed class PackHeaderAnchorTests
     {
         (string File, string Title, bool Free, int Left, int Top, int Right, int Bottom, int JointRight)[] fixtures =
         [
-            ("paid-details.png", "驱邪被恶巨神传说", false, 290, 85, 545, 115, 278),
+            ("paid-details.png", "驱邪祓恶巳神传说", false, 290, 85, 545, 115, 278),
             ("paid-details-after-opening.png", "颠覆世界恶魔之力", false, 290, 85, 544, 115, 278),
             ("free-details-single-row.png", "颠覆世界恶魔之力", true, 290, 85, 544, 115, 278),
             ("free-details-second-title.png", "于毁灭中觉醒", true, 291, 85, 480, 115, 278),
             ("free-details-top-edge.png", "黑之魔导师", true, 282, 23, 440, 53, 268),
             ("paid-details-fire-beast-after-opening.png", "猛火魔兽", false, 267, 48, 391, 78, 253)
         ];
-        yield return ["paid-details.png", "驱邪被恶巨神传说", false, .5, 290, 85, 545, 115, 278];
+        yield return ["paid-details.png", "驱邪祓恶巳神传说", false, .5, 290, 85, 545, 115, 278];
         foreach (var fixture in fixtures)
             foreach (var scale in new[] { .65, .85, 1, 1.25 })
                 yield return [fixture.File, fixture.Title, fixture.Free, scale, fixture.Left, fixture.Top,
@@ -85,7 +85,7 @@ public sealed class PackHeaderAnchorTests
         using var image = Resize(original, scale);
         var frame = ToFrame(image);
         var before = frame.Pixels.ToArray();
-        const string title = "驱邪被恶巨神传说";
+        const string title = "驱邪祓恶巳神传说";
         var reader = new RecordingTitleReader(title);
         using var subject = new OpenCvPackRecognizer(feeVerifier: new RecordingFeeVerifier(), titleReader: reader);
 
@@ -123,13 +123,13 @@ public sealed class PackHeaderAnchorTests
         using (var destination = new Mat(original, new Rect(120 + offset, 80, 158, 43))) joint.CopyTo(destination);
         using var image = Resize(original, scale);
         var frame = ToFrame(image);
-        var reader = new RecordingTitleReader("驱邪被恶巨神传说");
+        var reader = new RecordingTitleReader("驱邪祓恶巳神传说");
         using var subject = new OpenCvPackRecognizer(feeVerifier: new RecordingFeeVerifier(), titleReader: reader);
 
         var observation = subject.Recognize(frame);
 
         Assert.Equal(PackScreen.PackDetails, observation.Screen);
-        Assert.Equal("驱邪被恶巨神传说", observation.PackTitle);
+        Assert.Equal("驱邪祓恶巳神传说", observation.PackTitle);
         Assert.NotNull(observation.NextTarget);
         var region = FindCopiedTitleRegion(frame, Assert.Single(reader.Calls));
         AssertJointRight(region, 278 + offset, scale);
@@ -292,7 +292,7 @@ public sealed class PackHeaderAnchorTests
         using var image = Resize(original, scale);
         var frame = ToFrame(image);
         var before = frame.Pixels.ToArray();
-        const string title = "丨驱邪被恶巨神传说丨";
+        const string title = "丨驱邪祓恶巳神传说丨";
         var reader = new RecordingTitleReader(title);
         using var subject = new OpenCvPackRecognizer(feeVerifier: new RecordingFeeVerifier(), titleReader: reader);
 
