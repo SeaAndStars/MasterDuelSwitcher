@@ -11,6 +11,52 @@ namespace MasterDuelSwitcher.Tests;
 [Collection("WindowsGameAutomationNative")]
 public sealed class WindowsGameAutomationNativeTests
 {
+    /// <summary>验证移动独立于按钮批次，让目标位置先进入游戏的鼠标轮询帧。</summary>
+    [Fact]
+    public void MouseMovementIsSentSeparatelyBeforeButtonDown()
+    {
+        var batches = new List<uint[]>();
+        var api = new SystemWindowsGameAutomationNativeApi(() => [], Process.GetProcessById, "fixture", inputs =>
+        {
+            batches.Add(inputs.Select(input => input.Mouse.Flags).ToArray());
+            return (uint)inputs.Length;
+        }, _ => { });
+
+        Assert.Equal(3u, api.SendMouseClick(100, 200));
+        Assert.Equal([0xC001u], batches[0]);
+        Assert.Equal([2u], batches[1]);
+        Assert.Equal([4u], batches[2]);
+    }
+
+    /// <summary>模拟画面只在等待期间刷新悬停目标，验证按下发生时移动已跨过四十毫秒。</summary>
+    [Fact]
+    public void MouseMovementSettlesAcrossAFrameBeforeButtonDown()
+    {
+        TimeSpan elapsed = TimeSpan.Zero;
+        TimeSpan movedAt = TimeSpan.Zero;
+        TimeSpan downAt = TimeSpan.Zero;
+        bool moved = false;
+        bool hovered = false;
+        bool downSawHover = false;
+        var api = new SystemWindowsGameAutomationNativeApi(() => [], Process.GetProcessById, "fixture", inputs =>
+        {
+            foreach (var input in inputs)
+            {
+                if (input.Mouse.Flags == 0xC001) { moved = true; movedAt = elapsed; }
+                if (input.Mouse.Flags == 2) { downAt = elapsed; downSawHover = hovered; }
+            }
+            return (uint)inputs.Length;
+        }, duration =>
+        {
+            elapsed += duration;
+            if (moved && elapsed - movedAt >= TimeSpan.FromMilliseconds(40)) hovered = true;
+        });
+
+        Assert.Equal(3u, api.SendMouseClick(100, 200));
+        Assert.True(downSawHover, "左键按下时，上一帧尚未更新到移动后的悬停目标。");
+        Assert.True(downAt - movedAt >= TimeSpan.FromMilliseconds(40));
+    }
+
     /// <summary>验证系统仅部分接受输入时补发左键松开，并保留原错误。</summary>
     [Theory]
     [InlineData(0u)]
