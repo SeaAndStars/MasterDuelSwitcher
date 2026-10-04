@@ -183,16 +183,15 @@ public sealed class OpenCvPackRecognizer : IPackRecognizer, IDisposable
             Math.Min(score, Math.Min(free.Value.Score, one.Value.Score))) { PackTitle = packTitle };
     }
 
-    /// <summary>读取具有完整上下留白的标题区域，兼容规范化后仅保留 Unicode 字母及数字作为精确身份。</summary>
+    /// <summary>在必需标题核心与详情导航锚点完整时读取标题上下文，顶部可选留白贴边取零，仅保留Unicode字母和数字作为精确身份。</summary>
     /// <param name="color">当前原始客户区的完整 BGRA 像素。</param>
     /// <param name="anchor">已完整匹配且通过标题图像指纹边界验证的详情菜单锚点。</param>
     /// <returns>保留全部中文、字母大小写及数字的标题；没有有效文字时为空。</returns>
     private string ReadPackTitle(Mat color, Match anchor)
     {
         var region = new Rect((int)Math.Round(anchor.Bounds.X - 1052 * anchor.Scale),
-            (int)Math.Round(anchor.Bounds.Y - 307 * anchor.Scale) - (int)Math.Round(15 * anchor.Scale),
+            Math.Max(0, (int)Math.Round(anchor.Bounds.Y - 307 * anchor.Scale) - (int)Math.Round(15 * anchor.Scale)),
             (int)Math.Round(1000 * anchor.Scale), (int)Math.Round(90 * anchor.Scale));
-        if (region.Intersect(new Rect(0, 0, color.Width, color.Height)) != region) return string.Empty;
         using var area = new Mat(color, region);
         using var isolated = area.Clone();
         var pixels = new byte[region.Width * region.Height * 4];
