@@ -44,6 +44,10 @@ public sealed class OpenCvPackRecognizer : IPackRecognizer, IDisposable
     private readonly Dictionary<string, Match> localizations = [];
     /// <summary>上一有效输入帧的窗口句柄、客户区宽高和屏幕原点。</summary>
     private FrameGeometry? localizationGeometry;
+    /// <summary>上一完整标题的当前白字签名，仅用于相同字形下减少重复OCR。</summary>
+    private string cachedTitleSignature = string.Empty;
+    /// <summary>上一非空完整OCR标题；费用和购买许可不进入此单槽缓存。</summary>
+    private string cachedTitle = string.Empty;
     /// <summary>本帧已通过原始单尺度局部核验的模板数量。</summary>
     private int localizationHits;
     /// <summary>本帧恢复原多尺度扫描的模板数量，包含首次定位。</summary>
@@ -124,6 +128,8 @@ public sealed class OpenCvPackRecognizer : IPackRecognizer, IDisposable
         {
             var cleared = localizations.Count;
             localizations.Clear();
+            cachedTitleSignature = string.Empty;
+            cachedTitle = string.Empty;
             logger.LogDebug("FreePackTemplateCacheGeometryInvalidated Previous={Previous} Current={Current} Cleared={Cleared}",
                 previous, current, cleared);
         }
@@ -298,6 +304,13 @@ public sealed class OpenCvPackRecognizer : IPackRecognizer, IDisposable
         titleVisualSignature = CreateTitleVisualSignature(color, glyphRegion);
         logger.LogDebug("FreePackTitleVisualSignature RegionX={RegionX} RegionY={RegionY} RegionWidth={RegionWidth} RegionHeight={RegionHeight} Signature={Signature}",
             glyphRegion.X, glyphRegion.Y, glyphRegion.Width, glyphRegion.Height, titleVisualSignature);
+        // 先核验本帧完整类别、分隔符及字形；相同非空签名仅复用标题，后续费用仍逐帧读取。
+        if (titleVisualSignature.Length > 0 && titleVisualSignature == cachedTitleSignature)
+        {
+            logger.LogDebug("FreePackTitleCacheHit Signature={Signature} PackTitle={PackTitle}",
+                titleVisualSignature, cachedTitle);
+            return cachedTitle;
+        }
         var title = ReadTitleRegion(color, region, anchor.Scale);
         if (title.Length == 0)
         {
@@ -307,6 +320,10 @@ public sealed class OpenCvPackRecognizer : IPackRecognizer, IDisposable
                 "EmptyNormalizedTitle", region.X, region.Y, region.Width, region.Height);
             title = ReadTitleRegion(color, region, anchor.Scale);
         }
+        cachedTitleSignature = title.Length > 0 ? titleVisualSignature : string.Empty;
+        cachedTitle = title;
+        logger.LogDebug("FreePackTitleCacheRefreshed Signature={Signature} PackTitle={PackTitle}",
+            cachedTitleSignature, cachedTitle);
         return title;
     }
 
