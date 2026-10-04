@@ -951,15 +951,23 @@ public sealed class FreePackVisionTests : IDisposable
         var observation = loggedRecognizer.Recognize(frame);
         Assert.Equal(PackScreen.PackDetails, observation.Screen);
         Assert.Equal("独立卡包标题", observation.PackTitle);
-        Assert.Equal(4, provider.Events.Count);
-        var visualLog = Assert.Single(provider.Events, entry => entry.Message.StartsWith("FreePackTitleVisualSignature", StringComparison.Ordinal));
+        const string visualTemplate = "FreePackTitleVisualSignature RegionX={RegionX} RegionY={RegionY} RegionWidth={RegionWidth} RegionHeight={RegionHeight} Signature={Signature}";
+        const string headerTemplate = "FreePackHeaderMatched Category={Category} HeaderX={HeaderX} HeaderY={HeaderY} HeaderWidth={HeaderWidth} HeaderHeight={HeaderHeight} AnchorScale={AnchorScale} Confidence={Confidence} SeparatorConfidence={SeparatorConfidence}";
+        const string titleTemplate = "FreePackTitleRead RegionX={RegionX} RegionY={RegionY} RegionWidth={RegionWidth} RegionHeight={RegionHeight} AnchorScale={AnchorScale} RawText={RawText} PackTitle={PackTitle}";
+        const string screenTemplate = "卡包画面识别：{Screen}，免费 {FreeOffer}，分数 {Confidence:F4}，卡图 {Fingerprint}，标题 {PackTitle}";
+        string[] observationTemplates = [visualTemplate, headerTemplate, titleTemplate, screenTemplate];
+        // 按原有四种准确事件模板分类，缓存和计时事件的同名结构字段单独保留。
+        var observationEvents = provider.Events.Where(entry =>
+            entry.Properties.GetValueOrDefault("{OriginalFormat}") is string template && observationTemplates.Contains(template)).ToArray();
+        Assert.Equal(4, observationEvents.Length);
+        var visualLog = Assert.Single(observationEvents, entry => Equals(entry.Properties["{OriginalFormat}"], visualTemplate));
         Assert.Equal(observation.TitleVisualSignature, Assert.IsType<string>(visualLog.Properties["Signature"]));
-        var headerLog = Assert.Single(provider.Events, entry => entry.Message.StartsWith("FreePackHeaderMatched", StringComparison.Ordinal));
+        var headerLog = Assert.Single(observationEvents, entry => Equals(entry.Properties["{OriginalFormat}"], headerTemplate));
         Assert.Equal(LogLevel.Debug, headerLog.Level);
         Assert.Equal("header-secret", Assert.IsType<string>(headerLog.Properties["Category"]));
         Assert.InRange(Assert.IsType<double>(headerLog.Properties["Confidence"]), .92, 1);
         Assert.InRange(Assert.IsType<double>(headerLog.Properties["SeparatorConfidence"]), .84, 1);
-        var titleLog = Assert.Single(provider.Events, entry => entry.Message.StartsWith("FreePackTitleRead", StringComparison.Ordinal));
+        var titleLog = Assert.Single(observationEvents, entry => Equals(entry.Properties["{OriginalFormat}"], titleTemplate));
         Assert.Equal(LogLevel.Debug, titleLog.Level);
         Assert.Equal("【独立\t卡包 标题】", Assert.IsType<string>(titleLog.Properties["RawText"]));
         Assert.Equal(observation.PackTitle, Assert.IsType<string>(titleLog.Properties["PackTitle"]));
@@ -969,17 +977,18 @@ public sealed class FreePackVisionTests : IDisposable
         Assert.Equal(1000, Assert.IsType<int>(titleLog.Properties["RegionWidth"]));
         Assert.Equal(80, Assert.IsType<int>(titleLog.Properties["RegionHeight"]));
         Assert.Equal(1d, Assert.IsType<double>(titleLog.Properties["AnchorScale"]));
-        var log = Assert.Single(provider.Events, entry => entry.Properties.ContainsKey("Screen"));
+        var log = Assert.Single(observationEvents, entry => Equals(entry.Properties["{OriginalFormat}"], screenTemplate));
         Assert.Equal(LogLevel.Debug, log.Level);
         Assert.Equal(observation.Screen, Assert.IsType<PackScreen>(log.Properties["Screen"]));
         Assert.Equal(observation.Confidence, Assert.IsType<double>(log.Properties["Confidence"]));
         Assert.Equal(observation.PackTitle, Assert.IsType<string>(log.Properties["PackTitle"]));
         Assert.Contains(observation.Screen.ToString(), log.Message);
         Assert.Contains(observation.PackTitle, log.Message);
+        var eventCountBeforeDisposal = provider.Events.Count;
         loggedRecognizer.Dispose();
         loggedRecognizer.Dispose();
         Assert.Throws<ObjectDisposedException>(() => loggedRecognizer.Recognize(frame));
-        Assert.Equal(4, provider.Events.Count);
+        Assert.Equal(eventCountBeforeDisposal, provider.Events.Count);
     }
 
     /// <summary>模板已经确认免费入口或购买弹窗时，费用文字拒绝仍必须撤回购买坐标。</summary>

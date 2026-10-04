@@ -515,7 +515,7 @@ public sealed class PackHeaderAnchorTests
         /// <returns>始终启用日志。</returns>
         public bool IsEnabled(LogLevel logLevel) => true;
 
-        /// <summary>从结构化日志状态中仅提取门禁的Reason字段。</summary>
+        /// <summary>只从完整类别拒绝事件的准确模板提取Reason，排除其他缓存诊断原因。</summary>
         /// <param name="logLevel">当前日志等级。</param>
         /// <param name="eventId">当前事件标识。</param>
         /// <param name="state">真实结构化日志状态。</param>
@@ -525,7 +525,10 @@ public sealed class PackHeaderAnchorTests
             Func<TState, Exception?, string> formatter)
         {
             if (state is not IEnumerable<KeyValuePair<string, object?>> properties) return;
-            foreach (var property in properties)
+            var values = properties.ToArray();
+            if (!values.Any(property => property.Key == "{OriginalFormat}"
+                && Equals(property.Value, "FreePackHeaderRejected Reason={Reason}"))) return;
+            foreach (var property in values)
                 if (property.Key == "Reason" && property.Value is string reason) Reasons.Add(reason);
         }
     }

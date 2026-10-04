@@ -189,13 +189,23 @@ public sealed class FreePackAutomationService : IFreePackAutomationService
                     context.Phase = RunPhase.Opening;
                     continue;
                 }
-                // 免费入口已点击但弹窗尚未显示时，只等待仍属原包且明确免费的详情，不追加输入。
+                // 免费入口已点击但弹窗尚未显示时，同包费用可暂时读空；只等待独立免费弹窗，不追加输入。
                 if (context.Phase == RunPhase.AwaitFreeConfirmation && observation.Screen == PackScreen.PackDetails &&
-                    observation.FreeOffer && SameIdentity(context.CurrentPack!, observation))
+                    SameIdentity(context.CurrentPack!, observation))
                 {
-                    logger.LogDebug("FreePackPurchaseTransitionWaiting RunId={RunId} FrameSequence={FrameSequence} PackTitle={PackTitle} PreviousPrimaryTarget={PreviousPrimaryTarget} CurrentPrimaryTarget={CurrentPrimaryTarget} PreviousNextTarget={PreviousNextTarget} CurrentNextTarget={CurrentNextTarget} PreviousAnimationSkipTarget={PreviousAnimationSkipTarget} CurrentAnimationSkipTarget={CurrentAnimationSkipTarget}",
-                        context.RunId, context.FrameSequence, observation.PackTitle, context.CurrentPack!.PrimaryTarget, observation.PrimaryTarget,
+                    logger.LogDebug("FreePackPurchaseTransitionWaiting RunId={RunId} FrameSequence={FrameSequence} PackTitle={PackTitle} CurrentFreeOffer={CurrentFreeOffer} PreviousPrimaryTarget={PreviousPrimaryTarget} CurrentPrimaryTarget={CurrentPrimaryTarget} PreviousNextTarget={PreviousNextTarget} CurrentNextTarget={CurrentNextTarget} PreviousAnimationSkipTarget={PreviousAnimationSkipTarget} CurrentAnimationSkipTarget={CurrentAnimationSkipTarget}",
+                        context.RunId, context.FrameSequence, observation.PackTitle, observation.FreeOffer, context.CurrentPack!.PrimaryTarget, observation.PrimaryTarget,
                         context.CurrentPack.NextTarget, observation.NextTarget, context.CurrentPack.AnimationSkipTarget, observation.AnimationSkipTarget);
+                    await DelayAsync(context, cancellationToken).ConfigureAwait(false);
+                    continue;
+                }
+                // 免费购买已成功发送；退出动画可移动原弹窗按钮，只等待消退，不重复购买或续期。
+                if (context.Phase == RunPhase.Opening && observation.Screen == PackScreen.FreePurchaseDialog &&
+                    context.LastAction!.Screen == PackScreen.FreePurchaseDialog)
+                {
+                    logger.LogDebug("FreePackPurchasedDialogDismissing RunId={RunId} FrameSequence={FrameSequence} LastSuccessfulActionSequence={LastSuccessfulActionSequence} PreviousPrimaryTarget={PreviousPrimaryTarget} CurrentPrimaryTarget={CurrentPrimaryTarget} Confidence={Confidence}",
+                        context.RunId, context.FrameSequence, context.LastSuccessfulActionSequence,
+                        context.LastAction!.PrimaryTarget, observation.PrimaryTarget, observation.Confidence);
                     await DelayAsync(context, cancellationToken).ConfigureAwait(false);
                     continue;
                 }
@@ -267,6 +277,24 @@ public sealed class FreePackAutomationService : IFreePackAutomationService
                     await DelayAsync(context, cancellationToken).ConfigureAwait(false);
                     continue;
                 }
+                // 其他详情阶段已在上方处理；剩余入口或购买淡出须稳定不同包才拒绝，复核期间不发送输入。
+                if (observation.Screen == PackScreen.PackDetails &&
+                    (context.Phase == RunPhase.AwaitFreeConfirmation ||
+                     context.LastAction!.Screen == PackScreen.FreePurchaseDialog))
+                {
+                    logger.LogDebug("FreePackTransitionIdentityReview RunId={RunId} FrameSequence={FrameSequence} Phase={Phase} OriginalTitle={OriginalTitle} CurrentTitle={CurrentTitle} OriginalSignature={OriginalSignature} CurrentSignature={CurrentSignature}",
+                        context.RunId, context.FrameSequence, context.Phase.ToString(), context.CurrentPack!.PackTitle,
+                        observation.PackTitle, context.CurrentPack.TitleVisualSignature, observation.TitleVisualSignature);
+                    if (!await IsStableAsync(context, observation, cancellationToken).ConfigureAwait(false)) continue;
+                    // 两帧可因相同新字形被判为别名；第二帧恢复原文字时不应据第一帧拒绝原包。
+                    if (SameIdentity(context.CurrentPack, context.LastObservation!))
+                    {
+                        logger.LogDebug("FreePackTransitionIdentityRestored RunId={RunId} FrameSequence={FrameSequence} OriginalTitle={OriginalTitle} VerifiedTitle={VerifiedTitle} VerifiedSignature={VerifiedSignature}",
+                            context.RunId, context.FrameSequence, context.CurrentPack.PackTitle,
+                            context.LastObservation!.PackTitle, context.LastObservation.TitleVisualSignature);
+                        continue;
+                    }
+                }
                 return Finish(context, "当前画面与免费开包阶段不符，已停止。", true);
             }
             catch (GameWindowTemporarilyUnavailableException exception)
@@ -298,6 +326,7 @@ public sealed class FreePackAutomationService : IFreePackAutomationService
         context.WaitStartedFrameAt ??= context.LastFrame.CapturedAtUtc - context.PreservedFrameElapsed;
         context.RepeatStartedFrameAt ??= context.LastFrame.CapturedAtUtc - context.PreservedRepeatFrameElapsed;
         var observation = recognizer.Recognize(context.LastFrame);
+        context.LastObservation = observation;
         logger.LogDebug("识别界面 {Screen}，评分 {Confidence}。", observation.Screen, observation.Confidence);
         logger.LogDebug("FreePackObservation RunId={RunId} FrameSequence={FrameSequence} Phase={Phase} Screen={Screen} Confidence={Confidence} FreeOffer={FreeOffer} PrimaryTarget={PrimaryTarget} LastSuccessfulActionSequence={LastSuccessfulActionSequence} LastActionScreen={LastActionScreen} ResultAttempts={ResultAttempts} CapturedAtUtc={CapturedAtUtc}",
             context.RunId, context.FrameSequence, context.Phase.ToString(), observation.Screen, observation.Confidence, observation.FreeOffer, observation.PrimaryTarget,
@@ -599,6 +628,8 @@ public sealed class FreePackAutomationService : IFreePackAutomationService
         public int OpenedPacks;
         /// <summary>最新有效截图，异常时作为诊断依据。</summary>
         public GameFrame? LastFrame;
+        /// <summary>最后捕获帧的识别结果，用于拒绝前核验第二帧仍不同于原包。</summary>
+        public PackObservation? LastObservation;
         /// <summary>上次点击的观察签名，相同页面禁止重复动作。</summary>
         public PackObservation? LastAction;
         /// <summary>当前有限业务阶段，默认检查详情。</summary>

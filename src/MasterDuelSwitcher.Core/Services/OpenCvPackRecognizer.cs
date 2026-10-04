@@ -1,4 +1,5 @@
 using System.Buffers.Binary;
+using System.Diagnostics;
 using System.Runtime.InteropServices;
 using System.Security.Cryptography;
 using System.Text;
@@ -33,10 +34,20 @@ public sealed class OpenCvPackRecognizer : IPackRecognizer, IDisposable
     private const byte MaximumTitleWhiteColorDifference = 8;
     /// <summary>原始截图模板对应的参考窗口宽度。</summary>
     private const double ReferenceWidth = 2050;
+    /// <summary>暖定位只在首帧边界周围允许四个原始物理像素的辅助搜索。</summary>
+    private const int LocalizationMargin = 4;
     /// <summary>用于低成本状态锚点搜索的标准缩放候选。</summary>
     private static readonly double[] StandardScales = [.5, .65, .75, .85, 1, 1.25, 1.5, 1.75, 2];
     /// <summary>嵌入截图解码后保留的灰度模板。</summary>
     private readonly Dictionary<string, Template> templates;
+    /// <summary>只保存已经通过实际匹配的模板边界和尺度，免费判据每帧独立复核。</summary>
+    private readonly Dictionary<string, Match> localizations = [];
+    /// <summary>上一有效输入帧的窗口句柄、客户区宽高和屏幕原点。</summary>
+    private FrameGeometry? localizationGeometry;
+    /// <summary>本帧已通过原始单尺度局部核验的模板数量。</summary>
+    private int localizationHits;
+    /// <summary>本帧恢复原多尺度扫描的模板数量，包含首次定位。</summary>
+    private int localizationFallbacks;
     /// <summary>记录界面和最低匹配分数的诊断日志。</summary>
     private readonly ILogger<OpenCvPackRecognizer> logger;
     /// <summary>对局部费用文字和宝石图标建立独立免费证据。</summary>
@@ -82,12 +93,16 @@ public sealed class OpenCvPackRecognizer : IPackRecognizer, IDisposable
             throw new ArgumentException("帧尺寸必须为正数且像素总量应在数组范围内。", nameof(frame));
         if (frame.Pixels.Length != frame.Width * frame.Height * 4)
             throw new ArgumentException("帧必须拥有逐行紧密排列的四通道 BGRA 像素。", nameof(frame));
-        if (frame.Width < 128 || frame.Height < 100) return Unknown();
+        var started = Stopwatch.GetTimestamp();
+        localizationHits = 0;
+        localizationFallbacks = 0;
+        EnsureLocalizationGeometry(frame);
+        if (frame.Width < 128 || frame.Height < 100) return CompleteRecognition(Unknown(), started);
         using var bgra = Mat.FromPixelData(frame.Height, frame.Width, MatType.CV_8UC4, frame.Pixels);
         using var gray = new Mat();
         Cv2.CvtColor(bgra, gray, ColorConversionCodes.BGRA2GRAY);
         Cv2.MeanStdDev(gray, out _, out var deviation);
-        if (deviation.Val0 < 5) return Unknown();
+        if (deviation.Val0 < 5) return CompleteRecognition(Unknown(), started);
         var factor = Math.Min(1, 1280d / frame.Width);
         using var search = new Mat();
         Cv2.Resize(gray, search, new Size((int)Math.Round(gray.Width * factor), (int)Math.Round(gray.Height * factor)),
@@ -97,6 +112,32 @@ public sealed class OpenCvPackRecognizer : IPackRecognizer, IDisposable
             ?? RecognizeDetails(search, gray, bgra, factor) ?? Unknown();
         logger.LogDebug("卡包画面识别：{Screen}，免费 {FreeOffer}，分数 {Confidence:F4}，卡图 {Fingerprint}，标题 {PackTitle}",
             observation.Screen, observation.FreeOffer, observation.Confidence, observation.Fingerprint, observation.PackTitle);
+        return CompleteRecognition(observation, started);
+    }
+
+    /// <summary>窗口句柄、尺寸或屏幕原点变化时清除全部首帧定位，恢复完整扫描。</summary>
+    /// <param name="frame">已验证紧密BGRA布局的当前客户区帧。</param>
+    private void EnsureLocalizationGeometry(GameFrame frame)
+    {
+        var current = new FrameGeometry(frame.WindowHandle, frame.Width, frame.Height, frame.ScreenX, frame.ScreenY);
+        if (localizationGeometry is { } previous && previous != current)
+        {
+            var cleared = localizations.Count;
+            localizations.Clear();
+            logger.LogDebug("FreePackTemplateCacheGeometryInvalidated Previous={Previous} Current={Current} Cleared={Cleared}",
+                previous, current, cleared);
+        }
+        localizationGeometry = current;
+    }
+
+    /// <summary>记录本帧真实识别耗时与定位命中数量，再返回原有界面观察。</summary>
+    /// <param name="observation">当前帧独立完成的组合验证结果。</param>
+    /// <param name="started">开始处理当前帧时的单调时钟时间戳。</param>
+    /// <returns>原有界面观察，保留当前帧费用和标题判断。</returns>
+    private PackObservation CompleteRecognition(PackObservation observation, long started)
+    {
+        logger.LogDebug("FreePackRecognitionTiming Screen={Screen} CacheHits={CacheHits} CacheFallbacks={CacheFallbacks} ElapsedMilliseconds={ElapsedMilliseconds:F3}",
+            observation.Screen, localizationHits, localizationFallbacks, Stopwatch.GetElapsedTime(started).TotalMilliseconds);
         return observation;
     }
 
@@ -112,14 +153,14 @@ public sealed class OpenCvPackRecognizer : IPackRecognizer, IDisposable
         var feeRegion = new Rect((int)Math.Floor((anchor.Bounds.X - 370 * anchor.Scale) * factor),
             (int)Math.Floor((anchor.Bounds.Y + 123 * anchor.Scale) * factor),
             (int)Math.Ceiling(880 * anchor.Scale * factor), (int)Math.Ceiling(59 * anchor.Scale * factor));
-        var free = Find(image, factor, templates["dialog-free-text"], feeRegion,
+        var free = FindWithLocalization(image, factor, templates["dialog-free-text"], feeRegion,
             new[] { anchor.Scale * .98, anchor.Scale, anchor.Scale * 1.02 });
         var gemHeight = cancel is null ? 320 * anchor.Scale
             : Math.Max(1, cancel.Value.Bounds.Y - anchor.Bounds.Y - 114 * anchor.Scale);
         var gemRegion = new Rect((int)Math.Floor((anchor.Bounds.X - 370 * anchor.Scale) * factor),
             (int)Math.Floor((anchor.Bounds.Y + 100 * anchor.Scale) * factor),
             (int)Math.Ceiling(880 * anchor.Scale * factor), (int)Math.Ceiling(gemHeight * factor));
-        var gem = Find(image, factor, templates["dialog-gem"], gemRegion,
+        var gem = FindWithLocalization(image, factor, templates["dialog-gem"], gemRegion,
             new[] { anchor.Scale * .98, anchor.Scale, anchor.Scale * 1.02 });
         var feePixels = new Rect((int)Math.Floor(anchor.Bounds.X - 370 * anchor.Scale),
             (int)Math.Floor(anchor.Bounds.Y + 123 * anchor.Scale),
@@ -183,7 +224,7 @@ public sealed class OpenCvPackRecognizer : IPackRecognizer, IDisposable
         if (next is null) return null;
         var fingerprint = Fingerprint(original, label.Value);
         if (fingerprint is null) return null;
-        var packTitle = ReadPackTitle(image, original, color, factor, out var titleVisualSignature);
+        var packTitle = ReadPackTitle(original, color, out var titleVisualSignature);
         if (packTitle.Length == 0) return Unknown();
         var free = FindFreeEntry(image, factor, label.Value);
         var one = free is null ? null : FindRelative(image, factor, free.Value, "one-pack-text");
@@ -204,19 +245,18 @@ public sealed class OpenCvPackRecognizer : IPackRecognizer, IDisposable
     }
 
     /// <summary>匹配完整类别及其分隔符后读取右侧标题，保留完整Unicode字母数字作为精确身份。</summary>
-    /// <param name="image">用于多尺度类别锚点搜索的灰度缩略图。</param>
-    /// <param name="original">原始客户区灰度像素，用于保留细分隔符的独立核验。</param>
+    /// <param name="original">原始客户区灰度像素，用于完整类别定位及细分隔符的独立核验。</param>
     /// <param name="color">当前原始客户区的完整 BGRA 像素。</param>
-    /// <param name="factor">灰度缩略图相对于原始像素的比例。</param>
     /// <param name="titleVisualSignature">独立于OCR文字的完整标题二维字形精确签名；联合锚点失效时为空。</param>
     /// <returns>保留全部中文、字母大小写及数字的标题；联合锚点或完整区域失效时为空。</returns>
-    private string ReadPackTitle(Mat image, Mat original, Mat color, double factor, out string titleVisualSignature)
+    private string ReadPackTitle(Mat original, Mat color, out string titleVisualSignature)
     {
         titleVisualSignature = string.Empty;
-        var headerRegion = new Rect(0, 0, image.Width * 2 / 5, image.Height / 6);
-        var header = FindAnchor(image, factor, "header-secret", headerRegion);
+        // 类别在原始灰度像素中定位，保留感叹号右移及客户区裁切后完整字形的采样精度。
+        var headerRegion = new Rect(0, 0, original.Width * 2 / 5, original.Height / 6);
+        var header = FindAnchor(original, 1, "header-secret", headerRegion);
         if (header is null || header.Value.Score < HeaderMatchThreshold)
-            header = FindAnchor(image, factor, "header-normal", headerRegion);
+            header = FindAnchor(original, 1, "header-normal", headerRegion);
         if (header is null || header.Value.Score < HeaderMatchThreshold)
         {
             logger.LogDebug("FreePackHeaderRejected Reason={Reason}", "MissingCompleteHeader");
@@ -234,7 +274,7 @@ public sealed class OpenCvPackRecognizer : IPackRecognizer, IDisposable
         var separatorRegion = new Rect(separatorLeft, anchor.Bounds.Y,
             anchor.Bounds.Right - separatorLeft, anchor.Bounds.Height)
             .Intersect(anchor.Bounds);
-        var separator = Find(original, 1, separatorTemplate, separatorRegion,
+        var separator = FindWithLocalization(original, 1, separatorTemplate, separatorRegion,
             new[] { anchor.Scale * .98, anchor.Scale, anchor.Scale * 1.02, anchor.Scale * 1.10 });
         if (separator is null)
         {
@@ -360,7 +400,7 @@ public sealed class OpenCvPackRecognizer : IPackRecognizer, IDisposable
         var region = new Rect((int)Math.Floor((anchor.Bounds.X - 46 * anchor.Scale) * factor),
             (int)Math.Floor((anchor.Bounds.Y + 418 * anchor.Scale) * factor),
             (int)Math.Ceiling(525 * anchor.Scale * factor), (int)Math.Ceiling(240 * anchor.Scale * factor));
-        return Find(image, factor, templates["free-entry-text"], region,
+        return FindWithLocalization(image, factor, templates["free-entry-text"], region,
             new[] { anchor.Scale * .98, anchor.Scale, anchor.Scale * 1.02 });
     }
 
@@ -396,7 +436,7 @@ public sealed class OpenCvPackRecognizer : IPackRecognizer, IDisposable
     {
         var expected = image.Width / factor / ReferenceWidth;
         var scales = StandardScales.Concat(new[] { expected * .96, expected * .98, expected, expected * 1.02, expected * 1.04 });
-        return Find(image, factor, templates[name], region, scales);
+        return FindWithLocalization(image, factor, templates[name], region, scales);
     }
 
     /// <summary>从已识别锚点推导按钮或费用文字区域，只在邻近位置及相近尺度内匹配。</summary>
@@ -409,7 +449,51 @@ public sealed class OpenCvPackRecognizer : IPackRecognizer, IDisposable
         var region = new Rect((int)Math.Floor((x - margin) * factor), (int)Math.Floor((y - margin) * factor),
             (int)Math.Ceiling((template.Gray.Width * anchor.Scale + 2 * margin) * factor),
             (int)Math.Ceiling((template.Gray.Height * anchor.Scale + 2 * margin) * factor));
-        return Find(image, factor, template, region, new[] { anchor.Scale * .98, anchor.Scale, anchor.Scale * 1.02 });
+        return FindWithLocalization(image, factor, template, region, new[] { anchor.Scale * .98, anchor.Scale, anchor.Scale * 1.02 });
+    }
+
+    /// <summary>首帧定位后在原位置单尺度复验，类别仍须达到完整类别门槛，实际目标覆盖原中心时沿用坐标。</summary>
+    /// <param name="image">当前帧灰度像素，可能为缩略搜索图或原始分隔符图。</param>
+    /// <param name="factor">搜索图相对于当前原始客户区像素的比例。</param>
+    /// <param name="template">实际截图模板及参考位置。</param>
+    /// <param name="region">当前组合锚点允许的搜索范围，局部缓存仍受此范围限制。</param>
+    /// <param name="scales">局部核验失效时恢复的原有完整尺度候选。</param>
+    /// <returns>当前像素再次验证的定位；局部失效时返回完整扫描的新定位或空值。</returns>
+    private Match? FindWithLocalization(Mat image, double factor, Template template, Rect region, IEnumerable<double> scales)
+    {
+        var started = Stopwatch.GetTimestamp();
+        var reason = "NoCachedMatch";
+        if (localizations.TryGetValue(template.Name, out var cached))
+        {
+            var localRegion = new Rect((int)Math.Floor((cached.Bounds.X - LocalizationMargin) * factor),
+                (int)Math.Floor((cached.Bounds.Y - LocalizationMargin) * factor),
+                (int)Math.Ceiling((cached.Bounds.Width + LocalizationMargin * 2) * factor),
+                (int)Math.Ceiling((cached.Bounds.Height + LocalizationMargin * 2) * factor)).Intersect(region);
+            var verified = Find(image, factor, template, localRegion, new[] { cached.Scale });
+            var center = cached.Center;
+            // 完整类别的局部低分必须恢复全部尺度搜索，避免错过另一尺度已经通过的标题锚点。
+            var minimumLocalScore = template.Name is "header-secret" or "header-normal" ? HeaderMatchThreshold : MatchThreshold;
+            if (verified is { } current && current.Score >= minimumLocalScore
+                && current.Bounds.Contains(new Point(center.X, center.Y))
+                && Math.Abs(current.Bounds.X - cached.Bounds.X) <= LocalizationMargin
+                && Math.Abs(current.Bounds.Y - cached.Bounds.Y) <= LocalizationMargin)
+            {
+                localizationHits++;
+                logger.LogDebug("FreePackTemplateCacheHit Template={Template} Scale={Scale} RegionScaleCount={RegionScaleCount} Bounds={Bounds} Center={Center} Confidence={Confidence} ElapsedMilliseconds={ElapsedMilliseconds:F3}",
+                    template.Name, cached.Scale, 1, current.Bounds, center, current.Score,
+                    Stopwatch.GetElapsedTime(started).TotalMilliseconds);
+                return cached with { Score = current.Score };
+            }
+            localizations.Remove(template.Name);
+            reason = "LocalVerificationFailed";
+        }
+        var candidates = scales.ToArray();
+        var found = Find(image, factor, template, region, candidates);
+        if (found is { } positive) localizations[template.Name] = positive;
+        localizationFallbacks++;
+        logger.LogDebug("FreePackTemplateCacheFallback Template={Template} Reason={Reason} RegionScaleCount={RegionScaleCount} Bounds={Bounds} ElapsedMilliseconds={ElapsedMilliseconds:F3}",
+            template.Name, reason, candidates.Length, found?.Bounds, Stopwatch.GetElapsedTime(started).TotalMilliseconds);
+        return found;
     }
 
     /// <summary>执行真实归一化匹配，拒绝尺寸不适配、相似度不足以及遮罩变暗的候选。</summary>
@@ -479,6 +563,7 @@ public sealed class OpenCvPackRecognizer : IPackRecognizer, IDisposable
     public void Dispose()
     {
         disposed = true;
+        localizations.Clear();
         foreach (var template in templates.Values) template.Gray.Dispose();
     }
 
@@ -488,6 +573,14 @@ public sealed class OpenCvPackRecognizer : IPackRecognizer, IDisposable
     /// <param name="X">参考截图中的模板左边界。</param>
     /// <param name="Y">参考截图中的模板上边界。</param>
     private sealed record Template(string Name, Mat Gray, int X, int Y);
+
+    /// <summary>决定首帧定位是否仍适用于当前客户区的完整几何键。</summary>
+    /// <param name="WindowHandle">已捕获目标窗口句柄。</param>
+    /// <param name="Width">当前客户区原始物理像素宽度。</param>
+    /// <param name="Height">当前客户区原始物理像素高度。</param>
+    /// <param name="ScreenX">客户区左上角屏幕物理横坐标。</param>
+    /// <param name="ScreenY">客户区左上角屏幕物理纵坐标。</param>
+    private readonly record struct FrameGeometry(nint WindowHandle, int Width, int Height, int ScreenX, int ScreenY);
 
     /// <summary>某一尺度下已通过相似度和对比度验证的模板匹配。</summary>
     /// <param name="Template">所匹配的模板与参考位置。</param>

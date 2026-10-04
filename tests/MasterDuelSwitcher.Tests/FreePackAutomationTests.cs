@@ -127,6 +127,52 @@ public sealed class FreePackAutomationTests
         Assert.Single(fixture.Platform.Diagnostics);
     }
 
+    /// <summary>复现第26包：入口已点击后的同包费用短暂读空，仅等待后续独立免费弹窗并继续下一包。</summary>
+    [Fact]
+    public async Task MissingFeeDuringSamePackEntryTransitionStillCompletesAndAdvances()
+    {
+        var detail = TitledDetail("闪耀的龙", "61a9c00000000000", true) with { TitleVisualSignature = "CA9B4A60" };
+        var transition = detail with { FreeOffer = false, PrimaryTarget = null };
+        var fixture = new Fixture(detail, transition, Unknown(), Dialog(), Opening(true), Results(), transition,
+            TitledDetail("下一卡包", "other"), detail);
+        var result = await fixture.RunAsync();
+        Assert.Equal(1, result.OpenedPacks);
+        Assert.Equal(2, result.ScannedPacks);
+        Assert.Contains("一轮", result.Reason);
+        Assert.Single(fixture.Platform.Clicks, click => click.Screen == PackScreen.FreePurchaseDialog);
+        Assert.Single(fixture.Platform.Clicks, click => click.Point == detail.PrimaryTarget);
+        Assert.Contains(fixture.Logger.Records, record => Template(record).StartsWith("FreePackPurchaseTransitionWaiting", StringComparison.Ordinal)
+            && Equals(record["CurrentFreeOffer"], false));
+    }
+
+    /// <summary>同包费用永久读空不重复入口、不购买、不计完成，仍按六十秒正常等待期限结束。</summary>
+    [Fact]
+    public async Task MissingFeeAfterFreeEntryCannotAuthorizeAnotherInputOrExtendTheDeadline()
+    {
+        var detail = TitledDetail("闪耀的龙", "same", true);
+        var fixture = new Fixture(detail, detail with { FreeOffer = false, PrimaryTarget = null });
+        fixture.Platform.UseRequestedDelay = true;
+        var result = await fixture.RunAsync();
+        Assert.Contains("60", result.Reason);
+        Assert.Equal(0, result.OpenedPacks);
+        Assert.Single(fixture.Platform.Clicks);
+        Assert.InRange(fixture.Platform.Elapsed.TotalSeconds, 60, 60.2);
+    }
+
+    /// <summary>同包费用空白后出现收费或未验证弹窗，购买门禁仍停止且诊断应保留该弹窗。</summary>
+    [Fact]
+    public async Task UnverifiedDialogAfterMissingFeeStillStopsBeforePurchase()
+    {
+        var detail = TitledDetail("闪耀的龙", "same", true);
+        var paid = new PackObservation(PackScreen.UnverifiedPurchaseDialog, null, null, false, "", .99);
+        var fixture = new Fixture(detail, detail with { FreeOffer = false, PrimaryTarget = null }, paid);
+        var result = await fixture.RunAsync();
+        Assert.Equal(0, result.OpenedPacks);
+        Assert.Single(fixture.Platform.Clicks);
+        var diagnostic = Assert.Single(fixture.Platform.Diagnostics);
+        Assert.Equal(PackScreen.UnverifiedPurchaseDialog, fixture.Recognizer.Recognize(diagnostic.Frame).Screen);
+    }
+
     /// <summary>免费入口的同包详情过渡后出现付费购买框时停止，诊断确实停在付费框且不购买。</summary>
     [Fact]
     public async Task PaidDialogAfterFreeEntryTransitionStopsBeforePurchase()
@@ -141,6 +187,78 @@ public sealed class FreePackAutomationTests
         Assert.Single(fixture.Platform.Clicks);
         var diagnostic = Assert.Single(fixture.Platform.Diagnostics);
         Assert.Equal(PackScreen.UnverifiedPurchaseDialog, fixture.Recognizer.Recognize(diagnostic.Frame).Screen);
+    }
+
+    /// <summary>复现实机单帧标题与白字签名漂移，先复核页面转换，再完成原包且不追加购买或提前切换。</summary>
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task SingleMismatchedDetailDuringAuthorizedTransitionRequiresStableEvidenceBeforeStopping(bool purchased)
+    {
+        var detail = TitledDetail(purchased ? "艺术夭使" : "光之铠装", "same", true)
+            with { TitleVisualSignature = new string('A', 64) };
+        var drift = detail with { PackTitle = purchased ? "艺术天使" : "光之铠裝",
+            TitleVisualSignature = purchased ? "" : new string('B', 64) };
+        var fixture = new Fixture(detail);
+        fixture.Platform.Observations = purchased
+            ? [detail, detail, Dialog(), Dialog(), drift, Opening(true), Opening(true), Opening(true),
+                Results(), Results(), detail with { FreeOffer = false }, detail with { FreeOffer = false },
+                TitledDetail("下一卡包", "other"), TitledDetail("下一卡包", "other"), detail, detail]
+            : [detail, detail, drift, Dialog(), Dialog(), Dialog(), Opening(true), Opening(true),
+                Results(), Results(), detail with { FreeOffer = false }, detail with { FreeOffer = false },
+                TitledDetail("下一卡包", "other"), TitledDetail("下一卡包", "other"), detail, detail];
+        var result = await fixture.RunAsync();
+        Assert.Contains("一轮", result.Reason);
+        Assert.Equal(2, result.ScannedPacks);
+        Assert.Equal(1, result.OpenedPacks);
+        Assert.Single(fixture.Platform.Clicks, click => click.Screen == PackScreen.FreePurchaseDialog);
+        Assert.Single(fixture.Platform.Clicks, click => click.Point == detail.PrimaryTarget);
+        Assert.Single(fixture.Platform.Clicks, click => click.Screen == PackScreen.Opening);
+        Assert.Single(fixture.Platform.Clicks, click => click.Screen == PackScreen.Results);
+        Assert.DoesNotContain(fixture.Platform.ClickFrameIndices, frame => frame == (purchased ? 4 : 2));
+        Assert.Empty(fixture.Platform.Diagnostics);
+        Assert.Contains(fixture.Logger.Records, record => Template(record).StartsWith("FreePackTransitionIdentityReview", StringComparison.Ordinal)
+            && Equals(record["CurrentTitle"], drift.PackTitle));
+    }
+
+    /// <summary>漂移与恢复帧共用新字形签名时，复核帧精确恢复原文字仍继续，不能按两帧别名稳定误拒原包。</summary>
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task RecoveredOriginalTitleInSecondTransitionFrameMustNotBeRejectedAsAnAlias(bool purchased)
+    {
+        var original = TitledDetail("光之铠装", "same", true) with { TitleVisualSignature = new string('A', 64) };
+        var drift = original with { PackTitle = "光之铠裝", TitleVisualSignature = new string('B', 64) };
+        var recovered = original with { TitleVisualSignature = drift.TitleVisualSignature };
+        var fixture = new Fixture(original);
+        fixture.Platform.Observations = purchased
+            ? [original, original, Dialog(), Dialog(), drift, recovered, Opening(true), Opening(true),
+                Results(), Results(), original with { FreeOffer = false }, original with { FreeOffer = false },
+                TitledDetail("下一卡包", "other"), TitledDetail("下一卡包", "other"), original, original]
+            : [original, original, drift, recovered, Dialog(), Dialog(), Opening(true), Opening(true),
+                Results(), Results(), original with { FreeOffer = false }, original with { FreeOffer = false },
+                TitledDetail("下一卡包", "other"), TitledDetail("下一卡包", "other"), original, original];
+        var result = await fixture.RunAsync();
+        Assert.Contains("一轮", result.Reason);
+        Assert.Equal(1, result.OpenedPacks);
+        Assert.Equal(2, result.ScannedPacks);
+        Assert.Single(fixture.Platform.Clicks, click => click.Screen == PackScreen.FreePurchaseDialog);
+        Assert.DoesNotContain(fixture.Platform.ClickFrameIndices, frame => frame == (purchased ? 4 : 2) || frame == (purchased ? 5 : 3));
+        Assert.Empty(fixture.Platform.Diagnostics);
+    }
+
+    /// <summary>动画跳过已经发送后出现另一包详情，不适用购买淡出复核，也不确认、计数或切下一包。</summary>
+    [Fact]
+    public async Task DifferentPackAfterAnimationSkipDoesNotReuseThePurchaseTransitionReview()
+    {
+        var fixture = new Fixture(TitledDetail("原卡包", "same", true), Dialog(), Opening(true),
+            TitledDetail("另一卡包", "same", true), Results());
+        var result = await fixture.RunAsync();
+        Assert.Contains("阶段", result.Reason);
+        Assert.Equal(0, result.OpenedPacks);
+        Assert.Equal(3, fixture.Platform.Clicks.Count);
+        Assert.DoesNotContain(fixture.Platform.Clicks, click => click.Screen == PackScreen.Results);
+        Assert.DoesNotContain(fixture.Logger.Records, record => Template(record).StartsWith("FreePackTransitionIdentityReview", StringComparison.Ordinal));
     }
 
     /// <summary>免费入口的原包过渡后标题变为其他卡包时停止，同哈希也不允许继续等待或购买。</summary>
@@ -158,6 +276,64 @@ public sealed class FreePackAutomationTests
         Assert.Single(fixture.Platform.Clicks);
         var diagnostic = Assert.Single(fixture.Platform.Diagnostics);
         Assert.Equal(changed.PackTitle, fixture.Recognizer.Recognize(diagnostic.Frame).PackTitle);
+    }
+
+    /// <summary>复现实机退出动画移动购买目标：购买已成功后只等弹窗消退，并连续完成两包的跳过、确认与切换。</summary>
+    [Theory]
+    [InlineData(1207, 679)]
+    [InlineData(1206, 677)]
+    public async Task MovingPurchasedDialogStillSkipsConfirmsAndAdvancesContinuously(int x, int y)
+    {
+        var originalDialog = Dialog() with { PrimaryTarget = new PixelPoint(1218, 685) };
+        var dismissingDialog = originalDialog with { PrimaryTarget = new PixelPoint(x, y) };
+        var first = TitledDetail("颠覆世界恶魔之力", "first", true);
+        var second = TitledDetail("另一免费卡包", "second", true);
+        var fixture = new Fixture(first, originalDialog, dismissingDialog, Opening(true), Results(),
+            first with { FreeOffer = false }, second, originalDialog, dismissingDialog, Opening(true), Results(),
+            second with { FreeOffer = false }, first);
+        var result = await fixture.RunAsync();
+        Assert.Contains("一轮", result.Reason);
+        Assert.Equal(2, result.ScannedPacks);
+        Assert.Equal(2, result.OpenedPacks);
+        Assert.Equal(2, fixture.Platform.Clicks.Count(click => click.Screen == PackScreen.FreePurchaseDialog));
+        Assert.All(fixture.Platform.Clicks.Where(click => click.Screen == PackScreen.FreePurchaseDialog),
+            click => Assert.Equal(originalDialog.PrimaryTarget, click.Point));
+        Assert.Equal(2, fixture.Platform.Clicks.Count(click => click.Screen == PackScreen.Opening));
+        Assert.Equal(2, fixture.Platform.Clicks.Count(click => click.Screen == PackScreen.Results));
+        Assert.DoesNotContain(fixture.Platform.Clicks, click => click.Point == dismissingDialog.PrimaryTarget);
+        Assert.Contains(fixture.Logger.Records, record => Template(record).StartsWith("FreePackPurchasedDialogDismissing", StringComparison.Ordinal)
+            && Equals(record["CurrentPrimaryTarget"], dismissingDialog.PrimaryTarget));
+        Assert.Empty(fixture.Platform.Diagnostics);
+    }
+
+    /// <summary>购买成功后的移动弹窗永久保留时，不重新购买或计数，沿用六十秒无进展期限。</summary>
+    [Fact]
+    public async Task MovingPurchasedDialogRetainsSixtySecondDeadlineWithoutAnotherPurchase()
+    {
+        var fixture = new Fixture(Detail("a", true), Dialog(), Dialog() with { PrimaryTarget = new PixelPoint(39, 54) });
+        fixture.Platform.UseRequestedDelay = true;
+        var result = await fixture.RunAsync();
+        Assert.Contains("60", result.Reason);
+        Assert.Equal(0, result.OpenedPacks);
+        Assert.Equal(2, fixture.Platform.Clicks.Count);
+        Assert.Single(fixture.Platform.Clicks, click => click.Screen == PackScreen.FreePurchaseDialog);
+        Assert.InRange(fixture.Platform.Elapsed.TotalSeconds, 60, 60.2);
+    }
+
+    /// <summary>退出动画期间弹窗失去免费证据或出现宝石费用，保留购买门禁且不追加输入。</summary>
+    [Theory]
+    [InlineData(PackScreen.FreePurchaseDialog)]
+    [InlineData(PackScreen.UnverifiedPurchaseDialog)]
+    public async Task FeeEvidenceLostDuringPurchasedDialogDismissalStopsBeforeAnyAdditionalInput(PackScreen screen)
+    {
+        var rejected = Dialog() with { Screen = screen, FreeOffer = false, PrimaryTarget = new PixelPoint(39, 54) };
+        var fixture = new Fixture(Detail("a", true), Dialog(), rejected, Opening(true));
+        var result = await fixture.RunAsync();
+        Assert.Contains("购买确认未验证免费条件", result.Reason);
+        Assert.Equal(0, result.OpenedPacks);
+        Assert.Equal(2, fixture.Platform.Clicks.Count);
+        Assert.Single(fixture.Platform.Clicks, click => click.Screen == PackScreen.FreePurchaseDialog);
+        Assert.Equal(screen, fixture.Recognizer.Recognize(Assert.Single(fixture.Platform.Diagnostics).Frame).Screen);
     }
 
     /// <summary>购买弹窗消退后短暂显示同包详情时，只等待开包页面，不重复购买或切换下一包。</summary>
@@ -1207,13 +1383,13 @@ public sealed class FreePackAutomationTests
         Assert.Single(fixture.Platform.Clicks, click => click.Screen == PackScreen.Results);
     }
 
-    /// <summary>免费入口后在购买确认前出现变化的原包详情不会被当作已购买的过渡页继续处理。</summary>
+    /// <summary>免费入口后原包费用变化只等待购买确认，不把费用消失当作已购买或允许额外输入。</summary>
     [Fact]
     public async Task ChangedSamePackDetailsBeforePurchaseCannotPretendToBeThePurchasedTransition()
     {
         var fixture = new Fixture(Detail("a", true), Detail("a"));
         var result = await fixture.RunAsync();
-        Assert.Contains("阶段", result.Reason);
+        Assert.Contains("60", result.Reason);
         Assert.Equal(0, result.OpenedPacks);
         Assert.Single(fixture.Platform.Clicks);
         Assert.Single(fixture.Platform.Diagnostics);
