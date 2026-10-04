@@ -111,3 +111,5 @@
 18:52连续开包实际根因是第三包非空OCR星生/星尘分歧；修补已提交4961e19，完整二维白字签名与跨包隐藏Skip，具体证据和未验收边界见docs/continuous-pack-live-verification.md。
 19:27 RunId09ae0f155b7b443ab32306563ea31b47 实机失败：免费美丽的漆黑蔷薇Results仅一帧后原详情，Opening未转返回；同精确OCR标题SHA随背景从9BB6A1变10CDEA。修补以完整OCR精确主、SHA别名补充，并保留结果证据冻结旧Skip，原详情稳定非免费补交返回、下一包前提交AwaitReturn。
 26包停止RunId e30a809d1e0a43a8839504e13cdd8493，26 scanned/24 opened：入口Action178完成，同Title闪耀的龙/SHA一致，Frame550费用免费false、收费false，AwaitFreeConfirmation过渡守卫因FreeOffer要求true而提前停止。
+
+2026-10-05 新截图为律世葬剑收费详情：原窗口1922×1112，原像素客户区1920×1080，右下100／1000宝石。10月5日日志为空；最新旧运行0fc3c1d67b754a6c9dd61d8d94e506e2在18扫描／6开后由用户停止，之前下一包后14帧Unknown，未记录下一包标题。该旧证据不证明新截图根因。当前只读Computer Use游戏句柄5441338返回不存在，未发送输入。
