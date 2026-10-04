@@ -324,6 +324,31 @@ public sealed class PackHeaderAnchorTests
         Assert.Equal(0, fee.Calls);
     }
 
+    /// <summary>真实大蛇咒缚详情须经原生中文OCR建立完整标题与免费入口，不得因空检测停在未知画面。</summary>
+    /// <param name="scale">现场客户区截图的四档缩放比例。</param>
+    [Theory]
+    [InlineData(.65)]
+    [InlineData(.85)]
+    [InlineData(1)]
+    [InlineData(1.25)]
+    public void NativeOcrReadsTheRealSerpentTitleAndFreeEntry(double scale)
+    {
+        using var original = LoadFrame("free-details-serpent-live.png");
+        using var image = Resize(original, scale);
+        var frame = ToFrame(image);
+        var before = frame.Pixels.ToArray();
+        using var subject = new OpenCvPackRecognizer();
+
+        var observation = subject.Recognize(frame);
+
+        Assert.Equal(PackScreen.PackDetails, observation.Screen);
+        Assert.Equal("大蛇咒缚", observation.PackTitle);
+        Assert.True(observation.FreeOffer);
+        Assert.NotNull(observation.PrimaryTarget);
+        Assert.NotNull(observation.NextTarget);
+        Assert.Equal(before, frame.Pixels);
+    }
+
     /// <summary>普通类别原暗图仍是付费购买弹窗，加入类别模板不得将其降级为可点击详情。</summary>
     [Fact]
     public void RealDimmedNormalPurchaseDialogKeepsItsPurchaseGate()
