@@ -24,7 +24,7 @@ public sealed class FreePackAutomationIntegrationTests
 
         AssertCompletedRound(result, platform);
         var confirmations = platform.Clicks.Where(item => item.Name == "results").ToArray();
-        Assert.InRange(confirmations.Length, 2, 10);
+        Assert.InRange(confirmations.Length, 2, 30);
         Assert.All(confirmations, item =>
         {
             Assert.InRange(item.Point.X, (int)Math.Floor(1518 * scale), (int)Math.Ceiling(1920 * scale) - 1);

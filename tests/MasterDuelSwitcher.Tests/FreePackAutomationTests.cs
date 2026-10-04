@@ -54,7 +54,7 @@ public sealed class FreePackAutomationTests
         Assert.Equal(0, result.OpenedPacks);
     }
 
-    /// <summary>结果页持续不变时日志解释退避和十次上限，且诊断不会增加点击。</summary>
+    /// <summary>结果页持续不变时日志解释退避和三十次上限，且诊断不会增加点击。</summary>
     [Fact]
     public async Task ResultRetryDiagnosticsExplainBackoffAndAttemptLimit()
     {
@@ -62,11 +62,11 @@ public sealed class FreePackAutomationTests
         fixture.Platform.UseRequestedDelay = true;
         var result = await fixture.RunAsync();
         Assert.Contains("60 秒", result.Reason);
-        Assert.Equal(10, fixture.Platform.Clicks.Count(click => click.Screen == PackScreen.Results));
+        Assert.Equal(30, fixture.Platform.Clicks.Count(click => click.Screen == PackScreen.Results));
         var gates = fixture.Logger.Records.Where(record => Template(record).StartsWith("FreePackResultRetryBlocked", StringComparison.Ordinal)).ToArray();
         Assert.Contains(gates, record => Equals(record["Reason"], "Backoff") && Equals(record["RequiredIntervalMilliseconds"], 200.0));
-        Assert.Contains(gates, record => Equals(record["Reason"], "AttemptLimit") && Equals(record["Attempts"], 10));
-        Assert.Equal(10, fixture.Logger.Records.Count(record => Template(record).StartsWith("FreePackResultConfirmationRequested", StringComparison.Ordinal)));
+        Assert.Contains(gates, record => Equals(record["Reason"], "AttemptLimit") && Equals(record["Attempts"], 30));
+        Assert.Equal(30, fixture.Logger.Records.Count(record => Template(record).StartsWith("FreePackResultConfirmationRequested", StringComparison.Ordinal)));
         Assert.Equal(0, result.OpenedPacks);
     }
 
@@ -849,24 +849,44 @@ public sealed class FreePackAutomationTests
         var result = await fixture.RunAsync();
         var resultTimes = fixture.Platform.ClickTimes.Where((_, index) => fixture.Platform.Clicks[index].Screen == PackScreen.Results).ToArray();
         Assert.Equal(7, resultTimes.Length);
-        var minimums = new[] { .2, .4, .8, 1.6, 3.2, 5 };
+        var minimums = new[] { .2, .4, .6, .6, .6, .6 };
         for (var index = 0; index < minimums.Length; index++)
-            Assert.InRange((resultTimes[index + 1] - resultTimes[index]).TotalSeconds, minimums[index], minimums[index] + .24);
+            Assert.InRange((resultTimes[index + 1] - resultTimes[index]).TotalSeconds, minimums[index], minimums[index] + .16);
         Assert.Equal(1, result.OpenedPacks);
         Assert.Single(fixture.Platform.Clicks, click => click.Screen == PackScreen.FreePurchaseDialog);
     }
 
-    /// <summary>一直停留结果页最多确认十次，重试不延长六十秒总期限且不提前累计开包。</summary>
+    /// <summary>一直停留结果页最多确认三十次，重试不延长六十秒总期限且不提前累计开包。</summary>
     [Fact]
     public async Task ResultRetriesAreBoundedAndNeverResetTheTotalDeadline()
     {
         var fixture = new Fixture(Detail("a", true), Dialog(), Results());
         fixture.Platform.UseRequestedDelay = true;
         var result = await fixture.RunAsync();
-        Assert.Equal(10, fixture.Platform.Clicks.Count(click => click.Screen == PackScreen.Results));
+        Assert.Equal(30, fixture.Platform.Clicks.Count(click => click.Screen == PackScreen.Results));
         Assert.Equal(0, result.OpenedPacks);
         Assert.Contains("60", result.Reason);
         Assert.InRange(fixture.Platform.Elapsed.TotalSeconds, 60, 61);
+    }
+
+    /// <summary>结果按钮第十一次才生效时继续逐次验证，返回原包只累计一次开包。</summary>
+    [Fact]
+    public async Task ResultConfirmationCanReturnAfterMoreThanTenValidatedAttempts()
+    {
+        const int confirmationsRequired = 11;
+        var fixture = new Fixture(Detail("a", true), Dialog(), Results());
+        fixture.Platform.UseRequestedDelay = true;
+        fixture.Platform.Tail = _ => fixture.Platform.Clicks.Count(click => click.Screen == PackScreen.Results) < confirmationsRequired
+            ? Results() : Detail(fixture.Platform.Clicks.Count(click => click.Screen == PackScreen.PackDetails) == 2 ? "b" : "a");
+        var result = await fixture.RunAsync();
+        Assert.Equal(confirmationsRequired, fixture.Platform.Clicks.Count(click => click.Screen == PackScreen.Results));
+        Assert.Equal(1, result.OpenedPacks);
+        Assert.Contains("一轮", result.Reason);
+        Assert.False(result.IsCancelled);
+        Assert.Single(fixture.Platform.Clicks, click => click.Screen == PackScreen.FreePurchaseDialog);
+        var frames = fixture.Platform.ClickFrameIndices.Where((_, index) => fixture.Platform.Clicks[index].Screen == PackScreen.Results).ToArray();
+        for (int index = 1; index < frames.Length; index++)
+            Assert.True(frames[index] >= frames[index - 1] + 2);
     }
 
     /// <summary>不稳定结果按钮导致本次重试放弃，不复用前次已验证坐标。</summary>
