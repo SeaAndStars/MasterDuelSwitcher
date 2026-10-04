@@ -33,8 +33,8 @@ public sealed class WindowsGameAutomationPlatform : IGameAutomationPlatform
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(stateDirectory);
         diagnosticDirectory = Path.Combine(Path.GetFullPath(stateDirectory), "free-pack-diagnostics");
-        native = nativeApi ?? new SystemWindowsGameAutomationNativeApi();
         this.logger = logger ?? NullLogger<WindowsGameAutomationPlatform>.Instance;
+        native = nativeApi ?? new SystemWindowsGameAutomationNativeApi(this.logger);
     }
 
     /// <summary>激活目标游戏窗口。</summary>
@@ -147,8 +147,10 @@ public sealed class WindowsGameAutomationPlatform : IGameAutomationPlatform
         AutomationNativeRectangle desktop = native.GetVirtualDesktop();
         long width = (long)desktop.Right - desktop.Left;
         long height = (long)desktop.Bottom - desktop.Top;
-        long x = (long)frame.ScreenX + point.X - desktop.Left;
-        long y = (long)frame.ScreenY + point.Y - desktop.Top;
+        long physicalX = (long)frame.ScreenX + point.X;
+        long physicalY = (long)frame.ScreenY + point.Y;
+        long x = physicalX - desktop.Left;
+        long y = physicalY - desktop.Top;
         if (width <= 1 || height <= 1 || x < 0 || x >= width || y < 0 || y >= height)
             throw new InvalidOperationException("点击目标超出当前虚拟桌面。");
         int normalizedX = (int)Math.Round(x * 65535.0 / (width - 1));
@@ -156,9 +158,15 @@ public sealed class WindowsGameAutomationPlatform : IGameAutomationPlatform
         EnsureSameGeometry(current, ReadClientFrame());
         if (native.IsF8Pressed)
             throw new OperationCanceledException("F8 已请求停止免费开包。");
-        if (native.SendMouseClick(normalizedX, normalizedY) != 3)
+        var physicalTarget = new AutomationNativePoint(checked((int)physicalX), checked((int)physicalY));
+        if (native.SendMouseClick(normalizedX, normalizedY, physicalTarget, () =>
+        {
+            EnsureSameGeometry(current, ReadClientFrame());
+            if (native.IsF8Pressed)
+                throw new OperationCanceledException("F8 已请求停止免费开包。");
+        }) != 3)
             throw new Win32Exception(Marshal.GetLastWin32Error(), "鼠标输入批次未完整发送。");
-        logger.LogDebug("FreePackMouseClick ClientX={X} ClientY={Y}", point.X, point.Y);
+        logger.LogDebug("FreePackMouseClick ClientX={X} ClientY={Y} ScreenX={ScreenX} ScreenY={ScreenY}", point.X, point.Y, physicalTarget.X, physicalTarget.Y);
     }
 
     /// <summary>读取 F8 紧急停止状态。</summary>
@@ -277,8 +285,8 @@ public interface IWindowsGameAutomationNativeApi
     void ReleaseClientDc(nint window, nint dc);
     /// <summary>读取全部显示器组成的虚拟桌面。</summary>
     AutomationNativeRectangle GetVirtualDesktop();
-    /// <summary>发送绝对移动和左键按下，跨帧等待后保证松开；完整成功返回三次输入。</summary>
-    uint SendMouseClick(int normalizedX, int normalizedY);
+    /// <summary>先定位并核验物理目标，按下前复验窗口，再跨帧按住并保证松开；完整成功返回三次输入。</summary>
+    uint SendMouseClick(int normalizedX, int normalizedY, AutomationNativePoint? physicalTarget = null, Action? beforeButtonDown = null);
     /// <summary>读取 F8 是否处于按下状态。</summary>
     bool IsF8Pressed { get; }
     /// <summary>开始接收运行期间的 F8 热键事件。</summary>
@@ -330,22 +338,45 @@ public sealed class SystemWindowsGameAutomationNativeApi : IWindowsGameAutomatio
     private readonly Func<NativeInput[], uint> sendInputs;
     /// <summary>跨过游戏鼠标轮询帧的可注入等待；生产使用线程等待。</summary>
     private readonly Action<TimeSpan> holdMouse;
+    /// <summary>移动系统鼠标到物理屏幕坐标的可注入入口。</summary>
+    private readonly Func<int, int, bool> setCursor;
+    /// <summary>读取实际鼠标屏幕坐标的可注入入口。</summary>
+    private readonly CursorPositionReader readCursor;
+    /// <summary>等待鼠标移动进入游戏画面的可注入入口。</summary>
+    private readonly Action<TimeSpan> settleMouse;
+    /// <summary>读取停止锁存的可注入入口。</summary>
+    private readonly Func<bool> stopRequested;
+    /// <summary>兼容两参数调用时取得物理虚拟桌面的入口。</summary>
+    private readonly Func<AutomationNativeRectangle> getDesktop;
+    /// <summary>读取实际发送线程 DPI 上下文的可注入入口。</summary>
+    private readonly Func<nint> getDpiContext;
+    /// <summary>记录鼠标实际到达和原生输入故障。</summary>
+    private readonly ILogger logger;
     /// <summary>仅在自动化运行期间存在的 F8 消息监听器。</summary>
     private F8EmergencyStopListener? stopListener;
 
     /// <summary>创建只匹配 Master Duel 的真实系统边界。</summary>
-    public SystemWindowsGameAutomationNativeApi()
-        : this(() => Process.GetProcessesByName("masterduel"), Process.GetProcessById, "masterduel") { }
+    public SystemWindowsGameAutomationNativeApi(ILogger? logger = null)
+        : this(() => Process.GetProcessesByName("masterduel"), Process.GetProcessById, "masterduel", logger: logger) { }
 
     /// <summary>为隔离 Win32 窗口测试注入进程边界，不对真实游戏发送输入。</summary>
     internal SystemWindowsGameAutomationNativeApi(Func<Process[]> findProcesses, Func<int, Process> findProcess, string gameProcessName,
-        Func<NativeInput[], uint>? sendInputs = null, Action<TimeSpan>? holdMouse = null)
+        Func<NativeInput[], uint>? sendInputs = null, Action<TimeSpan>? holdMouse = null,
+        Func<int, int, bool>? setCursor = null, CursorPositionReader? readCursor = null, Action<TimeSpan>? settleMouse = null,
+        Func<bool>? stopRequested = null, Func<AutomationNativeRectangle>? getDesktop = null, Func<nint>? getDpiContext = null, ILogger? logger = null)
     {
         this.findProcesses = findProcesses;
         this.findProcess = findProcess;
         this.gameProcessName = gameProcessName;
         this.sendInputs = sendInputs ?? SendSystemInputs;
         this.holdMouse = holdMouse ?? Thread.Sleep;
+        this.setCursor = setCursor ?? NativeMethods.SetCursorPos;
+        this.readCursor = readCursor ?? NativeMethods.GetCursorPos;
+        this.settleMouse = settleMouse ?? Thread.Sleep;
+        this.stopRequested = stopRequested ?? (() => IsF8Pressed);
+        this.getDesktop = getDesktop ?? GetVirtualDesktop;
+        this.getDpiContext = getDpiContext ?? NativeMethods.GetThreadDpiAwarenessContext;
+        this.logger = logger ?? NullLogger.Instance;
     }
 
     /// <summary>寻找目标进程的第一个主窗口，并释放全部进程查询句柄。</summary>
@@ -438,26 +469,49 @@ public sealed class SystemWindowsGameAutomationNativeApi : IWindowsGameAutomatio
         return new(left, top, left + NativeMethods.GetSystemMetrics(78), top + NativeMethods.GetSystemMetrics(79));
     }
 
-    /// <summary>发送虚拟桌面移动和按下，等待八十毫秒后松开，所有失败路径均尝试释放左键。</summary>
-    public uint SendMouseClick(int normalizedX, int normalizedY)
+    /// <summary>先定位并单独移动，等待四十毫秒确认实际坐标后按住八十毫秒，按下失败路径均尝试松开。</summary>
+    public uint SendMouseClick(int normalizedX, int normalizedY, AutomationNativePoint? physicalTarget = null, Action? beforeButtonDown = null)
     {
+        AutomationNativePoint target = physicalTarget ?? ResolvePhysicalTarget(normalizedX, normalizedY);
         bool released = false;
+        bool buttonMayBeDown = false;
         try
         {
-            uint down = sendInputs(
-            [
-                new() { Mouse = new() { X = normalizedX, Y = normalizedY, Flags = 0xC001 } },
-                new() { Mouse = new() { Flags = 0x0002 } }
-            ]);
-            if (down != 2) return down;
+            ThrowIfStopRequested();
+            logger.LogDebug("FreePackMousePositionRequested ExpectedScreenX={ExpectedX} ExpectedScreenY={ExpectedY} NormalizedX={NormalizedX} NormalizedY={NormalizedY} ThreadDpiContext={ThreadDpiContext}",
+                target.X, target.Y, normalizedX, normalizedY, getDpiContext());
+            SetExpectedCursor(target);
+            uint moved = sendInputs([new() { Mouse = new() { X = normalizedX, Y = normalizedY, Flags = 0xC001 } }]);
+            if (moved != 1) return 0;
+            SetExpectedCursor(target);
+            settleMouse(TimeSpan.FromMilliseconds(40));
+            ThrowIfStopRequested();
+            if (!readCursor(out AutomationNativePoint actual))
+            {
+                int error = Marshal.GetLastWin32Error();
+                logger.LogWarning("FreePackMousePositionReadFailed ExpectedScreenX={ExpectedX} ExpectedScreenY={ExpectedY} Win32Error={Win32Error}", target.X, target.Y, error);
+                throw new Win32Exception(error, "读取鼠标实际位置失败。");
+            }
+            logger.LogDebug("FreePackMousePositionObserved ExpectedScreenX={ExpectedX} ExpectedScreenY={ExpectedY} ActualScreenX={ActualX} ActualScreenY={ActualY}", target.X, target.Y, actual.X, actual.Y);
+            if (actual.X != target.X || actual.Y != target.Y)
+            {
+                logger.LogWarning("FreePackMousePositionRejected ExpectedScreenX={ExpectedX} ExpectedScreenY={ExpectedY} ActualScreenX={ActualX} ActualScreenY={ActualY}", target.X, target.Y, actual.X, actual.Y);
+                throw new InvalidOperationException($"鼠标未到达目标：期望 ({target.X},{target.Y})，实际 ({actual.X},{actual.Y})。");
+            }
+            beforeButtonDown?.Invoke();
+            ThrowIfStopRequested();
+            buttonMayBeDown = true;
+            uint down = sendInputs([new() { Mouse = new() { Flags = 0x0002 } }]);
+            if (down != 1) return moved;
             holdMouse(TimeSpan.FromMilliseconds(80));
+            ThrowIfStopRequested();
             uint up = sendInputs([new() { Mouse = new() { Flags = 0x0004 } }]);
             released = up == 1;
-            return down + up;
+            return released ? moved + down + up : moved + down;
         }
         finally
         {
-            if (!released)
+            if (buttonMayBeDown && !released)
             {
                 int originalError = Marshal.GetLastWin32Error();
                 try { sendInputs([new() { Mouse = new() { Flags = 0x0004 } }]); }
@@ -466,6 +520,35 @@ public sealed class SystemWindowsGameAutomationNativeApi : IWindowsGameAutomatio
             }
         }
     }
+
+    /// <summary>显式定位到原始物理像素，保留真实系统失败代码。</summary>
+    private void SetExpectedCursor(AutomationNativePoint target)
+    {
+        if (setCursor(target.X, target.Y)) return;
+        int error = Marshal.GetLastWin32Error();
+        logger.LogWarning("FreePackMousePositionFailed ExpectedScreenX={ExpectedX} ExpectedScreenY={ExpectedY} Win32Error={Win32Error}", target.X, target.Y, error);
+        throw new Win32Exception(error, "定位鼠标失败。");
+    }
+
+    /// <summary>为兼容的两参数调用把虚拟桌面归一化坐标还原为物理像素。</summary>
+    private AutomationNativePoint ResolvePhysicalTarget(int normalizedX, int normalizedY)
+    {
+        AutomationNativeRectangle desktop = getDesktop();
+        long width = (long)desktop.Right - desktop.Left;
+        long height = (long)desktop.Bottom - desktop.Top;
+        if (width <= 1 || height <= 1 || normalizedX < 0 || normalizedX > 65535 || normalizedY < 0 || normalizedY > 65535)
+            throw new InvalidOperationException("鼠标目标超出有效虚拟桌面坐标。");
+        return new(desktop.Left + (int)Math.Round(normalizedX * (width - 1) / 65535.0), desktop.Top + (int)Math.Round(normalizedY * (height - 1) / 65535.0));
+    }
+
+    /// <summary>在移动、就绪等待和按住期间响应本轮 F8 停止锁存。</summary>
+    private void ThrowIfStopRequested()
+    {
+        if (stopRequested()) throw new OperationCanceledException("F8 已请求停止免费开包。");
+    }
+
+    /// <summary>与 GetCursorPos 兼容且可替换的坐标读取边界。</summary>
+    internal delegate bool CursorPositionReader(out AutomationNativePoint point);
 
     /// <summary>运行时读取事件锁存，空闲时只检查 F8 当前按住状态。</summary>
     public bool IsF8Pressed => stopListener?.IsStopRequested ?? IsEmergencyStopState(NativeMethods.GetAsyncKeyState(0x77));
@@ -627,6 +710,17 @@ public sealed class SystemWindowsGameAutomationNativeApi : IWindowsGameAutomatio
         /// <summary>发送普通鼠标输入。</summary>
         [DllImport("user32.dll", SetLastError = true)]
         internal static extern uint SendInput(uint count, NativeInput[] inputs, int inputSize);
+        /// <summary>以屏幕坐标定位系统鼠标，保留系统裁剪约束。</summary>
+        [DllImport("user32.dll", SetLastError = true)]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        internal static extern bool SetCursorPos(int x, int y);
+        /// <summary>读取实际系统鼠标屏幕坐标。</summary>
+        [DllImport("user32.dll", SetLastError = true)]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        internal static extern bool GetCursorPos(out AutomationNativePoint point);
+        /// <summary>读取当前原生输入发送线程的 DPI 上下文。</summary>
+        [DllImport("user32.dll")]
+        internal static extern nint GetThreadDpiAwarenessContext();
         /// <summary>读取紧急停止键状态。</summary>
         [DllImport("user32.dll")]
         internal static extern short GetAsyncKeyState(int virtualKey);

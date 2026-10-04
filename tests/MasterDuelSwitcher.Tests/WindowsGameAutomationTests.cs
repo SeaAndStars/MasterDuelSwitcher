@@ -301,6 +301,7 @@ public sealed class WindowsGameAutomationTests : IDisposable
         platform.Click(frame, new PixelPoint(100, 50));
         Assert.Equal(3u, native.InputCount);
         Assert.Equal((31137, 8196), native.LastInput);
+        Assert.Equal(new AutomationNativePoint(-200, 250), native.LastPhysicalTarget);
         native.F8Pressed = true;
         Assert.True(platform.IsStopRequested);
         native.F8Pressed = false;
@@ -469,6 +470,35 @@ public sealed class WindowsGameAutomationTests : IDisposable
         Assert.Throws<ArgumentNullException>(() => platform.Click(null!, new(10, 10)));
     }
 
+    /// <summary>验证移动等待期间的失焦、窗口身份、几何或停止变化均在按下前拒绝。</summary>
+    [Theory]
+    [InlineData("foreground")]
+    [InlineData("process")]
+    [InlineData("origin")]
+    [InlineData("size")]
+    [InlineData("game-window")]
+    [InlineData("f8")]
+    public void ClickRevalidatesTheLockedWindowImmediatelyBeforeButtonDown(string change)
+    {
+        var native = new FixtureNativeApi();
+        var platform = new WindowsGameAutomationPlatform(directory, native);
+        platform.ActivateGame();
+        GameFrame frame = platform.Capture();
+        native.BeforeMouseDown = () =>
+        {
+            if (change == "foreground") native.Foreground = 99;
+            if (change == "process") native.ProcessId++;
+            if (change == "origin") native.Origin = new(native.Origin.X + 1, native.Origin.Y);
+            if (change == "size") native.Client = new(0, 0, native.Client.Right + 1, native.Client.Bottom);
+            if (change == "game-window") native.GameWindow = false;
+            if (change == "f8") native.F8Pressed = true;
+        };
+        Exception? failure = Record.Exception(() => platform.Click(frame, new(100, 50)));
+        if (change == "f8") Assert.IsType<OperationCanceledException>(failure);
+        else Assert.IsAssignableFrom<InvalidOperationException>(failure);
+        Assert.Equal(0u, native.InputCount);
+    }
+
     /// <summary>验证每轮结束释放紧急停止，并在释放失败时仍清除窗口锁定。</summary>
     [Theory]
     [InlineData(false)]
@@ -592,6 +622,10 @@ public sealed class WindowsGameAutomationTests : IDisposable
         public uint SendCount { get; set; } = 3;
         /// <summary>最后输入坐标。</summary>
         public (int X, int Y) LastInput { get; private set; }
+        /// <summary>发送前等待期间注入失焦、几何变化或停止。</summary>
+        public Action? BeforeMouseDown { get; set; }
+        /// <summary>平台传入的精确物理屏幕目标。</summary>
+        public AutomationNativePoint? LastPhysicalTarget { get; private set; }
         /// <summary>最后截图在源设备上下文中的起点。</summary>
         public (int X, int Y) LastCopySource { get; private set; }
         /// <summary>最后截图复制的客户区尺寸。</summary>
@@ -662,7 +696,15 @@ public sealed class WindowsGameAutomationTests : IDisposable
         /// <summary>返回虚拟桌面范围。</summary>
         public AutomationNativeRectangle GetVirtualDesktop() => Desktop;
         /// <summary>发送完整鼠标批次。</summary>
-        public uint SendMouseClick(int normalizedX, int normalizedY) { InputCount = 3; LastInput = (normalizedX, normalizedY); return SendCount; }
+        public uint SendMouseClick(int normalizedX, int normalizedY, AutomationNativePoint? physicalTarget = null, Action? beforeButtonDown = null)
+        {
+            BeforeMouseDown?.Invoke();
+            beforeButtonDown?.Invoke();
+            LastPhysicalTarget = physicalTarget;
+            InputCount = 3;
+            LastInput = (normalizedX, normalizedY);
+            return SendCount;
+        }
         /// <summary>返回 F8 紧急停止状态。</summary>
         public bool IsF8Pressed => f8TapLatched || F8Pressed || F8OnSecondRead && ++f8ReadCount == 2;
         /// <summary>记录紧急停止监听开始。</summary>

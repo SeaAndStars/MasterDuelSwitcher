@@ -1,5 +1,6 @@
 using MasterDuelSwitcher.Core.Models;
 using MasterDuelSwitcher.Core.Services;
+using Microsoft.Extensions.Logging;
 using System.ComponentModel;
 using System.Diagnostics;
 using System.Runtime.InteropServices;
@@ -16,7 +17,7 @@ public sealed class WindowsGameAutomationNativeTests
     public void MouseMovementIsSentSeparatelyBeforeButtonDown()
     {
         var batches = new List<uint[]>();
-        var api = new SystemWindowsGameAutomationNativeApi(() => [], Process.GetProcessById, "fixture", inputs =>
+        var api = CreateMouseApi(inputs =>
         {
             batches.Add(inputs.Select(input => input.Mouse.Flags).ToArray());
             return (uint)inputs.Length;
@@ -38,7 +39,7 @@ public sealed class WindowsGameAutomationNativeTests
         bool moved = false;
         bool hovered = false;
         bool downSawHover = false;
-        var api = new SystemWindowsGameAutomationNativeApi(() => [], Process.GetProcessById, "fixture", inputs =>
+        var api = CreateMouseApi(inputs =>
         {
             foreach (var input in inputs)
             {
@@ -46,7 +47,7 @@ public sealed class WindowsGameAutomationNativeTests
                 if (input.Mouse.Flags == 2) { downAt = elapsed; downSawHover = hovered; }
             }
             return (uint)inputs.Length;
-        }, duration =>
+        }, duration => elapsed += duration, settleMouse: duration =>
         {
             elapsed += duration;
             if (moved && elapsed - movedAt >= TimeSpan.FromMilliseconds(40)) hovered = true;
@@ -57,15 +58,14 @@ public sealed class WindowsGameAutomationNativeTests
         Assert.True(downAt - movedAt >= TimeSpan.FromMilliseconds(40));
     }
 
-    /// <summary>验证系统仅部分接受输入时补发左键松开，并保留原错误。</summary>
+    /// <summary>验证移动批次未完整接受时停止发送按钮，并保留原系统错误。</summary>
     [Theory]
     [InlineData(0u)]
-    [InlineData(1u)]
     [InlineData(2u)]
-    public void PartialMouseBatchAlwaysReleasesTheButtonAndPreservesOriginalError(uint accepted)
+    public void PartialMouseMovementDoesNotPressTheButtonAndPreservesOriginalError(uint accepted)
     {
         var batches = new List<uint[]>();
-        var api = new SystemWindowsGameAutomationNativeApi(() => [], Process.GetProcessById, "fixture", inputs =>
+        var api = CreateMouseApi(inputs =>
         {
             batches.Add(inputs.Select(input => input.Mouse.Flags).ToArray());
             Marshal.SetLastPInvokeError(batches.Count == 1 ? 5 : 0);
@@ -73,14 +73,9 @@ public sealed class WindowsGameAutomationNativeTests
         }, _ => { });
         uint result = api.SendMouseClick(100, 200);
         int originalError = Marshal.GetLastWin32Error();
-        Assert.Equal(accepted == 2 ? 3u : accepted, result);
-        Assert.Equal([0xC001u, 2u], batches[0]);
-        Assert.Equal(2, batches.Count);
-        if (accepted != 2)
-        {
-            Assert.Equal([4u], batches[1]);
-            Assert.Equal(5, originalError);
-        }
+        Assert.Equal(0u, result);
+        Assert.Equal([0xC001u], Assert.Single(batches));
+        Assert.Equal(5, originalError);
     }
 
     /// <summary>验证空闲阶段只识别当前按住的 F8，忽略上一轮遗留的短按位。</summary>
@@ -98,7 +93,7 @@ public sealed class WindowsGameAutomationNativeTests
         long downAt = 0;
         long releasedAt = 0;
         bool pressed = false;
-        var api = new SystemWindowsGameAutomationNativeApi(() => [], Process.GetProcessById, "fixture", inputs =>
+        var api = CreateMouseApi(inputs =>
         {
             long batchAt = Stopwatch.GetTimestamp();
             foreach (var input in inputs)
@@ -126,7 +121,7 @@ public sealed class WindowsGameAutomationNativeTests
         bool released = false;
         int calls = 0;
         Exception expected = cancelled ? new OperationCanceledException("F8 已请求停止。") : new Win32Exception(5);
-        var api = new SystemWindowsGameAutomationNativeApi(() => [], Process.GetProcessById, "fixture", inputs =>
+        var api = CreateMouseApi(inputs =>
         {
             calls++;
             foreach (var input in inputs)
@@ -134,7 +129,7 @@ public sealed class WindowsGameAutomationNativeTests
                 if (input.Mouse.Flags == 2)
                 {
                     pressed = true;
-                    if (calls == 1) throw expected;
+                    throw expected;
                 }
                 if (input.Mouse.Flags == 4) { pressed = false; released = true; }
             }
@@ -152,10 +147,12 @@ public sealed class WindowsGameAutomationNativeTests
         bool pressed = false;
         bool held = false;
         var order = new List<string>();
-        var api = new SystemWindowsGameAutomationNativeApi(() => [], Process.GetProcessById, "fixture", inputs =>
+        var api = CreateMouseApi(inputs =>
         {
-            if (inputs.Length == 2) { pressed = true; order.Add("down"); }
-            else { Assert.True(held); pressed = false; order.Add("up"); }
+            uint flag = Assert.Single(inputs).Mouse.Flags;
+            if (flag == 0xC001) order.Add("move");
+            if (flag == 2) { pressed = true; order.Add("down"); }
+            if (flag == 4) { Assert.True(held); pressed = false; order.Add("up"); }
             return (uint)inputs.Length;
         }, duration =>
         {
@@ -165,7 +162,7 @@ public sealed class WindowsGameAutomationNativeTests
             order.Add("hold");
         });
         Assert.Equal(3u, api.SendMouseClick(100, 200));
-        Assert.Equal(["down", "hold", "up"], order);
+        Assert.Equal(["move", "down", "hold", "up"], order);
         Assert.False(pressed);
     }
 
@@ -178,9 +175,11 @@ public sealed class WindowsGameAutomationNativeTests
         bool pressed = false;
         int releaseAttempts = 0;
         var stop = new OperationCanceledException("F8 已请求停止。");
-        var api = new SystemWindowsGameAutomationNativeApi(() => [], Process.GetProcessById, "fixture", inputs =>
+        var api = CreateMouseApi(inputs =>
         {
-            if (inputs.Length == 2) { pressed = true; Marshal.SetLastPInvokeError(7); return 2; }
+            uint flag = Assert.Single(inputs).Mouse.Flags;
+            if (flag == 0xC001) return 1;
+            if (flag == 2) { pressed = true; Marshal.SetLastPInvokeError(7); return 1; }
             Assert.Equal(4u, Assert.Single(inputs).Mouse.Flags);
             releaseAttempts++;
             Marshal.SetLastPInvokeError(9);
@@ -200,18 +199,19 @@ public sealed class WindowsGameAutomationNativeTests
     {
         bool pressed = false;
         int calls = 0;
-        var api = new SystemWindowsGameAutomationNativeApi(() => [], Process.GetProcessById, "fixture", inputs =>
+        var api = CreateMouseApi(inputs =>
         {
             calls++;
-            if (calls == 1) { pressed = true; return 2; }
-            if (calls == 2) { Marshal.SetLastPInvokeError(5); return 0; }
+            if (calls == 1) return 1;
+            if (calls == 2) { pressed = true; return 1; }
+            if (calls == 3) { Marshal.SetLastPInvokeError(5); return 0; }
             pressed = false;
             Marshal.SetLastPInvokeError(0);
             return 1;
         }, _ => { });
         Assert.Equal(2u, api.SendMouseClick(100, 200));
         Assert.Equal(5, Marshal.GetLastWin32Error());
-        Assert.Equal(3, calls);
+        Assert.Equal(4, calls);
         Assert.False(pressed);
     }
 
@@ -222,17 +222,214 @@ public sealed class WindowsGameAutomationNativeTests
         bool pressed = false;
         int calls = 0;
         var original = new Win32Exception(5);
-        var api = new SystemWindowsGameAutomationNativeApi(() => [], Process.GetProcessById, "fixture", inputs =>
+        var api = CreateMouseApi(inputs =>
         {
             calls++;
-            if (calls == 1) { pressed = true; return 2; }
-            if (calls == 2) throw original;
+            if (calls == 1) return 1;
+            if (calls == 2) { pressed = true; return 1; }
+            if (calls == 3) throw original;
             pressed = false;
             return 1;
         }, _ => { });
         Assert.Same(original, Record.Exception(() => api.SendMouseClick(100, 200)));
-        Assert.Equal(3, calls);
+        Assert.Equal(4, calls);
         Assert.False(pressed);
+    }
+
+    /// <summary>验证非零负屏坐标先精确定位，四十毫秒后核对实际位置及窗口，再发送按钮。</summary>
+    [Fact]
+    public void PhysicalCursorPositionIsVerifiedBeforeTheGuardAndButtonDown()
+    {
+        var target = new AutomationNativePoint(-301, 229);
+        AutomationNativePoint cursor = new(900, 600);
+        var order = new List<string>();
+        var log = new MouseLogger();
+        var api = CreateMouseApi(inputs =>
+        {
+            uint flag = Assert.Single(inputs).Mouse.Flags;
+            order.Add(flag == 0xC001 ? "move" : flag == 2 ? "down" : "up");
+            if (flag == 0xC001) cursor = new(target.X - 1, target.Y);
+            if (flag == 2) Assert.Equal(target, cursor);
+            return 1;
+        }, _ => order.Add("hold"), setCursor: (x, y) =>
+        {
+            Assert.Equal((target.X, target.Y), (x, y));
+            cursor = new(x, y);
+            order.Add("set");
+            return true;
+        }, readCursor: (out AutomationNativePoint point) =>
+        {
+            point = cursor;
+            order.Add("read");
+            return true;
+        }, settleMouse: duration =>
+        {
+            Assert.Equal(TimeSpan.FromMilliseconds(40), duration);
+            order.Add("settle");
+        }, logger: log);
+
+        Assert.Equal(3u, api.SendMouseClick(100, 200, target, () => order.Add("guard")));
+        Assert.Equal(["set", "move", "set", "settle", "read", "guard", "down", "hold", "up"], order);
+        var observed = Assert.Single(log.Entries, entry => entry.Fields.ContainsKey("ActualX"));
+        Assert.Equal(target.X, observed.Fields["ExpectedX"]);
+        Assert.Equal(target.Y, observed.Fields["ExpectedY"]);
+        Assert.Equal(target.X, observed.Fields["ActualX"]);
+        Assert.Equal(target.Y, observed.Fields["ActualY"]);
+        Assert.Contains(log.Entries, entry => entry.Fields.TryGetValue("ThreadDpiContext", out object? value) && (nint)value! == -4);
+    }
+
+    /// <summary>验证初次定位或校正归一化移动失败时均保留系统错误且没有按钮输入。</summary>
+    [Theory]
+    [InlineData(1)]
+    [InlineData(2)]
+    public void SetCursorFailurePreventsAnyButtonInput(int failedSet)
+    {
+        int sets = 0;
+        var flags = new List<uint>();
+        var log = new MouseLogger();
+        var api = CreateMouseApi(inputs => { flags.AddRange(inputs.Select(input => input.Mouse.Flags)); return (uint)inputs.Length; },
+            setCursor: (_, _) => { Marshal.SetLastPInvokeError(5); return ++sets != failedSet; }, logger: log);
+
+        var error = Assert.Throws<Win32Exception>(() => api.SendMouseClick(100, 200, new(300, 400)));
+        Assert.Equal(5, error.NativeErrorCode);
+        Assert.DoesNotContain(2u, flags);
+        Assert.DoesNotContain(4u, flags);
+        Assert.Equal(failedSet - 1, flags.Count);
+        Assert.Contains(log.Entries, entry => entry.Level == LogLevel.Warning && (int)entry.Fields["Win32Error"]! == 5);
+    }
+
+    /// <summary>验证读取实际坐标失败时不按下左键，保留读取入口的系统错误。</summary>
+    [Fact]
+    public void ReadCursorFailurePreventsAnyButtonInput()
+    {
+        var flags = new List<uint>();
+        var api = CreateMouseApi(inputs => { flags.AddRange(inputs.Select(input => input.Mouse.Flags)); return (uint)inputs.Length; },
+            readCursor: (out AutomationNativePoint point) => { point = default; Marshal.SetLastPInvokeError(87); return false; });
+        var error = Assert.Throws<Win32Exception>(() => api.SendMouseClick(100, 200));
+        Assert.Equal(87, error.NativeErrorCode);
+        Assert.Equal([0xC001u], flags);
+    }
+
+    /// <summary>验证系统裁剪或用户移动导致任一坐标偏离时不按下，并记录实际位置。</summary>
+    [Theory]
+    [InlineData(1, 0)]
+    [InlineData(0, 1)]
+    public void CursorPositionMismatchPreventsAnyButtonInput(int deltaX, int deltaY)
+    {
+        var flags = new List<uint>();
+        var log = new MouseLogger();
+        var api = CreateMouseApi(inputs => { flags.AddRange(inputs.Select(input => input.Mouse.Flags)); return (uint)inputs.Length; },
+            readCursor: (out AutomationNativePoint point) => { point = new(300 + deltaX, 400 + deltaY); return true; }, logger: log);
+        Assert.Throws<InvalidOperationException>(() => api.SendMouseClick(100, 200, new(300, 400)));
+        Assert.Equal([0xC001u], flags);
+        var rejected = Assert.Single(log.Entries, entry => entry.Level == LogLevel.Warning);
+        Assert.Equal(300 + deltaX, rejected.Fields["ActualX"]);
+        Assert.Equal(400 + deltaY, rejected.Fields["ActualY"]);
+    }
+
+    /// <summary>验证移动就绪等待或按下前窗口复验异常时不按下，且保留原异常实例。</summary>
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public void CursorSettleOrWindowGuardFailurePreventsAnyButtonInput(bool failGuard)
+    {
+        var flags = new List<uint>();
+        var expected = new InvalidOperationException("窗口复验或移动等待失败。");
+        var api = CreateMouseApi(inputs => { flags.AddRange(inputs.Select(input => input.Mouse.Flags)); return (uint)inputs.Length; },
+            settleMouse: _ => { if (!failGuard) throw expected; });
+        Assert.Same(expected, Record.Exception(() => api.SendMouseClick(100, 200, beforeButtonDown: () => throw expected)));
+        Assert.Equal([0xC001u], flags);
+    }
+
+    /// <summary>验证定位前、就绪等待、最终复验及按住阶段的 F8 分别阻止按下或及时松开。</summary>
+    [Theory]
+    [InlineData(0)]
+    [InlineData(1)]
+    [InlineData(2)]
+    [InlineData(3)]
+    public void EmergencyStopBeforeOrAfterDownKeepsTheMouseReleased(int phase)
+    {
+        bool stop = phase == 0;
+        var flags = new List<uint>();
+        var api = CreateMouseApi(inputs => { flags.AddRange(inputs.Select(input => input.Mouse.Flags)); return (uint)inputs.Length; },
+            holdMouse: _ => stop = phase == 3, settleMouse: _ => stop = phase == 1, stopRequested: () => stop);
+        Assert.Throws<OperationCanceledException>(() => api.SendMouseClick(100, 200, beforeButtonDown: () => stop = phase == 2));
+        if (phase == 3) Assert.Equal([0xC001u, 2u, 4u], flags);
+        else Assert.DoesNotContain(2u, flags);
+    }
+
+    /// <summary>验证独立按下批次部分失败仍补发松开，保留首个系统错误。</summary>
+    [Theory]
+    [InlineData(0u)]
+    [InlineData(2u)]
+    public void PartialButtonDownAttemptsReleaseAndKeepsOriginalError(uint accepted)
+    {
+        var flags = new List<uint>();
+        var api = CreateMouseApi(inputs =>
+        {
+            uint flag = Assert.Single(inputs).Mouse.Flags;
+            flags.Add(flag);
+            Marshal.SetLastPInvokeError(flag == 2 ? 5 : 0);
+            return flag == 2 ? accepted : 1u;
+        });
+        Assert.Equal(1u, api.SendMouseClick(100, 200));
+        Assert.Equal(5, Marshal.GetLastWin32Error());
+        Assert.Equal([0xC001u, 2u, 4u], flags);
+    }
+
+    /// <summary>验证兼容两参数入口使用完整虚拟桌面原点而非主显示器零点。</summary>
+    [Fact]
+    public void LegacyNormalizedMouseTargetUsesNegativeDesktopOrigin()
+    {
+        var desktop = new AutomationNativeRectangle(-2000, -1000, 2000, 1000);
+        var positions = new List<AutomationNativePoint>();
+        var api = CreateMouseApi(inputs => (uint)inputs.Length, setCursor: (x, y) => { positions.Add(new(x, y)); return true; },
+            readCursor: (out AutomationNativePoint point) => { point = positions[^1]; return true; }, getDesktop: () => desktop);
+        Assert.Equal(3u, api.SendMouseClick(16384, 32768));
+        Assert.Equal([new AutomationNativePoint(-1000, 0), new AutomationNativePoint(-1000, 0)], positions);
+    }
+
+    /// <summary>验证兼容入口拒绝无效桌面尺寸及超界归一化坐标，整个路径没有鼠标输入。</summary>
+    [Theory]
+    [InlineData(1, 100, 100, 200)]
+    [InlineData(100, 1, 100, 200)]
+    [InlineData(100, 100, -1, 200)]
+    [InlineData(100, 100, 65536, 200)]
+    [InlineData(100, 100, 100, -1)]
+    [InlineData(100, 100, 100, 65536)]
+    public void LegacyMouseTargetRejectsInvalidDesktopOrNormalizedCoordinates(int width, int height, int x, int y)
+    {
+        bool inputSent = false;
+        var api = CreateMouseApi(inputs => { inputSent = true; return (uint)inputs.Length; }, getDesktop: () => new(0, 0, width, height));
+        Assert.Throws<InvalidOperationException>(() => api.SendMouseClick(x, y));
+        Assert.False(inputSent);
+    }
+
+    /// <summary>创建所有鼠标定位和输入均可替换的边界，纯测试不会触碰桌面。</summary>
+    private static SystemWindowsGameAutomationNativeApi CreateMouseApi(Func<SystemWindowsGameAutomationNativeApi.NativeInput[], uint> sendInputs,
+        Action<TimeSpan>? holdMouse = null, Func<int, int, bool>? setCursor = null,
+        SystemWindowsGameAutomationNativeApi.CursorPositionReader? readCursor = null, Action<TimeSpan>? settleMouse = null,
+        Func<bool>? stopRequested = null, Func<AutomationNativeRectangle>? getDesktop = null, ILogger? logger = null)
+    {
+        AutomationNativePoint cursor = default;
+        return new(() => [], Process.GetProcessById, "fixture", sendInputs, holdMouse,
+            setCursor ?? ((x, y) => { cursor = new(x, y); return true; }),
+            readCursor ?? ((out AutomationNativePoint point) => { point = cursor; return true; }),
+            settleMouse ?? (_ => { }), stopRequested ?? (() => false), getDesktop ?? (() => new(0, 0, 65536, 65536)), () => -4, logger);
+    }
+
+    /// <summary>收集纯鼠标边界测试的结构化到达和故障日志。</summary>
+    private sealed class MouseLogger : ILogger
+    {
+        /// <summary>实际收到的日志等级及结构化字段。</summary>
+        internal List<(LogLevel Level, Dictionary<string, object?> Fields)> Entries { get; } = [];
+        /// <summary>本测试无需日志作用域。</summary>
+        public IDisposable? BeginScope<TState>(TState state) where TState : notnull => null;
+        /// <summary>保留所有级别的鼠标诊断。</summary>
+        public bool IsEnabled(LogLevel level) => true;
+        /// <summary>采集真实日志格式的字段。</summary>
+        public void Log<TState>(LogLevel level, EventId eventId, TState state, Exception? exception, Func<TState, Exception?, string> formatter)
+            => Entries.Add((level, ((IEnumerable<KeyValuePair<string, object?>>)state!).ToDictionary(pair => pair.Key, pair => pair.Value)));
     }
 
     /// <summary>验证真实边界只向测试自有窗口发送普通鼠标点击。</summary>
@@ -558,13 +755,18 @@ public sealed class WindowsGameAutomationNativeTests
         nint window = 0;
         string className = "FreePackFixture-" + Guid.NewGuid().ToString("N");
         bool clicked = false;
+        PixelPoint? pressedAt = null;
+        PixelPoint? releasedAt = null;
         Native.WindowProcedure procedure = (handle, message, wParam, lParam) =>
         {
-            if (message == 0x0202) clicked = true;
+            if (message == 0x0201) pressedAt = ReadMouseMessagePoint(lParam);
+            if (message == 0x0202) { releasedAt = ReadMouseMessagePoint(lParam); clicked = true; }
             return Native.DefWindowProc(handle, message, wParam, lParam);
         };
         string directory = Path.Combine(Path.GetTempPath(), className);
         SystemWindowsGameAutomationNativeApi? runningApi = null;
+        AutomationNativePoint? savedCursor = null;
+        Exception? mainFailure = null;
         try
         {
             var registration = new Native.WindowClass { Procedure = procedure, Instance = Native.GetModuleHandle(null), ClassName = className };
@@ -578,6 +780,7 @@ public sealed class WindowsGameAutomationNativeTests
             var desktop = raw.GetVirtualDesktop();
             Assert.True(Native.SystemParametersInfo(0x0030, 0, out AutomationNativeRectangle workArea, 0));
             Assert.True(Native.GetCursorPos(out AutomationNativePoint originalCursor));
+            savedCursor = originalCursor;
             window = Native.CreateWindowEx(0, className, "FreePack native fixture", 0x10CF0000,
                 originalCursor.X - 100, originalCursor.Y - 100, 420, 340, 0, 0, registration.Instance, 0);
             Assert.NotEqual((nint)0, window);
@@ -652,10 +855,12 @@ public sealed class WindowsGameAutomationNativeTests
             for (int attempt = 0; attempt < 3; attempt++)
             {
                 Assert.True(Native.GetCursorPos(out cursorBeforeInput));
-                target = new PixelPoint(cursorBeforeInput.X - inputFrame.ScreenX, cursorBeforeInput.Y - inputFrame.ScreenY);
-                rootBeforeInput = Native.GetAncestor(Native.WindowFromPoint(cursorBeforeInput), 2);
+                Assert.True(Native.GetClipCursor(out AutomationNativeRectangle clip));
+                var screenTarget = GetOwnedInputTarget(inputFrame, desktop, clip, cursorBeforeInput);
+                target = new PixelPoint(screenTarget.X - inputFrame.ScreenX, screenTarget.Y - inputFrame.ScreenY);
+                rootBeforeInput = Native.GetAncestor(Native.WindowFromPoint(screenTarget), 2);
                 Console.WriteLine($"OwnedClickPoint Attempt={attempt} Original=({originalCursor.X},{originalCursor.Y}) "
-                    + $"Current=({cursorBeforeInput.X},{cursorBeforeInput.Y}) Client=({target.X},{target.Y}) Root={rootBeforeInput} Own={window}.");
+                    + $"Current=({cursorBeforeInput.X},{cursorBeforeInput.Y}) TargetScreen=({screenTarget.X},{screenTarget.Y}) Client=({target.X},{target.Y}) Root={rootBeforeInput} Own={window}.");
                 inputReady = target.X >= 0 && target.X < inputFrame.Width && target.Y >= 0 && target.Y < inputFrame.Height
                     && rootBeforeInput == window;
                 if (inputReady || attempt == 2) break;
@@ -685,7 +890,11 @@ public sealed class WindowsGameAutomationNativeTests
             Assert.InRange(target.X, 0, inputFrame.Width - 1);
             Assert.InRange(target.Y, 0, inputFrame.Height - 1);
             Assert.Equal(window, rootBeforeInput);
+            Assert.NotEqual(cursorBeforeInput, new AutomationNativePoint(inputFrame.ScreenX + target.X, inputFrame.ScreenY + target.Y));
+            PumpOwnWindowMessages();
             clicked = false;
+            pressedAt = null;
+            releasedAt = null;
             nint foregroundBeforeInput = api.GetForegroundWindow();
             platform.Click(inputFrame, target);
             Stopwatch wait = Stopwatch.StartNew();
@@ -703,6 +912,8 @@ public sealed class WindowsGameAutomationNativeTests
             nint pointRoot = Native.GetAncestor(Native.WindowFromPoint(cursor), 2);
             Assert.True(clicked, $"自有测试窗口未收到鼠标松开。窗口={window}，输入前前台={foregroundBeforeInput}，输入后前台={foregroundAfterInput}，"
                 + $"预期屏幕点=({inputFrame.ScreenX + target.X},{inputFrame.ScreenY + target.Y})，当前鼠标=({cursor.X},{cursor.Y})，鼠标命中根窗口={pointRoot}。");
+            Assert.Equal(target, pressedAt);
+            Assert.Equal(target, releasedAt);
             uint originalPid = api.GetWindowProcessId(window);
             int beginsBeforeRecovery = ownedApi.BeginCount;
             int endsBeforeRecovery = ownedApi.EndCount;
@@ -725,19 +936,71 @@ public sealed class WindowsGameAutomationNativeTests
             Assert.Single(Directory.GetFiles(Path.Combine(directory, "free-pack-diagnostics"), "*.png"));
             platform.EndAutomation();
             api.EndEmergencyStop();
-            completion.SetResult();
         }
-        catch (Exception exception) { completion.SetException(exception); }
+        catch (Exception exception) { mainFailure = exception; }
         finally
         {
-            runningApi?.EndEmergencyStop();
-            if (window != 0) Native.DestroyWindow(window);
-            Native.UnregisterClass(className, Native.GetModuleHandle(null));
-            Native.SetThreadDpiAwarenessContext(previousDpi);
-            GC.KeepAlive(procedure);
-            if (Directory.Exists(directory)) Directory.Delete(directory, true);
+            try
+            {
+                runningApi?.EndEmergencyStop();
+                if (window != 0) Native.DestroyWindow(window);
+                Native.UnregisterClass(className, Native.GetModuleHandle(null));
+            }
+            catch (Exception cleanupFailure)
+            {
+                if (mainFailure is null) mainFailure = cleanupFailure;
+                else mainFailure.Data["WindowCleanupFailure"] = cleanupFailure.ToString();
+            }
+            finally
+            {
+                try
+                {
+                    if (savedCursor is { } cursor && runningApi is not null)
+                        RestoreOwnedFixtureCursor(cursor, runningApi);
+                }
+                catch (Exception cleanupFailure)
+                {
+                    Console.WriteLine($"OwnedFixtureCursorCleanup Error={cleanupFailure}");
+                    if (mainFailure is null) mainFailure = cleanupFailure;
+                    else mainFailure.Data["CursorCleanupFailure"] = cleanupFailure.ToString();
+                }
+                finally
+                {
+                    try
+                    {
+                        Native.SetThreadDpiAwarenessContext(previousDpi);
+                        GC.KeepAlive(procedure);
+                        if (Directory.Exists(directory)) Directory.Delete(directory, true);
+                    }
+                    catch (Exception cleanupFailure)
+                    {
+                        if (mainFailure is null) mainFailure = cleanupFailure;
+                        else mainFailure.Data["FinalCleanupFailure"] = cleanupFailure.ToString();
+                    }
+                }
+            }
         }
+        if (mainFailure is null) completion.SetResult();
+        else completion.SetException(mainFailure);
     }
+
+    /// <summary>从自有客户区、桌面和当前系统裁剪的交集中选择区别于原鼠标位置的真实目标。</summary>
+    private static AutomationNativePoint GetOwnedInputTarget(GameFrame frame, AutomationNativeRectangle desktop, AutomationNativeRectangle clip, AutomationNativePoint cursor)
+    {
+        long left = Math.Max(Math.Max((long)frame.ScreenX, desktop.Left), clip.Left);
+        long top = Math.Max(Math.Max((long)frame.ScreenY, desktop.Top), clip.Top);
+        long right = Math.Min(Math.Min((long)frame.ScreenX + frame.Width, desktop.Right), clip.Right);
+        long bottom = Math.Min(Math.Min((long)frame.ScreenY + frame.Height, desktop.Bottom), clip.Bottom);
+        Assert.True(right - left >= 2 && bottom > top, "自有客户区与系统裁剪没有可验证跨位置移动的交集。");
+        int x = (int)(left + (right - left) / 2);
+        int y = (int)(top + (bottom - top) / 2);
+        if (x == cursor.X && y == cursor.Y) x = x + 1 < right ? x + 1 : x - 1;
+        return new(x, y);
+    }
+
+    /// <summary>按 Win32 有符号十六位坐标解码鼠标客户区消息。</summary>
+    private static PixelPoint ReadMouseMessagePoint(nint lParam)
+        => new((short)((long)lParam & 0xFFFF), (short)(((long)lParam >> 16) & 0xFFFF));
 
     /// <summary>固定寻找本测试拥有的目标窗口，其余操作交给真实原生边界。</summary>
     private sealed class FixedWindowNativeApi(IWindowsGameAutomationNativeApi inner, nint window, CancellationToken shutdown) : IWindowsGameAutomationNativeApi
@@ -785,7 +1048,8 @@ public sealed class WindowsGameAutomationNativeTests
         /// <summary>读取真实虚拟桌面。</summary>
         public AutomationNativeRectangle GetVirtualDesktop() => inner.GetVirtualDesktop();
         /// <summary>将自有窗口的普通鼠标输入交给真实原生边界。</summary>
-        public uint SendMouseClick(int normalizedX, int normalizedY) => inner.SendMouseClick(normalizedX, normalizedY);
+        public uint SendMouseClick(int normalizedX, int normalizedY, AutomationNativePoint? physicalTarget = null, Action? beforeButtonDown = null)
+            => inner.SendMouseClick(normalizedX, normalizedY, physicalTarget, beforeButtonDown);
         /// <summary>读取真实紧急停止状态。</summary>
         public bool IsF8Pressed => shutdown.IsCancellationRequested || inner.IsF8Pressed;
         /// <summary>注册本测试运行期间的 F8 停止热键。</summary>
@@ -875,6 +1139,8 @@ public sealed class WindowsGameAutomationNativeTests
         [DllImport("user32.dll", EntryPoint = "PostThreadMessageW", SetLastError = true)] [return: MarshalAs(UnmanagedType.Bool)] internal static extern bool PostThreadMessage(uint threadId, uint message, nuint wParam, nint lParam);
         /// <summary>只读获取测试结束时的真实鼠标坐标。</summary>
         [DllImport("user32.dll")] [return: MarshalAs(UnmanagedType.Bool)] internal static extern bool GetCursorPos(out AutomationNativePoint point);
+        /// <summary>读取系统当前鼠标裁剪范围，测试保持该约束。</summary>
+        [DllImport("user32.dll")] [return: MarshalAs(UnmanagedType.Bool)] internal static extern bool GetClipCursor(out AutomationNativeRectangle rectangle);
         /// <summary>只读获取鼠标实际命中的窗口。</summary>
         [DllImport("user32.dll")] internal static extern nint WindowFromPoint(AutomationNativePoint point);
         /// <summary>只读获取鼠标命中窗口的顶级父窗口。</summary>
