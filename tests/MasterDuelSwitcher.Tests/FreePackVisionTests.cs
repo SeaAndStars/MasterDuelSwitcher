@@ -1239,14 +1239,54 @@ public sealed class FreePackVisionTests : IDisposable
         Assert.Equal(before, frame.Pixels);
     }
 
-    /// <summary>旧图像指纹仍完整但标题上下文越出裁切帧时，应等待完整画面且不读取残缺文字。</summary>
+    /// <summary>现场顶部留白不足的免费详情在各缩放下仍须读取完整真实标题并提供免费入口及下一包。</summary>
+    /// <param name="scale">客户区现场截图的缩放比例。</param>
+    [Theory]
+    [InlineData(0.65)]
+    [InlineData(0.85)]
+    [InlineData(1.0)]
+    [InlineData(1.25)]
+    public void TopEdgeFreeDetailsUseRealOcrAndAuthorizeCompleteTitle(double scale)
+    {
+        using var subject = new OpenCvPackRecognizer();
+        using var original = LoadFixture("free-details-top-edge.png");
+        using var image = Resize(original, scale);
+        var frame = ToFrame(image);
+        var before = frame.Pixels.ToArray();
+        var observation = subject.Recognize(frame);
+        Assert.Equal(PackScreen.PackDetails, observation.Screen);
+        Assert.Equal("黑之魔导师", observation.PackTitle);
+        Assert.True(observation.FreeOffer);
+        Assert.NotNull(observation.PrimaryTarget);
+        Assert.NotNull(observation.NextTarget);
+        AssertFingerprint(observation.Fingerprint);
+        Assert.InRange(observation.Confidence, .84, 1);
+        Assert.Equal(before, frame.Pixels);
+    }
+
+    /// <summary>裁去可选顶部留白而完整保留标题时，系统OCR仍须精确读取收费卡包身份且不授权购买。</summary>
     [Fact]
-    public void DetailsWithCroppedTitleContextDoNotReadOrAuthorizePartialTitle()
+    public void TopEdgeDetailsWithoutOptionalPaddingKeepCompletePaidTitle()
+    {
+        using var subject = new OpenCvPackRecognizer();
+        using var original = LoadFixture("paid-details-after-opening.png");
+        using var image = Crop(original, new Rect(0, 66, 2050, 1118));
+        var observation = subject.Recognize(ToFrame(image));
+        Assert.Equal(PackScreen.PackDetails, observation.Screen);
+        Assert.Equal("颠覆世界恶魔之力", observation.PackTitle);
+        Assert.False(observation.FreeOffer);
+        Assert.Null(observation.PrimaryTarget);
+        Assert.NotNull(observation.NextTarget);
+    }
+
+    /// <summary>实际裁掉标题字形和必需核心时，应等待完整画面且不向OCR提供残缺标题。</summary>
+    [Fact]
+    public void DetailsWithCroppedRequiredTitleDoNotReadOrAuthorizePartialTitle()
     {
         var reader = new RecordingTitleReader("颠覆世界恶魔之力");
         using var subject = new OpenCvPackRecognizer(feeVerifier: new RecordingFeeVerifier(true), titleReader: reader);
         using var original = LoadFixture("paid-details-after-opening.png");
-        using var image = Crop(original, new Rect(0, 66, 2050, 1118));
+        using var image = Crop(original, new Rect(0, 100, 2050, 1084));
         AssertUnknown(subject.Recognize(ToFrame(image)));
         Assert.Empty(reader.Calls);
     }
