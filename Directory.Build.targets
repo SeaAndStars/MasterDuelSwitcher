@@ -1,0 +1,17 @@
+<Project>
+  <!-- 仅为实际 .NET 框架固定发布运行时版本，Windows SDK 保留自身的独立版本。 -->
+  <Target Name="PinMasterDuelPublishedRuntimeVersion"
+          BeforeTargets="ProcessFrameworkReferences"
+          Condition="'$(MasterDuelRuntimeVersion)' != ''">
+    <ItemGroup>
+      <!-- 按引用设置版本，避免全局 RuntimeFrameworkVersion 被 Windows SDK 误用。 -->
+      <FrameworkReference Update="Microsoft.NETCore.App;Microsoft.WindowsDesktop.App;Microsoft.WindowsDesktop.App.WPF"
+                          RuntimeFrameworkVersion="$(MasterDuelRuntimeVersion)" />
+      <!-- WPF 与 Desktop 根框架共用运行包，根项也固定到相同的 .NET 10 补丁版本。 -->
+      <KnownFrameworkReference Update="Microsoft.WindowsDesktop.App;Microsoft.WindowsDesktop.App.WPF"
+                               Condition="'%(KnownFrameworkReference.TargetFramework)' == 'net10.0'"
+                               DefaultRuntimeFrameworkVersion="$(MasterDuelRuntimeVersion)"
+                               LatestRuntimeFrameworkVersion="$(MasterDuelRuntimeVersion)" />
+    </ItemGroup>
+  </Target>
+</Project>

@@ -3,5 +3,6 @@
 .vs/
 .superpowers/
 artifacts/
+work/
 *.user
 *.suo
