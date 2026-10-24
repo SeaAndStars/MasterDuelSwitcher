@@ -8,7 +8,7 @@
   <img alt="WPF UI 4.3.0" src="https://img.shields.io/badge/WPF%20UI-4.3.0-6E56CF">
   <img alt="OpenCV 4.13.0" src="https://img.shields.io/badge/OpenCV-4.13.0-5C3EE8?logo=opencv&logoColor=white">
   <img alt="界面 简体中文" src="https://img.shields.io/badge/%E7%95%8C%E9%9D%A2-%E7%AE%80%E4%BD%93%E4%B8%AD%E6%96%87-3B82F6">
-  <img alt="覆盖率 100% 行 / 100% 分支" src="https://img.shields.io/badge/%E8%A6%86%E7%9B%96%E7%8E%87-100%25%20%E8%A1%8C%20%2F%20100%25%20%E5%88%86%E6%94%AF-2EA043">
+  <img alt="覆盖率门槛 100% 行 / 分支" src="https://img.shields.io/badge/%E8%A6%86%E7%9B%96%E9%97%A8%E6%A7%9B-100%25%20%E8%A1%8C%20%2F%20%E5%88%86%E6%94%AF-2EA043">
 </p>
 
 <p align="center">
@@ -93,7 +93,7 @@
 - 五个独立 Page 与对应 ViewModel，通过官方 `NavigationView` 和依赖注入页面服务导航；Shell 只负责外框。
 - MVVM + DI：Core 承担目录事务、SQLite、Steam 集成、OCR 与 OpenCV 识别；View 不承载业务逻辑。
 - 官方 Fluent 中性明暗主题与系统强调色，所有通知与确认使用官方 `ContentDialog`，文件夹选择使用系统对话框。
-- 自写生产代码按 **100% 行与分支** 覆盖率验证；测试使用临时数据库、临时目录与隔离的系统边界，不登录或切换真实 Steam 账号。
+- 覆盖率门槛为自写生产代码 **100% 行与分支**，由 `scripts/Test-Coverage.ps1` 串行执行含真实窗口的 App 测试并判定；测试使用临时数据库、临时目录与隔离的系统边界，不登录或切换真实 Steam 账号。
 
 ## 快速开始
 
@@ -192,7 +192,7 @@ dotnet build MasterDuelSwitcher.sln -c Release
 pwsh -File scripts/Publish.ps1            # 输出 artifacts\publish\win-x64 自包含单文件
 ```
 
-发布包内含 `MasterDuelSwitcher.exe`、`使用说明.md`、`THIRD-PARTY-NOTICES.md` 与 `licenses`；EXE 内嵌 `requireAdministrator` 与 PerMonitorV2 清单。
+发布包内含 `MasterDuelSwitcher.exe`、`使用说明.md`（连同 `docs/images` 界面截图）、`THIRD-PARTY-NOTICES.md` 与 `licenses`；EXE 内嵌 `requireAdministrator` 与 PerMonitorV2 清单。
 
 ## 项目结构
 
