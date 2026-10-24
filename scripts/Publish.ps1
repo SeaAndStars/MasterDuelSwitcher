@@ -11,6 +11,13 @@ $taskPublishPath = if ($OutputDirectory) { [IO.Path]::GetFullPath($OutputDirecto
 dotnet publish (Join-Path $taskRepository 'src\MasterDuelSwitcher.App\MasterDuelSwitcher.App.csproj') -c Release -r win-x64 --self-contained true -p:MasterDuelRuntimeVersion=10.0.10 -p:PublishSingleFile=true -p:IncludeNativeLibrariesForSelfExtract=true -p:EnableCompressionInSingleFile=true -p:DebugType=None -p:DebugSymbols=false -o $taskPublishPath
 if ($LASTEXITCODE -ne 0) { throw '发布失败，请检查构建输出。' }
 Copy-Item -LiteralPath (Join-Path $taskRepository 'README.md') -Destination (Join-Path $taskPublishPath '使用说明.md')
+# 说明文件引用 docs\images 下的界面截图，按相对路径一并复制，保持离线可读。
+$taskImages = Join-Path $taskRepository 'docs\images'
+if (Test-Path -LiteralPath $taskImages) {
+    $taskImageTarget = Join-Path $taskPublishPath 'docs\images'
+    New-Item -ItemType Directory -Force -Path $taskImageTarget | Out-Null
+    Copy-Item -LiteralPath (Join-Path $taskImages '*') -Destination $taskImageTarget -Force
+}
 Copy-Item -LiteralPath (Join-Path $taskRepository 'THIRD-PARTY-NOTICES.md') -Destination $taskPublishPath
 Copy-Item -LiteralPath (Join-Path $taskRepository 'licenses') -Destination $taskPublishPath -Recurse -Force
 Get-ChildItem -LiteralPath $taskPublishPath | Select-Object Name,Length
